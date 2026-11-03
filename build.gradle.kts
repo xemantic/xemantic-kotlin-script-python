@@ -74,7 +74,6 @@ dependencies {
 
     // only the tests run Python in a script session, the main code does not depend on xemantic-kotlin-script
     testImplementation(libs.xemantic.kotlin.script)
-    testImplementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.xemantic.kotlin.test)
