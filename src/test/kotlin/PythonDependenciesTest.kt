@@ -219,4 +219,35 @@ class PythonDependenciesTest {
         assert(metadata == null)
     }
 
+    @Test
+    fun `should plan with more imported modules than fit on command line`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // about 6 MB of names, more than ARG_MAX of macOS and Linux, and the 32767 characters of Windows,
+        // and enough to hang if the distributions of the environment are scanned again for each module
+        val imported = List(300_000) { "imported_module_$it" }
+
+        // when
+        val plan = PythonDependencies.plan("dependencies = [\"nonexistent-dependency\"]\n", directory, imported)
+
+        // then
+        assert(("install" to "nonexistent-dependency") in plan)
+    }
+
+    @Test
+    fun `should plan for metadata with quotes, backslashes, line breaks and non-ASCII characters`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val metadata = "title = \"\\\"q\\\" \\\\ \u00fc\u2028 \uD83D\uDE00 \\u0001\"\r\n" +
+            "dependencies = [\n  \"nonexistent-dependency\",\n]\n"
+
+        // when
+        val plan = PythonDependencies.plan(metadata, directory, listOf("sys", "\u00fcber"))
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
+    }
+
 }
