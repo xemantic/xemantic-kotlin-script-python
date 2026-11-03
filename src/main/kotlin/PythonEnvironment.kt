@@ -22,6 +22,7 @@ import jep.MainInterpreter
 import jep.PyConfig
 import java.nio.file.Path
 import java.security.MessageDigest
+import kotlin.concurrent.thread
 import kotlin.io.path.Path
 import kotlin.io.path.exists
 import kotlin.io.path.listDirectoryEntries
@@ -80,22 +81,7 @@ public object PythonEnvironment {
     internal fun initialize() {
         if (initialized) return
         val python = (pythonExecutable ?: defaultPythonExecutable()).toString()
-        val (exitCode, output) = try {
-            runProcess(
-                listOf(
-                    python,
-                    "-c",
-                    "import importlib.util, sys; print(sys.executable, sys.implementation.cache_tag, sys.prefix, " +
-                        "importlib.util.find_spec('jep').submodule_search_locations[0], sep='\\n')"
-                )
-            )
-        } catch (e: java.io.IOException) {
-            throw IllegalStateException("Cannot run Python executable: $python", e)
-        }
-        check(exitCode == 0) {
-            "Cannot find the jep package of $python, install it with: $python -m pip install jep\n$output"
-        }
-        val (executable, cacheTag, prefix, jepLocation) = output.lines()
+        val (executable, cacheTag, prefix, jepLocation) = probePython(python)
         val jepDir = Path(jepLocation)
         val library = jepDir.listDirectoryEntries().firstOrNull {
             it.name.startsWith("libjep.") || it.name == "jep.dll"
@@ -122,6 +108,32 @@ public object PythonEnvironment {
         initialized = true
     }
 
+    /**
+     * Asks the [python] executable about itself.
+     *
+     * @throws IllegalStateException if it cannot be run, or has no `jep` package.
+     */
+    internal fun probePython(python: String): PythonProbe {
+        val (exitCode, output, error) = try {
+            runProcess(
+                listOf(
+                    python,
+                    "-c",
+                    "import importlib.util, sys; print(sys.executable, sys.implementation.cache_tag, sys.prefix, " +
+                        "importlib.util.find_spec('jep').submodule_search_locations[0], sep='\\n')"
+                ),
+                mergeErrorStream = false
+            )
+        } catch (e: java.io.IOException) {
+            throw IllegalStateException("Cannot run Python executable: $python", e)
+        }
+        check(exitCode == 0) {
+            "Cannot find the jep package of $python, install it with: $python -m pip install jep\n$error"
+        }
+        val (executable, cacheTag, prefix, jepLocation) = output.lines()
+        return PythonProbe(executable, cacheTag, prefix, jepLocation)
+    }
+
     private const val DEPENDENCY_DIRECTORY_PROPERTY = "xemantic.kotlin.script.python.dependencyDirectory"
 
     private fun checkNotInitialized() {
@@ -142,17 +154,59 @@ public object PythonEnvironment {
 }
 
 /**
+ * What a Python executable tells about itself.
+ *
+ * @property executable the absolute path of the executable, `sys.executable`.
+ * @property cacheTag the `sys.implementation.cache_tag`, e.g. `cpython-313`.
+ * @property prefix the `sys.prefix`, the virtual environment, if any.
+ * @property jepLocation the directory of the `jep` package.
+ */
+internal data class PythonProbe(
+    val executable: String,
+    val cacheTag: String,
+    val prefix: String,
+    val jepLocation: String
+)
+
+/**
+ * The result of [runProcess].
+ *
+ * @property exitCode the exit code of the process.
+ * @property output the standard output, merged with the standard error, unless the error stream is separate.
+ * @property error the standard error, if the error stream is separate, otherwise empty.
+ */
+internal data class ProcessResult(
+    val exitCode: Int,
+    val output: String,
+    val error: String
+)
+
+/**
  * Runs the [command], writing the [input] to its standard input, and waits for it to end.
  *
- * @return the exit code, and the standard output merged with the standard error.
+ * Its standard error is merged into its standard output when [mergeErrorStream],
+ * which keeps the order of all the messages, e.g. of a failing `pip`,
+ * otherwise it is read separately, so that the standard output can be parsed,
+ * whatever Python writes to the standard error, e.g. a warning at startup.
  */
-internal fun runProcess(command: List<String>, input: String? = null): Pair<Int, String> {
+internal fun runProcess(
+    command: List<String>,
+    input: String? = null,
+    mergeErrorStream: Boolean = true
+): ProcessResult {
     val process = ProcessBuilder(command)
-        .redirectErrorStream(true)
+        .redirectErrorStream(mergeErrorStream)
         .start()
+    // read concurrently, otherwise the process blocks when it fills the buffer of one of the streams
+    var error = ""
+    val errorReader = if (mergeErrorStream) null else thread(name = "process-stderr") {
+        error = process.errorStream.bufferedReader().use { it.readText() }.trim()
+    }
     process.outputStream.bufferedWriter().use { writer ->
         if (input != null) writer.write(input)
     }
     val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-    return process.waitFor() to output
+    val exitCode = process.waitFor()
+    errorReader?.join()
+    return ProcessResult(exitCode, output, error)
 }
