@@ -138,7 +138,7 @@ internal object PythonDependencies {
             listOf(PythonEnvironment.executable, "-c", PLAN, directory),
             input = input
         )
-        if (exitCode != 0) throw PythonDependencyException(output)
+        if (exitCode != 0) throw PythonDependencyException(redactCredentials(output))
         return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
     }
 
@@ -174,7 +174,7 @@ internal object PythonDependencies {
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
-                    "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
+                    redactCredentials("Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output")
                 )
             }
         } finally {
@@ -197,20 +197,49 @@ internal object PythonDependencies {
     /**
      * The `pinned_requirement` Python function,
      * returning the requirement of exactly the distribution resolved in an installation report of pip,
-     * like `direct_url_as_pep440_direct_reference` of pip.
+     * like `direct_url_as_pep440_direct_reference` of pip,
+     * and the `requested_urls` function, returning the URLs of the requirements by their distribution names.
+     *
+     * The report has the URLs without their credentials,
+     * which are taken back from the URL of the requirement, if the distribution is a requested one.
      */
     @Language("python")
     internal val PIP_PINNED_REQUIREMENT = """
-        def pinned_requirement(distribution):
+        def requested_urls(requirements):
+            from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+            from pip._vendor.packaging.utils import canonicalize_name
+            urls = {}
+            for requirement in requirements:
+                try:
+                    parsed = Requirement(requirement)
+                except InvalidRequirement:
+                    continue
+                if parsed.url:
+                    urls[canonicalize_name(parsed.name)] = parsed.url
+            return urls
+
+        def with_credentials(url, requested_url):
+            from urllib.parse import urlsplit, urlunsplit
+            credentials, at, host = urlsplit(requested_url).netloc.rpartition("@")
+            parts = urlsplit(url)
+            if not at or parts.netloc.rpartition("@")[2] != host:
+                return url
+            return urlunsplit(parts._replace(netloc=f"{credentials}@{host}"))
+
+        def pinned_requirement(distribution, urls):
+            from pip._vendor.packaging.utils import canonicalize_name
             name, download = distribution["metadata"]["name"], distribution["download_info"]
             if not distribution["is_direct"]:
                 return f"{name}=={distribution['metadata']['version']}"
+            url = download["url"]
+            if distribution.get("requested") and canonicalize_name(name) in urls:
+                url = with_credentials(url, urls[canonicalize_name(name)])
             fragments = []
             if "vcs_info" in download:
                 vcs = download["vcs_info"]
-                requirement = f"{name} @ {vcs['vcs']}+{download['url']}@{vcs['commit_id']}"
+                requirement = f"{name} @ {vcs['vcs']}+{url}@{vcs['commit_id']}"
             else:
-                requirement = f"{name} @ {download['url']}"
+                requirement = f"{name} @ {url}"
                 archive = download.get("archive_info") or {}
                 if archive.get("hashes"):
                     fragments.append("=".join(next(iter(archive["hashes"].items()))))
@@ -250,6 +279,12 @@ internal object PythonDependencies {
                 f"upgrade it with: {sys.executable} -m pip install --upgrade pip"
             )
 
+        from pip._vendor.packaging.utils import canonicalize_name
+
+        # the staging directories left by a killed installation
+        for stale in Path(directory).glob(".staging-*"):
+            shutil.rmtree(stale, ignore_errors=True)
+
         options = ["--quiet", "--disable-pip-version-check", "--no-input"]
         pip_seeing_directory = [
             sys.executable, "-c",
@@ -267,13 +302,14 @@ internal object PythonDependencies {
                 resolved = json.load(file)["install"]
         if not resolved:
             sys.exit()
+        urls = requested_urls(requirements)
 
         def distributions(path):
             found = {}
             for entry in Path(path).glob("*.dist-info"):
                 name = metadata.PathDistribution(entry).metadata["Name"]
                 if entry.is_dir() and name:
-                    found.setdefault(re.sub(r"[-_.]+", "-", name).lower(), []).append(entry)
+                    found.setdefault(canonicalize_name(name), []).append(entry)
             return found
 
         def remove(distribution, kept):
@@ -298,7 +334,7 @@ internal object PythonDependencies {
             installation = subprocess.run(
                 [sys.executable, "-m", "pip"] + options
                 + ["install", "--no-deps", "--target", staging]
-                + [pinned_requirement(distribution) for distribution in resolved]
+                + [pinned_requirement(distribution, urls) for distribution in resolved]
             )
             if installation.returncode != 0:
                 sys.exit(installation.returncode)
@@ -320,6 +356,10 @@ internal object PythonDependencies {
             shutil.rmtree(staging, ignore_errors=True)
     """.trimIndent()
 
+    private val urlCredentials = Regex("(?<=://)[^/@\\s]+@")
+
+    /** Replaces the credentials of the URLs in the [text] with `****`. */
+    internal fun redactCredentials(text: String): String = text.replace(urlCredentials, "****@")
 
     private fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
