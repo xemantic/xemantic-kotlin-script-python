@@ -111,12 +111,7 @@ internal object PythonDependencies {
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
             List::class.java
         ).map { it.toString() }
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", PLAN, directory) + imported,
-            input = metadata
-        )
-        if (exitCode != 0) throw PythonDependencyException(output)
-        val plan = output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+        val plan = plan(metadata, directory, imported)
         val missing = plan.filter { it.first == "install" }.map { it.second }
         if (missing.isNotEmpty()) {
             installMissing(missing, plan.filter { it.first == "constraint" }.map { it.second }, directory)
@@ -127,6 +122,38 @@ internal object PythonDependencies {
             interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use { it.call(directory) }
         }
         interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
+    }
+
+    /**
+     * Runs the [PLAN] for the [metadata], found by [scriptMetadata], the dependency [directory],
+     * and the [imported] top-level modules.
+     *
+     * @return the `install` and `constraint` entries of the plan, as pairs of the kind and the value.
+     * @throws PythonDependencyException if the plan cannot be made.
+     */
+    fun plan(metadata: String, directory: String, imported: List<String>): List<Pair<String, String>> {
+        // on the standard input, as the command line would exceed the OS limit after importing many modules
+        val input = """{"metadata": ${metadata.toJson()}, "modules": [${imported.joinToString(", ") { it.toJson() }}]}"""
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", PLAN, directory),
+            input = input
+        )
+        if (exitCode != 0) throw PythonDependencyException(output)
+        return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+    }
+
+    /** This string as a JSON string, with every character outside printable ASCII escaped, so it is ASCII only. */
+    private fun String.toJson(): String = buildString(length + 2) {
+        append('"')
+        for (char in this@toJson) {
+            when (char) {
+                '"' -> append("\\\"")
+                '\\' -> append("\\\\")
+                in ' '..'~' -> append(char)
+                else -> append("\\u").append(char.code.toString(16).padStart(4, '0'))
+            }
+        }
+        append('"')
     }
 
     private fun installMissing(missing: List<String>, constraints: List<String>, directory: String) {
@@ -170,17 +197,19 @@ internal object PythonDependencies {
      * Prints the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
      * or exits with the error.
-     * Its arguments are the dependency directory and the imported top-level modules,
-     * and the TOML content of the `script` metadata block, found by [scriptMetadata], is read from the standard input.
+     * Its argument is the dependency directory,
+     * and its standard input is a JSON object of the TOML content of the `script` metadata block,
+     * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
     @Language("python")
     private val PLAN = """
-        import importlib.metadata as metadata, os, re, sys, tomllib
+        import importlib.metadata as metadata, json, os, re, sys, tomllib
 
-        directory, imported = sys.argv[1], set(sys.argv[2:])
+        request = json.loads(sys.stdin.read())
+        directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
         try:
-            dependencies = tomllib.loads(sys.stdin.read()).get("dependencies", [])
+            dependencies = tomllib.loads(request["metadata"]).get("dependencies", [])
         except tomllib.TOMLDecodeError as e:
             sys.exit(f"Invalid '# /// script' metadata: {e}")
         if not isinstance(dependencies, list) or not all(isinstance(it, str) for it in dependencies):
@@ -216,7 +245,8 @@ internal object PythonDependencies {
 
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
-            in_use = {name for module in imported for name in metadata.packages_distributions().get(module, [])}
+            distributions_of = metadata.packages_distributions()
+            in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)
             constraints = {}
             for distribution in metadata.distributions():
