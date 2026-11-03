@@ -55,6 +55,8 @@ In `build.gradle.kts` add:
 ```kotlin
 dependencies {
     implementation("com.xemantic.kotlin:xemantic-kotlin-script-python:0.1.0")
+    // only for running Python in a ScriptSession, like below, as Python does not depend on it
+    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.0")
 }
 ```
 
