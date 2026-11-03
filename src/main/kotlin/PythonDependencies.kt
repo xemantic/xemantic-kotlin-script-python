@@ -193,6 +193,10 @@ internal object PythonDependencies {
         ?.firstOrNull { it.isExecutable() }
         ?.toString()
 
+    /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
+    internal const val NO_TOML_PARSER_MESSAGE =
+        "Cannot read '# /// script' metadata: Python 3.11+ is required, or the tomli or pip package before 3.11"
+
     /**
      * Prints the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
@@ -201,10 +205,6 @@ internal object PythonDependencies {
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
-    /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
-    internal const val NO_TOML_PARSER_MESSAGE =
-        "Cannot read '# /// script' metadata: Python 3.11+ is required, or the tomli or pip package before 3.11"
-
     @Language("python")
     internal val PLAN = """
         import json, sys
@@ -212,21 +212,19 @@ internal object PythonDependencies {
         # before any import which can fail, so that the input is always read
         request = json.loads(sys.stdin.read())
 
-        import importlib.metadata as metadata, os, re
+        import importlib, importlib.metadata as metadata, os, re
 
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
-        try:
-            import tomllib
-        except ImportError:
-            # tomllib is new in Python 3.11, tomli is its original, also vendored by pip
+        # tomllib is new in Python 3.11, tomli is its original, also vendored by pip
+        for toml_module in ("tomllib", "tomli", "pip._vendor.tomli"):
             try:
-                import tomli as tomllib
+                tomllib = importlib.import_module(toml_module)
+                break
             except ImportError:
-                try:
-                    from pip._vendor import tomli as tomllib
-                except ImportError:
-                    sys.exit("$NO_TOML_PARSER_MESSAGE")
+                pass
+        else:
+            sys.exit(${NO_TOML_PARSER_MESSAGE.toJson()})
         try:
             dependencies = tomllib.loads(request["metadata"]).get("dependencies", [])
         except tomllib.TOMLDecodeError as e:

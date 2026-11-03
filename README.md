@@ -31,8 +31,8 @@ keeping the Python state between the snippets as well.
 
 CPython 3.10 or newer, the oldest version supported by the `jep` package.
 Before Python 3.11, which brings `tomllib`,
-reading the [inline script metadata](#usage) of the code requires the `tomli` or the `pip` package,
-already installed in a virtual environment created with `python -m venv`.
+reading the [inline script metadata](#usage) of the code requires either the `tomli` or the `pip` package to be importable.
+An environment without `pip`, like the one of `uv venv`, can get `tomli` with `pip install tomli` or `uv pip install tomli`.
 
 Jep is a native CPython extension:
 the Java library comes from Maven Central,

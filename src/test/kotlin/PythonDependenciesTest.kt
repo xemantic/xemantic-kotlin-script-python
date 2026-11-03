@@ -255,8 +255,10 @@ class PythonDependenciesTest {
         // given
         PythonEnvironment.initialize()
         val directory = PythonEnvironment.dependencyDirectory.toString()
-        // None in sys.modules makes the import fail with ModuleNotFoundError, like on Python 3.10
-        val code = "import sys; sys.modules['tomllib'] = None\n" + PythonDependencies.PLAN
+        // None in sys.modules makes the import fail with ModuleNotFoundError, like on Python 3.10,
+        // and without tomli, the copy vendored by pip is used
+        val code = "import sys; sys.modules.update(dict.fromkeys(['tomllib', 'tomli'], None))\n" +
+            PythonDependencies.PLAN
 
         // when
         val (exitCode, output) = runProcess(
@@ -266,6 +268,24 @@ class PythonDependenciesTest {
 
         // then
         assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+    }
+
+    @Test
+    fun `should fail plan on invalid metadata without tomllib of Python before 3_11`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val code = "import sys; sys.modules.update(dict.fromkeys(['tomllib', 'tomli'], None))\n" +
+            PythonDependencies.PLAN
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", code, directory),
+            input = """{"metadata": "dependencies = \n", "modules": []}"""
+        )
+
+        // then
+        assert(exitCode != 0 && output.startsWith("Invalid '# /// script' metadata: "))
     }
 
     @Test
