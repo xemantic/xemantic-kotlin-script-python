@@ -138,6 +138,22 @@ class PythonEnvironmentTest {
     }
 
     @Test
+    fun `should exchange non-ASCII text with process under non-UTF-8 locale`() {
+        // given
+        val nonUtf8Locale = mapOf("LC_ALL" to "C", "PYTHONUTF8" to "0", "PYTHONCOERCECLOCALE" to "0")
+
+        // when
+        val result = runProcess(
+            listOf(venvPython, "-c", "import sys; print(sys.stdin.read().upper())"),
+            input = "zażółć gęślą jaźń 日本",
+            environment = nonUtf8Locale
+        )
+
+        // then
+        assert(result == ProcessResult(exitCode = 0, output = "ZAŻÓŁĆ GĘŚLĄ JAŹŃ 日本", error = ""))
+    }
+
+    @Test
     fun `should destroy process when writing its input fails`() {
         // given
         val pidFile = createTempFile("python-pid", ".txt")
