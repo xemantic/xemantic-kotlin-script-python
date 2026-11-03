@@ -19,6 +19,9 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import jep.Interpreter
+import java.lang.reflect.Proxy
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 
@@ -59,6 +62,50 @@ class PythonDependenciesTest {
 
         // then
         assert(metadata == "dependencies = []\n")
+    }
+
+    @Test
+    fun `should find metadata of script block with CRLF line endings`() {
+        // when
+        val metadata = PythonDependencies.scriptMetadata(
+            "import sys\r\n# /// script\r\n#\r\n# dependencies = [\"numpy\"]\r\n# ///\r\nprint(sys.argv)\r\n"
+        )
+
+        // then
+        assert(metadata == "\ndependencies = [\"numpy\"]\n")
+    }
+
+    @Test
+    fun `should split metadata content only at line feeds`() {
+        // when
+        val metadata = PythonDependencies.scriptMetadata(
+            "# /// script\n# title = \"a\u000cb\u0085c d\"\n# ///\n"
+        )
+
+        // then
+        // str.splitlines of the reference implementation would also break the TOML string at these characters
+        assert(metadata == "title = \"a\u000cb\u0085c d\"\n")
+    }
+
+    @Test
+    fun `should not wait for other installation when code has no metadata`() {
+        // given
+        val interpreter = Proxy.newProxyInstance(
+            Interpreter::class.java.classLoader, arrayOf(Interpreter::class.java)
+        ) { _, method, _ -> error("Unexpected call of Interpreter.${method.name}") } as Interpreter
+
+        // when
+        val state = synchronized(PythonDependencies) {
+            // as if another thread was installing dependencies
+            val installer = thread { PythonDependencies.install("x = 1", interpreter) }
+            while (installer.state != Thread.State.BLOCKED && installer.state != Thread.State.TERMINATED) {
+                Thread.onSpinWait()
+            }
+            installer.state
+        }
+
+        // then
+        assert(state == Thread.State.TERMINATED)
     }
 
     @Test

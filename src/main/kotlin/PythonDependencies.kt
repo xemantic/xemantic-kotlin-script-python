@@ -57,11 +57,16 @@ internal object PythonDependencies {
      * a regex retries all the following comment lines for every unclosed block start,
      * and Java one also recurses for each line of the block.
      *
+     * Unlike in the reference implementation, every line, also of the content, ends only with `\n` or `\r\n`:
+     * a `\r\n` line ending, of code written on Windows, does not hide the block,
+     * and the content is not broken within a TOML string at the characters like `\u000c` or `\u0085`,
+     * as `str.splitlines` would do.
+     *
      * @throws PythonDependencyException if there is more than one `script` block.
      */
     fun scriptMetadata(code: String): String? {
-        // only `\n` ends a line, like for `$` of a Python regex
-        val lines = code.split('\n')
+        if ("# ///" !in code) return null
+        val lines = code.split('\n').map { it.removeSuffix("\r") }
         val blocks = mutableListOf<List<String>>()
         var runStart = 0
         while (runStart < lines.size) {
@@ -74,9 +79,11 @@ internal object PythonDependencies {
             // a block is a run of consecutive comment lines, ending at its last closing line,
             // started by its first block start followed by at least one content line before that
             val end = (runStart until runEnd).lastOrNull { lines[it] == "# ///" }
-            val start = if (end == null) null else (runStart until end - 1).firstOrNull { blockStart.matches(lines[it]) }
-            if (start != null && lines[start] == "# /// script") {
-                blocks += lines.subList(start + 1, end!!)
+            if (end != null) {
+                val start = (runStart until end - 1).firstOrNull { blockStart.matches(lines[it]) }
+                if (start != null && lines[start] == "# /// script") {
+                    blocks += lines.subList(start + 1, end)
+                }
             }
             runStart = runEnd
         }
@@ -91,9 +98,14 @@ internal object PythonDependencies {
     private fun String.isComment() = this == "#" || startsWith("# ")
 
     /** Installs the missing dependencies declared by the [code], if any, on the thread of the [interpreter]. */
-    @Synchronized
     fun install(code: String, interpreter: Interpreter) {
+        // outside the lock, so that code without metadata does not wait for an installation of another thread
         val metadata = scriptMetadata(code) ?: return
+        installMetadata(metadata, interpreter)
+    }
+
+    @Synchronized
+    private fun installMetadata(metadata: String, interpreter: Interpreter) {
         val directory = PythonEnvironment.dependencyDirectory!!.createDirectories().toString()
         val imported = interpreter.getValue(
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
