@@ -191,16 +191,30 @@ internal data class ProcessResult(
  * which keeps the order of all the messages, e.g. of a failing `pip`,
  * otherwise it is collected separately, so that the standard output can be parsed,
  * whatever Python writes to the standard error, e.g. a warning at startup.
+ *
+ * The [environment] variables are added to the inherited ones,
+ * and every Python process exchanges its standard streams in UTF-8, whatever its locale.
  */
 internal fun runProcess(
     command: List<String>,
     input: String? = null,
-    mergeErrorStream: Boolean = true
+    mergeErrorStream: Boolean = true,
+    environment: Map<String, String> = emptyMap()
 ): ProcessResult {
     // a file, unlike a pipe, does not block the process when nobody reads it
     val errorFile = if (mergeErrorStream) null else createTempFile("process-stderr", ".txt")
     try {
         val builder = ProcessBuilder(command)
+        builder.environment().apply {
+            putAll(environment)
+            // the input is written, and the output read, as UTF-8, while Python would use the locale encoding,
+            // e.g. cp1252 on Windows, or ASCII in the C locale;
+            // the UTF-8 mode makes the whole process tree agree on UTF-8, also pip and its build subprocesses,
+            // and PYTHONIOENCODING, which would take precedence over the UTF-8 mode for the standard streams,
+            // must not be inherited with another encoding
+            put("PYTHONUTF8", "1")
+            put("PYTHONIOENCODING", "utf-8")
+        }
         if (errorFile == null) builder.redirectErrorStream(true) else builder.redirectError(errorFile.toFile())
         val process = builder.start()
         try {
