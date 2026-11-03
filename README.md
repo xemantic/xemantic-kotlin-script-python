@@ -58,6 +58,9 @@ dependencies {
 }
 ```
 
+`Python` does not depend on [xemantic-kotlin-script](https://github.com/xemantic/xemantic-kotlin-script),
+to use it in a `ScriptSession`, like below, add `com.xemantic.kotlin:xemantic-kotlin-script` as well.
+
 Then:
 
 ```kotlin

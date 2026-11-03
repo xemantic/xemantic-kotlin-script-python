@@ -69,11 +69,12 @@ repositories {
 }
 
 dependencies {
-    api(libs.xemantic.kotlin.script)
     // the Java side of Jep, its native library comes with the jep Python package, installed with pip
     api(libs.jep)
-    api(libs.kotlinx.coroutines.core)
 
+    // only the tests run Python in a script session, the main code does not depend on xemantic-kotlin-script
+    testImplementation(libs.xemantic.kotlin.script)
+    testImplementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.xemantic.kotlin.test)
