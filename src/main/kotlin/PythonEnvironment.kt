@@ -105,7 +105,7 @@ public object PythonEnvironment {
         MainInterpreter.setJepLibraryPath(library.toString())
         // the embedded CPython finds the pyvenv.cfg of a virtual environment next to its program,
         // otherwise it would search the site-packages of the base Python as well
-        MainInterpreter.setInitParams(PyConfig().setProgramName(executable))
+        MainInterpreter.setInitParams(PyConfig.python().setProgramName(executable))
         this.executable = executable
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }

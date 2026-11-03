@@ -333,7 +333,7 @@ class PythonTest {
         // then
         val property = System.getProperty("xemantic.kotlin.script.python.dependencyDirectory")
         assert(property != null)
-        assert(PythonEnvironment.dependencyDirectory == Path(property!!))
+        assert(PythonEnvironment.dependencyDirectory == Path(property))
     }
 
     @Test
