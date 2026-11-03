@@ -20,13 +20,18 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import java.nio.file.attribute.PosixFilePermissions
+import java.io.IOException
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createTempDirectory
+import kotlin.io.path.createTempFile
+import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
+import kotlin.io.path.readText
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
 
 class PythonEnvironmentTest {
 
@@ -54,6 +59,36 @@ class PythonEnvironmentTest {
 
             // then
             assert(probe == expected)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report both stdout and stderr of failing probe`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        python.writeText(
+            """
+            |#!/bin/sh
+            |echo "shim failure on stdout"
+            |echo "shim failure on stderr" >&2
+            |exit 1
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python.toString())
+            }
+
+            // then
+            val message = exception.message!!
+            assert("shim failure on stdout" in message && "shim failure on stderr" in message)
         } finally {
             directory.deleteRecursively()
         }
@@ -100,6 +135,26 @@ class PythonEnvironmentTest {
         assert(result.exitCode == 0)
         assert(result.output.length == size)
         assert(result.error.length == size)
+    }
+
+    @Test
+    fun `should destroy process when writing its input fails`() {
+        // given
+        val pidFile = createTempFile("python-pid", ".txt")
+        val script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); os.close(0); time.sleep(600)"
+
+        try {
+            // when
+            assertFailsWith<IOException> {
+                runProcess(listOf(venvPython, "-c", script, pidFile.toString()), input = "x".repeat(10_000_000))
+            }
+
+            // then
+            val pid = pidFile.readText().toLong()
+            assert(ProcessHandle.of(pid).map { it.isAlive }.orElse(false) == false)
+        } finally {
+            pidFile.deleteIfExists()
+        }
     }
 
 }
