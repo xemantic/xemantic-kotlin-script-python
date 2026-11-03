@@ -114,19 +114,61 @@ internal object PythonDependencies {
     ): List<String> = listOf(python, "-c", PIP_INSTALL, directory, constraints) + requirements
 
     /**
+     * The `pinned_requirement` Python function,
+     * returning the requirement of exactly the distribution resolved in an installation report of pip,
+     * like `direct_url_as_pep440_direct_reference` of pip.
+     */
+    @Language("python")
+    internal val PIP_PINNED_REQUIREMENT = """
+        def pinned_requirement(distribution):
+            name, download = distribution["metadata"]["name"], distribution["download_info"]
+            if not distribution["is_direct"]:
+                return f"{name}=={distribution['metadata']['version']}"
+            fragments = []
+            if "vcs_info" in download:
+                vcs = download["vcs_info"]
+                requirement = f"{name} @ {vcs['vcs']}+{download['url']}@{vcs['commit_id']}"
+            else:
+                requirement = f"{name} @ {download['url']}"
+                archive = download.get("archive_info") or {}
+                if archive.get("hashes"):
+                    fragments.append("=".join(next(iter(archive["hashes"].items()))))
+                elif archive.get("hash"):
+                    fragments.append(archive["hash"])
+            if download.get("subdirectory"):
+                fragments.append("subdirectory=" + download["subdirectory"])
+            return requirement + ("#" + "&".join(fragments) if fragments else "")
+    """.trimIndent()
+
+    /**
      * Installs the requirements with pip into the dependency directory, its first argument,
      * keeping the versions of the constraints file, its second argument.
      *
      * pip ignores the distributions already installed in a `--target` directory,
      * so it would install them again, also with their own dependencies, replacing the files of the loaded modules.
      * Therefore, the distributions to install are resolved first, with the dependency directory on `sys.path`,
-     * and then only these are installed, without their dependencies.
+     * and then only these are installed, without their dependencies, into an empty staging directory.
+     * Its files are merged into the dependency directory, after removing the files of the replaced distributions,
+     * so that a directory shared with other distributions, like a namespace package, is kept.
      */
     @Language("python")
-    private val PIP_INSTALL = """
-        import json, os, subprocess, sys, tempfile
+    private val PIP_INSTALL = PIP_PINNED_REQUIREMENT + "\n\n" + """
+        import json, os, re, shutil, subprocess, sys, tempfile
+        from importlib import metadata
+        from pathlib import Path
 
         directory, constraints, requirements = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+        try:
+            from pip import __version__ as pip_version
+        except ImportError:
+            sys.exit(f"Installing Python dependencies needs uv, or pip 22.2 or newer, but {sys.executable} has no pip")
+        if tuple(int(part) for part in re.findall(r"\d+", pip_version)[:2]) < (22, 2):
+            sys.exit(
+                f"Installing Python dependencies needs uv, or pip 22.2 or newer, but {sys.executable} has pip {pip_version}, "
+                f"upgrade it with: {sys.executable} -m pip install --upgrade pip"
+            )
+
         options = ["--quiet", "--disable-pip-version-check", "--no-input"]
         pip_seeing_directory = [
             sys.executable, "-c",
@@ -142,24 +184,61 @@ internal object PythonDependencies {
                 sys.exit(resolution.returncode)
             with open(report, encoding="utf-8") as file:
                 resolved = json.load(file)["install"]
+        if not resolved:
+            sys.exit()
 
-        def pinned(distribution):
-            name, download = distribution["metadata"]["name"], distribution["download_info"]
-            if not distribution["is_direct"]:
-                return f"{name}=={distribution['metadata']['version']}"
-            if "vcs_info" in download:
-                vcs = download["vcs_info"]
-                return f"{name} @ {vcs['vcs']}+{download['url']}@{vcs['commit_id']}"
-            return f"{name} @ {download['url']}"
+        def distributions(path):
+            found = {}
+            for entry in Path(path).glob("*.dist-info"):
+                name = metadata.PathDistribution(entry).metadata["Name"]
+                if entry.is_dir() and name:
+                    found.setdefault(re.sub(r"[-_.]+", "-", name).lower(), []).append(entry)
+            return found
 
-        if resolved:
-            # --upgrade replaces the distributions of the directory not satisfying the requirements
-            sys.exit(subprocess.run(
+        def remove(distribution, kept):
+            emptied = set()
+            for file in metadata.PathDistribution(distribution).files or []:
+                relative = os.path.normpath(str(file))
+                path = os.path.join(directory, relative)
+                if relative.startswith(os.pardir) or os.path.isabs(relative) or relative in kept:
+                    continue
+                if os.path.isfile(path) or os.path.islink(path):
+                    os.remove(path)
+                    emptied.add(os.path.dirname(path))
+            shutil.rmtree(distribution, ignore_errors=True)
+            for path in sorted(emptied, key=len, reverse=True):
+                while os.path.normpath(path) != os.path.normpath(directory) and os.path.isdir(path) and not os.listdir(path):
+                    os.rmdir(path)
+                    path = os.path.dirname(path)
+
+        os.makedirs(directory, exist_ok=True)
+        staging = tempfile.mkdtemp(prefix=".staging-", dir=directory)
+        try:
+            installation = subprocess.run(
                 [sys.executable, "-m", "pip"] + options
-                + ["install", "--no-deps", "--upgrade", "--target", directory]
-                + [pinned(distribution) for distribution in resolved]
-            ).returncode)
+                + ["install", "--no-deps", "--target", staging]
+                + [pinned_requirement(distribution) for distribution in resolved]
+            )
+            if installation.returncode != 0:
+                sys.exit(installation.returncode)
+            staged = {
+                os.path.relpath(os.path.join(root, file), staging)
+                for root, _, files in os.walk(staging) for file in files
+            }
+            staged_names = distributions(staging).keys()
+            for name, replaced in distributions(directory).items():
+                if name in staged_names:
+                    for distribution in replaced:
+                        remove(distribution, staged)
+            for root, _, files in os.walk(staging):
+                target = os.path.join(directory, os.path.relpath(root, staging))
+                os.makedirs(target, exist_ok=True)
+                for file in files:
+                    os.replace(os.path.join(root, file), os.path.join(target, file))
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
     """.trimIndent()
+
 
     private fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
