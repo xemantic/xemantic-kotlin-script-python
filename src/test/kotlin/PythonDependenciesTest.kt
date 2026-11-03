@@ -87,13 +87,16 @@ class PythonDependenciesTest {
         return output
     }
 
-    private fun pinnedRequirement(@Language("json") distribution: String): String {
+    private fun pinnedRequirement(
+        @Language("json") distribution: String,
+        vararg requirements: String
+    ): String {
         val (exitCode, output) = runProcess(
             listOf(
                 python, "-c",
                 PythonDependencies.PIP_PINNED_REQUIREMENT +
-                    "\nimport json, sys\nprint(pinned_requirement(json.load(sys.stdin)))"
-            ),
+                    "\nimport json, sys\nprint(pinned_requirement(json.load(sys.stdin), requested_urls(sys.argv[1:])))"
+            ) + requirements,
             input = distribution
         )
         assert(exitCode == 0, output)
@@ -109,7 +112,7 @@ class PythonDependenciesTest {
     @Test
     fun `should keep distribution of dependency directory when pip installs dependency requiring it`() {
         // given
-        val installed = pipInstall("idna")
+        val installed = pipInstall("idna==3.10")
         val idnaModule = directory.resolve("idna").resolve("__init__.py")
         val idnaKey = idnaModule.fileKey()
 
@@ -203,6 +206,89 @@ class PythonDependenciesTest {
         // then
         assert(exitCode == 0, output)
         assert(pythonOfDirectory("import subpkg; print(subpkg.ANSWER)") == "42")
+    }
+
+    /**
+     * pip strips the credentials from the URL in its installation report,
+     * so the distribution resolved from it would be installed without them.
+     */
+    @Test
+    fun `should install dependency from URL requiring credentials with pip`() {
+        // given
+        val wheels = sources.resolve("wheels").createDirectories()
+        val wheel = wheels.resolve("authpkg-1.0-py3-none-any.whl")
+        val (wheelExitCode, wheelOutput) = run(listOf(python, "-c", BUILD_WHEEL, wheel.toString()))
+        assert(wheelExitCode == 0, wheelOutput)
+        val server = ProcessBuilder(python, "-c", AUTHENTICATING_SERVER, wheels.toString(), "user:secret")
+            .redirectErrorStream(true)
+            .start()
+        try {
+            val port = server.inputStream.bufferedReader().readLine()
+
+            // when
+            val (exitCode, output) = pipInstall("authpkg @ http://user:secret@127.0.0.1:$port/${wheel.fileName}")
+
+            // then
+            assert(exitCode == 0, output)
+            assert(pythonOfDirectory("import authpkg; print(authpkg.ANSWER)") == "42")
+        } finally {
+            server.destroy()
+            server.waitFor()
+        }
+    }
+
+    @Test
+    fun `should remove staging directory left by killed installation`() {
+        // given
+        val stale = directory.resolve(".staging-stale").createDirectories()
+        stale.resolve("leftover.py").writeText("")
+
+        // when
+        val (exitCode, output) = pipInstall("idna==3.10")
+
+        // then
+        assert(exitCode == 0, output)
+        assert(!stale.exists())
+        assert(directory.resolve("idna").exists())
+    }
+
+    @Test
+    fun `should redact credentials of requirements`() {
+        // when
+        val redacted = PythonDependencies.redactCredentials(
+            "pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git, " +
+                "authpkg @ http://user:secret@127.0.0.1:8765/authpkg-1.0-py3-none-any.whl, idna"
+        )
+
+        // then
+        assert(
+            redacted == "pkg @ git+https://****@gitlab.com/org/private.git, " +
+                "authpkg @ http://****@127.0.0.1:8765/authpkg-1.0-py3-none-any.whl, idna"
+        )
+    }
+
+    @Test
+    fun `should pin requested distribution from URL with credentials of its requirement`() {
+        // when
+        val requirement = pinnedRequirement(
+            """
+            {
+              "metadata": {"name": "pkg", "version": "1.0"},
+              "is_direct": true,
+              "requested": true,
+              "download_info": {
+                "url": "https://gitlab.com/org/private.git",
+                "vcs_info": {"vcs": "git", "requested_revision": "main", "commit_id": "0123abcd"},
+                "subdirectory": "libs/pkg"
+              }
+            }
+            """.trimIndent(),
+            "idna",
+            "Pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git@main#subdirectory=libs/pkg"
+        )
+
+        // then
+        assert(requirement == "pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git@0123abcd#subdirectory=libs/pkg")
     }
 
     @Test
@@ -315,6 +401,66 @@ class PythonDependenciesTest {
         assert(exitCode != 0)
         assert(output.contains("pip 22.2"), output)
         assert(output.contains("22.1.2"), output)
+    }
+
+    private companion object {
+
+        /** Builds the wheel of the `authpkg` distribution, to the path of its argument. */
+        @Language("python")
+        val BUILD_WHEEL = """
+            import base64, hashlib, sys, zipfile
+
+            files = {
+                "authpkg/__init__.py": b"ANSWER = 42\n",
+                "authpkg-1.0.dist-info/METADATA": b"Metadata-Version: 2.1\nName: authpkg\nVersion: 1.0\n",
+                "authpkg-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            }
+            record = "".join(
+                f"{name},sha256={base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()},{len(data)}\n"
+                for name, data in files.items()
+            ) + "authpkg-1.0.dist-info/RECORD,,\n"
+            with zipfile.ZipFile(sys.argv[1], "w") as wheel:
+                for name, data in files.items():
+                    wheel.writestr(name, data)
+                wheel.writestr("authpkg-1.0.dist-info/RECORD", record)
+        """.trimIndent()
+
+        /**
+         * Serves the directory of its first argument, only with the basic authentication of its second argument,
+         * printing its port.
+         */
+        @Language("python")
+        val AUTHENTICATING_SERVER = """
+            import base64, functools, http.server, sys
+
+            directory, authorization = sys.argv[1], "Basic " + base64.b64encode(sys.argv[2].encode()).decode()
+
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def authorized(self):
+                    if self.headers.get("Authorization") == authorization:
+                        return True
+                    self.send_response(401)
+                    self.send_header("WWW-Authenticate", 'Basic realm="test"')
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return False
+
+                def do_GET(self):
+                    if self.authorized():
+                        super().do_GET()
+
+                def do_HEAD(self):
+                    if self.authorized():
+                        super().do_HEAD()
+
+                def log_message(self, *args):
+                    pass
+
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Handler, directory=directory))
+            print(server.server_address[1], flush=True)
+            server.serve_forever()
+        """.trimIndent()
+
     }
 
 }
