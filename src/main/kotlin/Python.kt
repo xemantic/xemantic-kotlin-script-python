@@ -25,6 +25,7 @@ import org.intellij.lang.annotations.Language
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -45,6 +46,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * and can be called from any thread, one call at a time.
  * Concurrent calls wait for their turn.
  *
+ * Once [close] is called, every call which is not running yet fails with an [IllegalStateException]
+ * with the message `Python is closed` —
+ * also a call racing `close()` from another thread, or waiting for its turn behind a running call.
+ * Only the running call completes, and the interpreter is closed after it,
+ * exactly once, on the thread of this `Python`.
+ *
  * A Kotlin function can be set as a global variable and called from Python, like `python["f"] = { n: Long -> n * 2 }`.
  * It runs on the thread of this `Python`, and can call it back.
  *
@@ -53,17 +60,22 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
  */
-public class Python : AutoCloseable {
+public class Python private constructor(
+    decorateExecutor: (ExecutorService) -> ExecutorService
+) : AutoCloseable {
+
+    public constructor() : this({ it })
 
     @Volatile
     private var thread: Thread? = null
 
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { task ->
+    // decorated only by tests, see withDecoratedExecutor
+    private val executor: ExecutorService = decorateExecutor(Executors.newSingleThreadExecutor { task ->
         Thread(task, "python-${threadCounter.incrementAndGet()}").apply {
             isDaemon = true
             thread = this
         }
-    }
+    })
 
     private val closed = AtomicBoolean(false)
 
@@ -157,31 +169,46 @@ public class Python : AutoCloseable {
 
     /**
      * Closes the interpreter and releases its thread.
-     * Calling it again has no effect.
+     *
+     * It waits for the running call, if any, to complete, and then closes the interpreter on its thread.
+     * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
+     * Calling it again has no effect, and returns immediately.
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
+        // the calls submitted before, and still waiting for their turn, see it closed when it comes,
+        // and the ones submitted afterward are rejected, so that this task is the last one to touch the interpreter
+        val closing = executor.submit {
+            interpreter?.close()
+            interpreter = null
+        }
+        executor.shutdown()
         try {
-            executor.submit {
-                interpreter?.close()
-                interpreter = null
-            }.get()
-        } finally {
-            executor.shutdown()
+            closing.get()
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
         }
     }
 
     private fun <T> call(block: SharedInterpreter.() -> T): T {
-        check(!closed.get()) { "Python is closed" }
+        checkNotClosed()
         // a Kotlin function called from Python, calling back this Python, runs already on its thread,
         // where waiting for the executor would deadlock
         if (Thread.currentThread() === thread) return interpreter!!.block()
-        val future = executor.submit<T> {
-            val interpreter = interpreter ?: run {
-                PythonEnvironment.initialize()
-                SharedInterpreter().also { interpreter = it }
+        val future = try {
+            executor.submit<T> {
+                // close() might have been called after this call was submitted, and if its task has run already,
+                // creating a new interpreter here would leak it, never to be closed
+                checkNotClosed()
+                val interpreter = interpreter ?: run {
+                    PythonEnvironment.initialize()
+                    SharedInterpreter().also { interpreter = it }
+                }
+                interpreter.block()
             }
-            interpreter.block()
+        } catch (_: RejectedExecutionException) {
+            // close() has shut down the executor after the check above
+            throw closedException()
         }
         return try {
             future.get()
@@ -190,7 +217,21 @@ public class Python : AutoCloseable {
         }
     }
 
-    private companion object {
+    private fun checkNotClosed() {
+        if (closed.get()) throw closedException()
+    }
+
+    private fun closedException() = IllegalStateException("Python is closed")
+
+    internal companion object {
+
+        /**
+         * Creates a `Python`, whose executor is decorated by [decorateExecutor],
+         * so that a test can interleave deterministically with the submission of a call.
+         */
+        internal fun withDecoratedExecutor(
+            decorateExecutor: (ExecutorService) -> ExecutorService
+        ): Python = Python(decorateExecutor)
 
         val threadCounter = AtomicInteger()
 
