@@ -59,6 +59,8 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * The values are converted between Java and Python by Jep, e.g. a Python `int` becomes a [Long],
  * a `str` a [String], and a `list` a [List].
+ * A returned value which Jep cannot convert, also when nested in a [List], a [Map] or an array,
+ * becomes its Python `repr`, as a Python object cannot be used outside the thread of this `Python`.
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
  */
@@ -129,20 +131,17 @@ public class Python private constructor(
         } as List<String>
         if (statements.isNotBlank()) exec(statements)
         if (expression.isEmpty()) return@call null
-        when (val value = getValue(expression)) {
-            is PyObject -> value.use {
-                getValue("__import__('builtins').repr", PyCallable::class.java).use { repr ->
-                    repr.callAs(String::class.java, it)
-                }
-            }
-            else -> value
-        }
+        toJava(getValue(expression))
     }
 
     /**
      * Evaluates a Python [expression], converting its value to the reified type [T].
      *
+     * A value which Jep cannot convert, e.g. of `eval<Any>("len")`, or nested in a [List] or a [Map],
+     * becomes its Python `repr`.
+     *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
+     * @throws IllegalArgumentException if [T] is a [PyObject], which cannot leave the thread of this `Python`.
      */
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
         eval(expression, T::class.javaObjectType)
@@ -150,17 +149,26 @@ public class Python private constructor(
     /**
      * Evaluates a Python [expression], converting its value to the given [type].
      *
+     * A value which Jep cannot convert, e.g. of `eval("len", Any::class.java)`, or nested in a [List] or a [Map],
+     * becomes its Python `repr`.
+     *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
+     * @throws IllegalArgumentException if the [type] is a [PyObject], which cannot leave the thread of this `Python`.
      */
-    public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T =
-        call { getValue(expression, type) }
+    public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T {
+        require(!PyObject::class.java.isAssignableFrom(type)) { "A PyObject cannot leave the thread of Python" }
+        return call { type.cast(toJava(getValue(expression, type))) }
+    }
 
     /**
      * Returns the value of the global variable of the given [name], converted to a Java object.
      *
+     * A value which Jep cannot convert, e.g. of an imported module, or nested in a [List] or a [Map],
+     * becomes its Python `repr`.
+     *
      * @throws jep.JepException if there is no such variable.
      */
-    public operator fun get(name: String): Any? = call { getValue(name) }
+    public operator fun get(name: String): Any? = call { toJava(getValue(name)) }
 
     /**
      * Sets the global variable of the given [name] to the [value], converted to a Python object.
@@ -236,6 +244,32 @@ public class Python private constructor(
 
     private fun checkNotClosed() {
         if (closed.get()) throw closedException()
+    }
+
+    /**
+     * Replaces each [PyObject] of the [value], also nested in a [List], a [Map] or an array, with its `repr`,
+     * closing it, as it is bound to the thread of this interpreter.
+     * A collection without any is returned as it is.
+     */
+    private fun SharedInterpreter.toJava(value: Any?): Any? = when (value) {
+        is PyObject -> value.use {
+            getValue("__import__('builtins').repr", PyCallable::class.java).use { repr ->
+                repr.callAs(String::class.java, it)
+            }
+        }
+        is List<*> -> {
+            val list = value.map { toJava(it) }
+            if (list.indices.all { list[it] === value[it] }) value else list
+        }
+        is Map<*, *> -> {
+            val map = value.entries.associate { (key, element) -> toJava(key) to toJava(element) }
+            if (value.entries.all { (key, element) -> key in map && map[key] === element }) value else map
+        }
+        is Array<*> -> {
+            val array = Array(value.size) { toJava(value[it]) }
+            if (array.indices.all { array[it] === value[it] }) value else array
+        }
+        else -> value
     }
 
     private fun closedException() = IllegalStateException("Python is closed")
