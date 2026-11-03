@@ -49,7 +49,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * Once [close] is called, every call which is not running yet fails with an [IllegalStateException]
  * with the message `Python is closed` —
  * also a call racing `close()` from another thread, or waiting for its turn behind a running call.
- * Only the running call completes, and the interpreter is closed after it,
+ * Only the running call completes, also when a Kotlin function it calls calls back this `Python`,
+ * and the interpreter is closed after it,
  * exactly once, on the thread of this `Python`.
  *
  * A Kotlin function can be set as a global variable and called from Python, like `python["f"] = { n: Long -> n * 2 }`.
@@ -170,7 +171,8 @@ public class Python private constructor(
     /**
      * Closes the interpreter and releases its thread.
      *
-     * It waits for the running call, if any, to complete, and then closes the interpreter on its thread.
+     * It waits for the running call, if any, to complete, also calling back this `Python` from a Kotlin function,
+     * and then closes the interpreter on its thread.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
      * Calling it again has no effect, and returns immediately.
      */
@@ -178,11 +180,14 @@ public class Python private constructor(
         if (!closed.compareAndSet(false, true)) return
         // the calls submitted before, and still waiting for their turn, see it closed when it comes,
         // and the ones submitted afterward are rejected, so that this task is the last one to touch the interpreter
-        val closing = executor.submit {
-            interpreter?.close()
-            interpreter = null
+        val closing = try {
+            executor.submit {
+                interpreter?.close()
+                interpreter = null
+            }
+        } finally {
+            executor.shutdown()
         }
-        executor.shutdown()
         try {
             closing.get()
         } catch (e: ExecutionException) {
@@ -191,10 +196,11 @@ public class Python private constructor(
     }
 
     private fun <T> call(block: SharedInterpreter.() -> T): T {
-        checkNotClosed()
         // a Kotlin function called from Python, calling back this Python, runs already on its thread,
-        // where waiting for the executor would deadlock
+        // where waiting for the executor would deadlock; it belongs to the running call, which completes
+        // even if close() is already waiting for it, as the task of close() cannot run before
         if (Thread.currentThread() === thread) return interpreter!!.block()
+        checkNotClosed()
         val future = try {
             executor.submit<T> {
                 // close() might have been called after this call was submitted, and if its task has run already,
@@ -233,7 +239,7 @@ public class Python private constructor(
             decorateExecutor: (ExecutorService) -> ExecutorService
         ): Python = Python(decorateExecutor)
 
-        val threadCounter = AtomicInteger()
+        private val threadCounter = AtomicInteger()
 
         /**
          * Splits the code into the statements before its last expression, and this expression,
@@ -242,7 +248,7 @@ public class Python private constructor(
          * or cannot be parsed, so that executing it reports the `SyntaxError`.
          */
         @Language("python")
-        val SPLITTER = """
+        private val SPLITTER = """
             import ast
 
             def split(code):
@@ -264,10 +270,10 @@ public class Python private constructor(
          * Evaluates to the `split` function of the [SPLITTER],
          * defined in a namespace of its own, not to add it to the global variables.
          */
-        val SPLIT_LAST_EXPRESSION =
+        private val SPLIT_LAST_EXPRESSION =
             "(lambda namespace: exec(${pythonStringLiteral(SPLITTER)}, namespace) or namespace['split'])({})"
 
-        fun pythonStringLiteral(text: String): String = "'" + text
+        private fun pythonStringLiteral(text: String): String = "'" + text
             .replace("\\", "\\\\")
             .replace("'", "\\'")
             .replace("\n", "\\n") + "'"

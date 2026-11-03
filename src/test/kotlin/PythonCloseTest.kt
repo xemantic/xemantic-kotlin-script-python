@@ -23,6 +23,7 @@ import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit.SECONDS
 import kotlin.concurrent.thread
 import kotlin.test.Test
 
@@ -31,8 +32,9 @@ import kotlin.test.Test
  *
  * The races are made deterministic with latches:
  * a Kotlin callback blocks a running call on the Python thread,
- * and the submission of a call to the Python thread is intercepted
- * on the threads named in the test.
+ * and the submission of a call to the Python thread, and the shutdown of the executor,
+ * are intercepted on the threads named in the test.
+ * Each wait for a latch is bounded, only to fail a broken test instead of hanging the JVM.
  */
 class PythonCloseTest {
 
@@ -41,11 +43,11 @@ class PythonCloseTest {
         // given
         val racerSubmitting = CountDownLatch(1)
         val closed = CountDownLatch(1)
-        Python.withDecoratedExecutor(interceptingSubmission(
+        Python.withDecoratedExecutor(interceptingExecutor(
             beforeSubmit = {
                 if (Thread.currentThread().name == "racer") {
                     racerSubmitting.countDown()
-                    closed.await()
+                    assert(closed.await(10, SECONDS))
                 }
             }
         )).use { python ->
@@ -55,7 +57,7 @@ class PythonCloseTest {
             val racer = thread(name = "racer") {
                 failure = runCatching { python.eval<Long>("x") }.exceptionOrNull()
             }
-            racerSubmitting.await()
+            assert(racerSubmitting.await(10, SECONDS))
 
             // when
             python.close()
@@ -69,35 +71,45 @@ class PythonCloseTest {
     }
 
     @Test
-    fun `should fail call submitted while close waits for running call`() {
+    fun `should fail call submitted after task of close while close waits for running call`() {
         // given
         val callbackEntered = CountDownLatch(1)
         val releaseCallback = CountDownLatch(1)
         val racerSubmitting = CountDownLatch(1)
         val racerSubmitted = CountDownLatch(1)
         val closeSubmitted = CountDownLatch(1)
-        Python.withDecoratedExecutor(interceptingSubmission(
+        var racerAccepted: Boolean? = null
+        Python.withDecoratedExecutor(interceptingExecutor(
             beforeSubmit = {
                 if (Thread.currentThread().name == "racer") {
                     racerSubmitting.countDown()
-                    closeSubmitted.await()
+                    assert(closeSubmitted.await(10, SECONDS))
                 }
             },
-            afterSubmit = {
+            afterSubmit = { accepted ->
                 when (Thread.currentThread().name) {
-                    "racer" -> racerSubmitted.countDown()
+                    "racer" -> {
+                        racerAccepted = accepted
+                        racerSubmitted.countDown()
+                    }
                     "closer" -> closeSubmitted.countDown()
+                }
+            },
+            // the racer submits between the task of close() and the shutdown of the executor
+            beforeShutdown = {
+                if (Thread.currentThread().name == "closer") {
+                    assert(racerSubmitted.await(10, SECONDS))
                 }
             }
         )).use { python ->
             python["block"] = { n: Long ->
                 callbackEntered.countDown()
-                releaseCallback.await()
+                assert(releaseCallback.await(10, SECONDS))
                 n
             }
             var runningResult: Long? = null
             val running = thread { runningResult = python.eval<Long>("block(42)") }
-            callbackEntered.await()
+            assert(callbackEntered.await(10, SECONDS))
             var racerResult: Long? = null
             var racerFailure: Throwable? = null
             // passes the check of being closed, and then waits before submitting the call
@@ -106,11 +118,11 @@ class PythonCloseTest {
                     .onSuccess { racerResult = it }
                     .onFailure { racerFailure = it }
             }
-            racerSubmitting.await()
+            assert(racerSubmitting.await(10, SECONDS))
 
             // when
             val closer = thread(name = "closer") { python.close() }
-            racerSubmitted.await()
+            assert(racerSubmitted.await(10, SECONDS))
             releaseCallback.countDown()
             running.join()
             racer.join()
@@ -118,6 +130,8 @@ class PythonCloseTest {
 
             // then
             assert(runningResult == 42L)
+            // queued after the task of close(), not rejected by the executor
+            assert(racerAccepted == true)
             // a result would mean a new interpreter, created after closing the previous one, and never closed
             assert(racerResult == null)
             assert(racerFailure is IllegalStateException)
@@ -132,7 +146,7 @@ class PythonCloseTest {
         val releaseCallback = CountDownLatch(1)
         val waitingSubmitted = CountDownLatch(1)
         val closeSubmitted = CountDownLatch(1)
-        Python.withDecoratedExecutor(interceptingSubmission(
+        Python.withDecoratedExecutor(interceptingExecutor(
             afterSubmit = {
                 when (Thread.currentThread().name) {
                     "waiting" -> waitingSubmitted.countDown()
@@ -142,12 +156,12 @@ class PythonCloseTest {
         )).use { python ->
             python["block"] = { n: Long ->
                 callbackEntered.countDown()
-                releaseCallback.await()
+                assert(releaseCallback.await(10, SECONDS))
                 n
             }
             var runningResult: Long? = null
             val running = thread { runningResult = python.eval<Long>("block(42)") }
-            callbackEntered.await()
+            assert(callbackEntered.await(10, SECONDS))
             var waitingResult: Long? = null
             var waitingFailure: Throwable? = null
             // submitted before close, but waiting behind the running call
@@ -156,11 +170,11 @@ class PythonCloseTest {
                     .onSuccess { waitingResult = it }
                     .onFailure { waitingFailure = it }
             }
-            waitingSubmitted.await()
+            assert(waitingSubmitted.await(10, SECONDS))
 
             // when
             val closer = thread(name = "closer") { python.close() }
-            closeSubmitted.await()
+            assert(closeSubmitted.await(10, SECONDS))
             releaseCallback.countDown()
             running.join()
             waiting.join()
@@ -174,14 +188,54 @@ class PythonCloseTest {
         }
     }
 
+    @Test
+    fun `should complete running call calling back Python while close waits for it`() {
+        // given
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val closeSubmitted = CountDownLatch(1)
+        Python.withDecoratedExecutor(interceptingExecutor(
+            afterSubmit = {
+                if (Thread.currentThread().name == "closer") closeSubmitted.countDown()
+            }
+        )).use { python ->
+            python.exec("factor = 3")
+            python["scale"] = { n: Long ->
+                callbackEntered.countDown()
+                assert(releaseCallback.await(10, SECONDS))
+                n * python.eval<Long>("factor")
+            }
+            var runningResult: Long? = null
+            var runningFailure: Throwable? = null
+            val running = thread {
+                runCatching { python.eval<Long>("scale(7)") }
+                    .onSuccess { runningResult = it }
+                    .onFailure { runningFailure = it }
+            }
+            assert(callbackEntered.await(10, SECONDS))
+
+            // when
+            val closer = thread(name = "closer") { python.close() }
+            assert(closeSubmitted.await(10, SECONDS))
+            releaseCallback.countDown()
+            running.join()
+            closer.join()
+
+            // then
+            assert(runningFailure == null)
+            assert(runningResult == 21L)
+        }
+    }
+
     /**
-     * Decorates the executor of a [Python], to call [beforeSubmit] before,
-     * and [afterSubmit] after submitting each task, also a rejected one,
-     * on the submitting thread.
+     * Decorates the executor of a [Python], to call on the calling thread:
+     * [beforeSubmit] before, and [afterSubmit] after submitting each task, telling if it was accepted,
+     * and [beforeShutdown] before shutting the executor down.
      */
-    private fun interceptingSubmission(
+    private fun interceptingExecutor(
         beforeSubmit: () -> Unit = {},
-        afterSubmit: () -> Unit = {}
+        afterSubmit: (accepted: Boolean) -> Unit = {},
+        beforeShutdown: () -> Unit = {}
     ): (ExecutorService) -> ExecutorService = { executor ->
         object : ExecutorService by executor {
 
@@ -189,12 +243,18 @@ class PythonCloseTest {
 
             override fun submit(task: Runnable): Future<*> = intercept { executor.submit(task) }
 
+            override fun shutdown() {
+                beforeShutdown()
+                executor.shutdown()
+            }
+
             private fun <F> intercept(submit: () -> F): F {
                 beforeSubmit()
+                var accepted = false
                 return try {
-                    submit()
+                    submit().also { accepted = true }
                 } finally {
-                    afterSubmit()
+                    afterSubmit(accepted)
                 }
             }
 
