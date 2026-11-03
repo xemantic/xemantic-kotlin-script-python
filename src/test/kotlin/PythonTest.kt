@@ -299,6 +299,24 @@ class PythonTest {
     }
 
     @Test
+    fun `should run code with lone script metadata marker line`() {
+        // given
+        python.exec(
+            """
+            template = '''
+            # /// script
+            '''
+            """.trimIndent()
+        )
+
+        // when
+        val template = python.eval<String>("template")
+
+        // then
+        assert(template == "\n# /// script\n")
+    }
+
+    @Test
     fun `should fail when used after close`() {
         // given
         python.exec("x = 1")

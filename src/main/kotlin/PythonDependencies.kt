@@ -46,12 +46,54 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  */
 internal object PythonDependencies {
 
-    private val scriptMetadata = Regex("(?m)^# /// script$")
+    private val blockStart = Regex("# /// [a-zA-Z0-9-]+")
+
+    /**
+     * The TOML content of the `script` metadata block of the [code], or `null` if there is none.
+     *
+     * The blocks are found like with the regex of the
+     * [reference implementation](https://packaging.python.org/en/latest/specifications/inline-script-metadata/#reference-implementation),
+     * so an unclosed block is not a block, but line by line, in linear time:
+     * a regex retries all the following comment lines for every unclosed block start,
+     * and Java one also recurses for each line of the block.
+     *
+     * @throws PythonDependencyException if there is more than one `script` block.
+     */
+    fun scriptMetadata(code: String): String? {
+        // only `\n` ends a line, like for `$` of a Python regex
+        val lines = code.split('\n')
+        val blocks = mutableListOf<List<String>>()
+        var runStart = 0
+        while (runStart < lines.size) {
+            if (!lines[runStart].isComment()) {
+                runStart++
+                continue
+            }
+            var runEnd = runStart
+            while (runEnd < lines.size && lines[runEnd].isComment()) runEnd++
+            // a block is a run of consecutive comment lines, ending at its last closing line,
+            // started by its first block start followed by at least one content line before that
+            val end = (runStart until runEnd).lastOrNull { lines[it] == "# ///" }
+            val start = if (end == null) null else (runStart until end - 1).firstOrNull { blockStart.matches(lines[it]) }
+            if (start != null && lines[start] == "# /// script") {
+                blocks += lines.subList(start + 1, end!!)
+            }
+            runStart = runEnd
+        }
+        if (blocks.size > 1) {
+            throw PythonDependencyException("Multiple '# /// script' metadata blocks, only one is allowed")
+        }
+        return blocks.singleOrNull()?.joinToString("") {
+            (if (it.startsWith("# ")) it.drop(2) else it.drop(1)) + "\n"
+        }
+    }
+
+    private fun String.isComment() = this == "#" || startsWith("# ")
 
     /** Installs the missing dependencies declared by the [code], if any, on the thread of the [interpreter]. */
     @Synchronized
     fun install(code: String, interpreter: Interpreter) {
-        if (!scriptMetadata.containsMatchIn(code)) return
+        val metadata = scriptMetadata(code) ?: return
         val directory = PythonEnvironment.dependencyDirectory!!.createDirectories().toString()
         val imported = interpreter.getValue(
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
@@ -59,7 +101,7 @@ internal object PythonDependencies {
         ).map { it.toString() }
         val (exitCode, output) = runProcess(
             listOf(PythonEnvironment.executable, "-c", PLAN, directory) + imported,
-            input = code
+            input = metadata
         )
         if (exitCode != 0) throw PythonDependencyException(output)
         val plan = output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
@@ -117,7 +159,7 @@ internal object PythonDependencies {
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
      * or exits with the error.
      * Its arguments are the dependency directory and the imported top-level modules,
-     * and the code declaring the dependencies is read from the standard input.
+     * and the TOML content of the `script` metadata block, found by [scriptMetadata], is read from the standard input.
      */
     @Language("python")
     private val PLAN = """
@@ -125,22 +167,8 @@ internal object PythonDependencies {
 
         directory, imported = sys.argv[1], set(sys.argv[2:])
         sys.path.append(directory)
-        # the reference implementation of https://packaging.python.org/en/latest/specifications/inline-script-metadata/
-        blocks = [
-            match for match in re.finditer(
-                r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$", sys.stdin.read()
-            ) if match.group("type") == "script"
-        ]
-        if len(blocks) > 1:
-            sys.exit("Multiple '# /// script' metadata blocks, only one is allowed")
-        if not blocks:
-            sys.exit("Unclosed '# /// script' metadata block, it has to end with a '# ///' line")
-        content = "".join(
-            line[2:] if line.startswith("# ") else line[1:]
-            for line in blocks[0].group("content").splitlines(keepends=True)
-        )
         try:
-            dependencies = tomllib.loads(content).get("dependencies", [])
+            dependencies = tomllib.loads(sys.stdin.read()).get("dependencies", [])
         except tomllib.TOMLDecodeError as e:
             sys.exit(f"Invalid '# /// script' metadata: {e}")
         if not isinstance(dependencies, list) or not all(isinstance(it, str) for it in dependencies):
