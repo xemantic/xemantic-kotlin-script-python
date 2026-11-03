@@ -23,9 +23,12 @@ import jep.PyConfig
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.io.path.Path
+import kotlin.io.path.createTempFile
+import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.name
+import kotlin.io.path.readText
 
 /**
  * The Python environment of all the [Python] interpreters of the JVM,
@@ -80,22 +83,7 @@ public object PythonEnvironment {
     internal fun initialize() {
         if (initialized) return
         val python = (pythonExecutable ?: defaultPythonExecutable()).toString()
-        val (exitCode, output) = try {
-            runProcess(
-                listOf(
-                    python,
-                    "-c",
-                    "import importlib.util, sys; print(sys.executable, sys.implementation.cache_tag, sys.prefix, " +
-                        "importlib.util.find_spec('jep').submodule_search_locations[0], sep='\\n')"
-                )
-            )
-        } catch (e: java.io.IOException) {
-            throw IllegalStateException("Cannot run Python executable: $python", e)
-        }
-        check(exitCode == 0) {
-            "Cannot find the jep package of $python, install it with: $python -m pip install jep\n$output"
-        }
-        val (executable, cacheTag, prefix, jepLocation) = output.lines()
+        val (executable, cacheTag, prefix, jepLocation) = probePython(python)
         val jepDir = Path(jepLocation)
         val library = jepDir.listDirectoryEntries().firstOrNull {
             it.name.startsWith("libjep.") || it.name == "jep.dll"
@@ -122,6 +110,33 @@ public object PythonEnvironment {
         initialized = true
     }
 
+    /**
+     * Asks the [python] executable about itself.
+     *
+     * @throws IllegalStateException if it cannot be run, or has no `jep` package.
+     */
+    internal fun probePython(python: String): PythonProbe {
+        val (exitCode, output, error) = try {
+            runProcess(
+                listOf(
+                    python,
+                    "-c",
+                    "import importlib.util, sys; print(sys.executable, sys.implementation.cache_tag, sys.prefix, " +
+                        "importlib.util.find_spec('jep').submodule_search_locations[0], sep='\\n')"
+                ),
+                mergeErrorStream = false
+            )
+        } catch (e: java.io.IOException) {
+            throw IllegalStateException("Cannot run Python executable: $python", e)
+        }
+        check(exitCode == 0) {
+            "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
+                listOf(output, error).filter { it.isNotEmpty() }.joinToString("\n")
+        }
+        val (executable, cacheTag, prefix, jepLocation) = output.lines()
+        return PythonProbe(executable, cacheTag, prefix, jepLocation)
+    }
+
     private const val DEPENDENCY_DIRECTORY_PROPERTY = "xemantic.kotlin.script.python.dependencyDirectory"
 
     private fun checkNotInitialized() {
@@ -142,17 +157,67 @@ public object PythonEnvironment {
 }
 
 /**
+ * What a Python executable tells about itself.
+ *
+ * @property executable the absolute path of the executable, `sys.executable`.
+ * @property cacheTag the `sys.implementation.cache_tag`, e.g. `cpython-313`.
+ * @property prefix the `sys.prefix`, the virtual environment, if any.
+ * @property jepLocation the directory of the `jep` package.
+ */
+internal data class PythonProbe(
+    val executable: String,
+    val cacheTag: String,
+    val prefix: String,
+    val jepLocation: String
+)
+
+/**
+ * The result of [runProcess].
+ *
+ * @property exitCode the exit code of the process.
+ * @property output the standard output, merged with the standard error, unless the error stream is separate.
+ * @property error the standard error, if the error stream is separate, otherwise empty.
+ */
+internal data class ProcessResult(
+    val exitCode: Int,
+    val output: String,
+    val error: String
+)
+
+/**
  * Runs the [command], writing the [input] to its standard input, and waits for it to end.
  *
- * @return the exit code, and the standard output merged with the standard error.
+ * Its standard error is merged into its standard output when [mergeErrorStream],
+ * which keeps the order of all the messages, e.g. of a failing `pip`,
+ * otherwise it is collected separately, so that the standard output can be parsed,
+ * whatever Python writes to the standard error, e.g. a warning at startup.
  */
-internal fun runProcess(command: List<String>, input: String? = null): Pair<Int, String> {
-    val process = ProcessBuilder(command)
-        .redirectErrorStream(true)
-        .start()
-    process.outputStream.bufferedWriter().use { writer ->
-        if (input != null) writer.write(input)
+internal fun runProcess(
+    command: List<String>,
+    input: String? = null,
+    mergeErrorStream: Boolean = true
+): ProcessResult {
+    // a file, unlike a pipe, does not block the process when nobody reads it
+    val errorFile = if (mergeErrorStream) null else createTempFile("process-stderr", ".txt")
+    try {
+        val builder = ProcessBuilder(command)
+        if (errorFile == null) builder.redirectErrorStream(true) else builder.redirectError(errorFile.toFile())
+        val process = builder.start()
+        try {
+            process.outputStream.bufferedWriter().use { writer ->
+                if (input != null) writer.write(input)
+            }
+            val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+            val exitCode = process.waitFor()
+            return ProcessResult(exitCode, output, errorFile?.readText()?.trim() ?: "")
+        } finally {
+            // e.g. a broken pipe of the input, when the process does not read it
+            if (process.isAlive) {
+                process.destroyForcibly()
+                process.waitFor()
+            }
+        }
+    } finally {
+        errorFile?.deleteIfExists()
     }
-    val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-    return process.waitFor() to output
 }
