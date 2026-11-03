@@ -22,6 +22,7 @@ import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.should
 import jep.JepException
+import jep.python.PyObject
 import kotlin.concurrent.thread
 import kotlin.io.path.Path
 import kotlin.test.AfterTest
@@ -132,6 +133,77 @@ class PythonTest {
 
         // then
         assert(result == "Point(1, 2)")
+    }
+
+    @Test
+    fun `should return repr of values not convertible to Java nested in collections`() {
+        // given
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            """.trimIndent()
+        )
+
+        // when
+        val list = python("[Point(), [Point()]]")
+        val tuple = python("(Point(), 1)")
+        val dict = python("{'p': Point(), 'nested': {'q': Point()}}")
+
+        // then
+        assert(list == listOf("Point", listOf("Point")))
+        assert(tuple == listOf("Point", 1L))
+        assert(dict == mapOf("p" to "Point", "nested" to mapOf("q" to "Point")))
+    }
+
+    @Test
+    fun `should get repr of global variable not convertible to Java`() {
+        // given
+        python.exec("import math")
+
+        // when
+        val math = python["math"]
+
+        // then
+        // math is either built in, or loaded from a file, depending on how Python was built
+        assert(math is String && math.startsWith("<module 'math'"))
+    }
+
+    @Test
+    fun `should get repr of values not convertible to Java nested in global variable`() {
+        // given
+        python.exec("functions = {'all': [len, abs]}")
+
+        // when
+        val functions = python["functions"]
+
+        // then
+        assert(functions == mapOf("all" to listOf("<built-in function len>", "<built-in function abs>")))
+    }
+
+    @Test
+    fun `should evaluate to repr of value not convertible to Java`() {
+        // when
+        val len = python.eval<Any>("len")
+        val functions = python.eval<List<Any>>("[len, abs]")
+        val byName = python.eval<Map<String, Any>>("{'len': len}")
+
+        // then
+        assert(len == "<built-in function len>")
+        assert(functions == listOf("<built-in function len>", "<built-in function abs>"))
+        assert(byName == mapOf("len" to "<built-in function len>"))
+    }
+
+    @Test
+    fun `should reject evaluating to PyObject`() {
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            python.eval<PyObject>("len")
+        }
+
+        // then
+        assert(exception.message == "A PyObject cannot leave the thread of Python")
     }
 
     @Test
