@@ -167,15 +167,10 @@ internal object PythonDependencies {
                     "--python", PythonEnvironment.executable,
                     "--target", directory,
                     "--constraints", constraintsFile.toString()
-                )
+                ) + missing
             } else {
-                listOf(
-                    PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
-                    "--disable-pip-version-check", "--no-input", "--upgrade",
-                    "--target", directory,
-                    "--constraint", constraintsFile.toString()
-                )
-            } + missing
+                pipInstallCommand(PythonEnvironment.executable, directory, constraintsFile.toString(), missing)
+            }
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
@@ -186,6 +181,66 @@ internal object PythonDependencies {
             constraintsFile.deleteIfExists()
         }
     }
+
+    /**
+     * The command installing the [requirements] with pip of the [python] executable into the [directory],
+     * keeping the distributions of the [constraints] file in their versions,
+     * and the ones already in the [directory], if they satisfy the [requirements].
+     */
+    internal fun pipInstallCommand(
+        python: String,
+        directory: String,
+        constraints: String,
+        requirements: List<String>
+    ): List<String> = listOf(python, "-c", PIP_INSTALL, directory, constraints) + requirements
+
+    /**
+     * Installs the requirements with pip into the dependency directory, its first argument,
+     * keeping the versions of the constraints file, its second argument.
+     *
+     * pip ignores the distributions already installed in a `--target` directory,
+     * so it would install them again, also with their own dependencies, replacing the files of the loaded modules.
+     * Therefore, the distributions to install are resolved first, with the dependency directory on `sys.path`,
+     * and then only these are installed, without their dependencies.
+     */
+    @Language("python")
+    private val PIP_INSTALL = """
+        import json, os, subprocess, sys, tempfile
+
+        directory, constraints, requirements = sys.argv[1], sys.argv[2], sys.argv[3:]
+        options = ["--quiet", "--disable-pip-version-check", "--no-input"]
+        pip_seeing_directory = [
+            sys.executable, "-c",
+            "import runpy, sys; sys.path.append(sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__', alter_sys=True)",
+            directory
+        ] + options
+        with tempfile.TemporaryDirectory() as temp:
+            report = os.path.join(temp, "report.json")
+            resolution = subprocess.run(
+                pip_seeing_directory + ["install", "--dry-run", "--report", report, "--constraint", constraints] + requirements
+            )
+            if resolution.returncode != 0:
+                sys.exit(resolution.returncode)
+            with open(report, encoding="utf-8") as file:
+                resolved = json.load(file)["install"]
+
+        def pinned(distribution):
+            name, download = distribution["metadata"]["name"], distribution["download_info"]
+            if not distribution["is_direct"]:
+                return f"{name}=={distribution['metadata']['version']}"
+            if "vcs_info" in download:
+                vcs = download["vcs_info"]
+                return f"{name} @ {vcs['vcs']}+{download['url']}@{vcs['commit_id']}"
+            return f"{name} @ {download['url']}"
+
+        if resolved:
+            # --upgrade replaces the distributions of the directory not satisfying the requirements
+            sys.exit(subprocess.run(
+                [sys.executable, "-m", "pip"] + options
+                + ["install", "--no-deps", "--upgrade", "--target", directory]
+                + [pinned(distribution) for distribution in resolved]
+            ).returncode)
+    """.trimIndent()
 
     private fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
