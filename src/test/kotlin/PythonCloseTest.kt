@@ -234,7 +234,7 @@ class PythonCloseTest {
         val events = CopyOnWriteArrayList<String>()
         val closeTaskRan = CountDownLatch(1)
         Python.withDecoratedExecutor(interceptingExecutor(
-            // only the task of close() is submitted as a Runnable
+            // only the task of close() is submitted as a Runnable, the calls are submitted as a Callable
             decorateRunnable = { task ->
                 Runnable {
                     task.run()
@@ -243,7 +243,9 @@ class PythonCloseTest {
                 }
             }
         )).use { python ->
+            var pythonThread: String? = null
             python["stop"] = {
+                pythonThread = Thread.currentThread().name
                 python.close()
                 events += "stop returned on ${Thread.currentThread().name}"
             }
@@ -261,8 +263,7 @@ class PythonCloseTest {
             assert(!caller.isAlive)
             assert(execFailure == null)
             assert(closeTaskRan.await(10, SECONDS))
-            val pythonThread = events.first().substringAfterLast(" ")
-            assert(pythonThread.startsWith("python-"))
+            assert(pythonThread?.startsWith("python-") == true)
             assert(events == listOf(
                 "stop returned on $pythonThread",
                 "after on $pythonThread",
@@ -270,7 +271,7 @@ class PythonCloseTest {
             ))
             val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
             assert(laterFailure is IllegalStateException)
-            assert(laterFailure?.message == "Python is closed")
+            assert(laterFailure.message == "Python is closed")
         }
     }
 
@@ -297,6 +298,9 @@ class PythonCloseTest {
             assert(!caller.isAlive)
             assert(failure == null)
             assert(result == 21L)
+            val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+            assert(laterFailure is IllegalStateException)
+            assert(laterFailure.message == "Python is closed")
         }
     }
 
@@ -305,6 +309,9 @@ class PythonCloseTest {
      * [beforeSubmit] before, and [afterSubmit] after submitting each task, telling if it was accepted,
      * and [beforeShutdown] before shutting the executor down,
      * while each submitted [Runnable] is replaced with the one returned by [decorateRunnable].
+     *
+     * The task of [Python.close] is the only one submitted as a [Runnable], the calls are submitted as a [Callable],
+     * so [decorateRunnable] intercepts only the closing of the interpreter.
      */
     private fun interceptingExecutor(
         beforeSubmit: () -> Unit = {},
