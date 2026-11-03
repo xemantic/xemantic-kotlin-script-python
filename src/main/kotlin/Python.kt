@@ -52,6 +52,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * Only the running call completes, also when a Kotlin function it calls calls back this `Python`,
  * and the interpreter is closed after it,
  * exactly once, on the thread of this `Python`.
+ * Also such a Kotlin function can call `close()`, which then closes this `Python` after the running call.
  *
  * A Kotlin function can be set as a global variable and called from Python, like `python["f"] = { n: Long -> n * 2 }`.
  * It runs on the thread of this `Python`, and can call it back.
@@ -175,6 +176,11 @@ public class Python private constructor(
      * and then closes the interpreter on its thread.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
      * Calling it again has no effect, and returns immediately.
+     *
+     * Called by a Kotlin function, which is called from Python, it does not wait,
+     * as the running call is the one which called it:
+     * it returns immediately, the running call continues and completes normally,
+     * still able to call back this `Python`, and the interpreter is closed after it returns.
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -188,6 +194,9 @@ public class Python private constructor(
         } finally {
             executor.shutdown()
         }
+        // called by a Kotlin function, called from Python, the running call is still on the stack of this thread,
+        // and the task of close() can run only after it, so waiting for it here would deadlock
+        if (Thread.currentThread() === thread) return
         try {
             closing.get()
         } catch (e: ExecutionException) {
