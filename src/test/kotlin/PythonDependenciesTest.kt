@@ -250,4 +250,40 @@ class PythonDependenciesTest {
         assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
     }
 
+    @Test
+    fun `should plan without tomllib of Python before 3_11`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // None in sys.modules makes the import fail with ModuleNotFoundError, like on Python 3.10
+        val code = "import sys; sys.modules['tomllib'] = None\n" + PythonDependencies.PLAN
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", code, directory),
+            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
+        )
+
+        // then
+        assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+    }
+
+    @Test
+    fun `should fail plan with clear message without any TOML parser`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val code = "import sys; sys.modules.update(dict.fromkeys(['tomllib', 'tomli', 'pip'], None))\n" +
+            PythonDependencies.PLAN
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", code, directory),
+            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
+        )
+
+        // then
+        assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+    }
+
 }
