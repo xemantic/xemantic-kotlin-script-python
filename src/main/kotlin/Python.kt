@@ -22,6 +22,8 @@ import jep.SharedInterpreter
 import jep.python.PyCallable
 import jep.python.PyObject
 import org.intellij.lang.annotations.Language
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -52,6 +54,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * a `str` a [String], and a `list` a [List].
  * A returned value which Jep cannot convert, also when nested in a [List], a [Map] or an array,
  * becomes its Python `repr`, as a Python object cannot be used outside the thread of this `Python`.
+ * If different keys of a `dict` have the same `repr`, e.g. `{'Point': 1, Point(): 2}`,
+ * an [IllegalStateException] is thrown, not to drop an entry silently.
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
  */
@@ -200,28 +204,128 @@ public class Python : AutoCloseable {
 
     /**
      * Replaces each [PyObject] of the [value], also nested in a [List], a [Map] or an array, with its `repr`,
-     * closing it, as it is bound to the thread of this interpreter.
-     * A collection without any is returned as it is.
+     * closing all of them, also when the conversion fails, as they are bound to the thread of this interpreter.
      */
-    private fun SharedInterpreter.toJava(value: Any?): Any? = when (value) {
-        is PyObject -> value.use {
-            getValue("__import__('builtins').repr", PyCallable::class.java).use { repr ->
-                repr.callAs(String::class.java, it)
+    private fun SharedInterpreter.toJava(value: Any?): Any? = PyObjectConverter(this).use { it.convert(value) }
+
+    /**
+     * Converts a value returned by Jep, see [toJava].
+     *
+     * A collection without any [PyObject] is returned as it is, otherwise as a copy,
+     * so a converted value is never the same instance as the original one.
+     * A collection already being converted, i.e. containing itself, is not converted again,
+     * which only a collection set from Java can do, so it cannot contain a [PyObject].
+     *
+     * @throws IllegalStateException if different keys of a map have the same `repr`,
+     * not to drop an entry silently.
+     */
+    private class PyObjectConverter(private val interpreter: SharedInterpreter) : AutoCloseable {
+
+        private var repr: PyCallable? = null
+
+        private val visiting = Collections.newSetFromMap(IdentityHashMap<Any, Boolean>())
+
+        private val closed = Collections.newSetFromMap(IdentityHashMap<PyObject, Boolean>())
+
+        private var original: Any? = null
+
+        private var failed = true
+
+        fun convert(value: Any?): Any? {
+            original = value
+            return convertValue(value).also { failed = false }
+        }
+
+        private fun convertValue(value: Any?): Any? = when (value) {
+            is PyObject -> try {
+                val repr = repr ?: interpreter.getValue("__import__('builtins').repr", PyCallable::class.java)
+                    .also { repr = it }
+                repr.callAs(String::class.java, value)
+            } finally {
+                close(value)
+            }
+            is List<*> -> visit(value) { convertList(value) }
+            is Map<*, *> -> visit(value) { convertMap(value) }
+            is Array<*> -> visit(value) { convertArray(value) }
+            else -> value
+        }
+
+        private inline fun visit(value: Any, convert: () -> Any): Any {
+            if (!visiting.add(value)) return value
+            try {
+                return convert()
+            } finally {
+                visiting.remove(value)
             }
         }
-        is List<*> -> {
-            val list = value.map { toJava(it) }
-            if (list.indices.all { list[it] === value[it] }) value else list
+
+        private fun convertList(list: List<*>): List<*> {
+            var converted: MutableList<Any?>? = null
+            list.forEachIndexed { index, element ->
+                val value = convertValue(element)
+                if (converted == null && value !== element) converted = ArrayList(list.subList(0, index))
+                converted?.add(value)
+            }
+            return converted ?: list
         }
-        is Map<*, *> -> {
-            val map = value.entries.associate { (key, element) -> toJava(key) to toJava(element) }
-            if (value.entries.all { (key, element) -> key in map && map[key] === element }) value else map
+
+        private fun convertMap(map: Map<*, *>): Map<*, *> {
+            var converted: MutableMap<Any?, Any?>? = null
+            map.entries.forEachIndexed { index, (key, element) ->
+                val convertedKey = convertValue(key)
+                val value = convertValue(element)
+                if (converted == null && (convertedKey !== key || value !== element)) {
+                    converted = LinkedHashMap<Any?, Any?>().apply {
+                        map.entries.take(index).forEach { (key, element) -> put(key, element) }
+                    }
+                }
+                converted?.let {
+                    check(convertedKey !in it) { "Different keys of a dict have the same repr: $convertedKey" }
+                    it[convertedKey] = value
+                }
+            }
+            return converted ?: map
         }
-        is Array<*> -> {
-            val array = Array(value.size) { toJava(value[it]) }
-            if (array.indices.all { array[it] === value[it] }) value else array
+
+        private fun convertArray(array: Array<*>): Array<*> {
+            var converted: Array<Any?>? = null
+            array.forEachIndexed { index, element ->
+                val value = convertValue(element)
+                if (converted == null && value !== element) converted = Array(array.size) { array[it] }
+                converted?.set(index, value)
+            }
+            return converted ?: array
         }
-        else -> value
+
+        private fun close(value: PyObject) {
+            if (closed.add(value)) value.close()
+        }
+
+        /**
+         * Closes the `repr` function, and, if the conversion failed,
+         * each [PyObject] of the original value, which was not converted yet.
+         */
+        override fun close() {
+            try {
+                if (failed) closeAll(original, Collections.newSetFromMap(IdentityHashMap()))
+            } finally {
+                repr?.close()
+            }
+        }
+
+        private fun closeAll(value: Any?, visited: MutableSet<Any>) {
+            if (value == null || !visited.add(value)) return
+            when (value) {
+                is PyObject -> close(value)
+                is List<*> -> value.forEach { closeAll(it, visited) }
+                is Map<*, *> -> value.forEach { (key, element) ->
+                    closeAll(key, visited)
+                    closeAll(element, visited)
+                }
+                is Array<*> -> value.forEach { closeAll(it, visited) }
+            }
+        }
+
     }
 
     private companion object {

@@ -158,6 +158,103 @@ class PythonTest {
     }
 
     @Test
+    fun `should return repr of dict keys not convertible to Java`() {
+        // given
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            d = {len: 'x'}
+            """.trimIndent()
+        )
+
+        // when
+        val byPoint = python("{Point(): 1, 'other': 2}")
+        val byFunction = python("{len: 1}")
+        val global = python["d"]
+
+        // then
+        assert(byPoint == mapOf("Point" to 1L, "other" to 2L))
+        assert(byFunction == mapOf("<built-in function len>" to 1L))
+        assert(global == mapOf("<built-in function len>" to "x"))
+    }
+
+    @Test
+    fun `should reject dict keys of the same repr`() {
+        // given
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            """.trimIndent()
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            python("{'Point': 1, Point(): 2}")
+        }
+
+        // then
+        assert(exception.message == "Different keys of a dict have the same repr: Point")
+    }
+
+    @Test
+    fun `should report failing repr of value not convertible to Java`() {
+        // given
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            class Broken:
+                def __repr__(self):
+                    raise ValueError('no repr')
+            import gc, weakref
+            references = []
+            def tracked(value):
+                references.append(weakref.ref(value))
+                return value
+            """.trimIndent()
+        )
+
+        // when
+        val exception = assertFailsWith<JepException> {
+            python("[tracked(Point()), tracked(Broken()), tracked(Point())]")
+        }
+
+        // then
+        assert(exception.message!!.contains("no repr"))
+        // all the objects are closed, also the one not converted yet
+        assert(python.eval<Boolean>("gc.collect() >= 0 and all(r() is None for r in references)"))
+        assert(python("[Point()]") == listOf("Point"))
+    }
+
+    @Test
+    fun `should return repr of values not convertible to Java nested in array`() {
+        // when
+        val array = python.eval("[len, 1]", Array<Any>::class.java)
+
+        // then
+        assert(array.toList() == listOf("<built-in function len>", 1L))
+    }
+
+    @Test
+    fun `should return self-referencing collection set from Kotlin`() {
+        // given
+        val list = mutableListOf<Any>()
+        list.add(list)
+        python["l"] = list
+
+        // when
+        val result = python["l"]
+
+        // then
+        assert(result === list)
+    }
+
+    @Test
     fun `should get repr of global variable not convertible to Java`() {
         // given
         python.exec("import math")
