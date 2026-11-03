@@ -1,0 +1,22 @@
+public final class com/xemantic/kotlin/script/python/Python : java/lang/AutoCloseable {
+	public fun <init> ()V
+	public fun close ()V
+	public final fun eval (Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;
+	public final fun exec (Ljava/lang/String;)V
+	public final fun get (Ljava/lang/String;)Ljava/lang/Object;
+	public final fun invoke (Ljava/lang/String;)Ljava/lang/Object;
+	public final fun set (Ljava/lang/String;Ljava/lang/Object;)V
+}
+
+public final class com/xemantic/kotlin/script/python/PythonDependencyException : java/lang/RuntimeException {
+	public fun <init> (Ljava/lang/String;)V
+}
+
+public final class com/xemantic/kotlin/script/python/PythonEnvironment {
+	public static final field INSTANCE Lcom/xemantic/kotlin/script/python/PythonEnvironment;
+	public final fun getDependencyDirectory ()Ljava/nio/file/Path;
+	public final fun getPythonExecutable ()Ljava/nio/file/Path;
+	public final fun setDependencyDirectory (Ljava/nio/file/Path;)V
+	public final fun setPythonExecutable (Ljava/nio/file/Path;)V
+}
+

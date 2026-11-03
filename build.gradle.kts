@@ -1,15 +1,14 @@
-@file:OptIn(ExperimentalWasmDsl::class, ExperimentalKotlinGradlePluginApi::class)
+@file:OptIn(ExperimentalKotlinGradlePluginApi::class, ExperimentalAbiValidation::class)
 
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
-import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
+import org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation
 import org.jreleaser.model.Active
 
 plugins {
-    alias(libs.plugins.kotlin.multiplatform)
+    alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.plugin.power.assert)
-    alias(libs.plugins.kotlinx.binary.compatibility.validator)
     alias(libs.plugins.dokka)
     alias(libs.plugins.version.catalog.update)
     alias(libs.plugins.maven.publish)
@@ -17,13 +16,11 @@ plugins {
     alias(libs.plugins.xemantic.conventions)
 }
 
-// TODO change the group
-group = "com.xemantic.template"
+group = "com.xemantic.kotlin"
 
-// TODO fill up the details
 xemantic {
-    description = "A template repository for Xemantic's Kotlin multiplatform projects"
-    inceptionYear = "2025"
+    description = "Stateful Python, embedded with Jep, in Kotlin scripts"
+    inceptionYear = "2026"
     applyAllConventions()
 }
 
@@ -40,91 +37,48 @@ val kotlinTarget = KotlinVersion.fromVersion(libs.versions.kotlinTarget.get())
 
 kotlin {
 
-    // TODO remove for a non-library project
     explicitApi()
 
+    abiValidation {}
+
+    // set up according to https://jakewharton.com/gradle-toolchains-are-rarely-a-good-idea/
     compilerOptions {
         apiVersion = kotlinTarget
         languageVersion = kotlinTarget
+        jvmTarget = JvmTarget.fromTarget(javaTarget)
+        freeCompilerArgs.add("-Xjdk-release=$javaTarget")
         extraWarnings = true
         progressiveMode = true
-        //optIn.addAll("add opt ins here")
-        //freeCompilerArgs.addAll()
-    }
-
-    jvm {
-        // set up according to https://jakewharton.com/gradle-toolchains-are-rarely-a-good-idea/
-        compilerOptions {
-            apiVersion = kotlinTarget
-            languageVersion = kotlinTarget
-            jvmTarget = JvmTarget.fromTarget(javaTarget)
-            freeCompilerArgs.add("-Xjdk-release=$javaTarget")
-            progressiveMode = true
-        }
-    }
-
-    js {
-        browser()
-        nodejs()
-        // TODO remove for a non-library project
-        binaries.library()
-    }
-
-    wasmJs {
-        browser()
-        nodejs()
-        d8()
-        // TODO remove for a non-library project
-        binaries.library()
-    }
-
-    wasmWasi {
-        nodejs()
-        // TODO remove for a non-library project
-        binaries.library()
-    }
-
-    // native, see https://kotlinlang.org/docs/native-target-support.html
-    // tier 1
-    macosArm64()
-    iosSimulatorArm64()
-    iosX64()
-    iosArm64()
-
-    // tier 2
-    linuxX64()
-    linuxArm64()
-    watchosSimulatorArm64()
-    watchosArm32()
-    watchosArm64()
-    tvosSimulatorArm64()
-    tvosArm64()
-
-    // tier 3
-    androidNativeArm32()
-    androidNativeArm64()
-    androidNativeX86()
-    androidNativeX64()
-    mingwX64()
-    watchosDeviceArm64()
-
-    swiftExport {}
-
-    sourceSets {
-
-        commonTest {
-            dependencies {
-                implementation(libs.kotlin.test)
-                implementation(libs.xemantic.kotlin.test)
-            }
-        }
-
     }
 
 }
 
+java {
+    sourceCompatibility = JavaVersion.toVersion(javaTarget)
+    targetCompatibility = JavaVersion.toVersion(javaTarget)
+}
+
 repositories {
     mavenCentral()
+    // TODO remove once xemantic-kotlin-script is released, a SNAPSHOT published with publishToMavenLocal for now
+    mavenLocal {
+        content {
+            includeModule("com.xemantic.kotlin", "xemantic-kotlin-script")
+        }
+    }
+}
+
+dependencies {
+    api(libs.xemantic.kotlin.script)
+    // the Java side of Jep, its native library comes with the jep Python package, installed with pip
+    api(libs.jep)
+    api(libs.kotlinx.coroutines.core)
+
+    testImplementation(libs.kotlin.test)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.xemantic.kotlin.test)
+    // only the tests bind an SLF4J backend, a library leaves this choice to the application
+    testRuntimeOnly(libs.logback.classic)
 }
 
 configurations.all {
@@ -135,24 +89,53 @@ configurations.all {
     }
 }
 
-// skip tests which require XCode components to be installed
-tasks {
-    named("tvosSimulatorArm64Test") { enabled = false }
-    named("watchosSimulatorArm64Test") { enabled = false }
+// the Python virtual environment of the tests, with the jep package matching the org.ninia:jep library
+val pythonVenv = layout.projectDirectory.dir(".venv")
+val venvPython = pythonVenv.file("bin/python")
+
+val createPythonVenv = tasks.register<Exec>("createPythonVenv") {
+    description = "Creates the Python virtual environment of the tests"
+    // a local value, as the configuration cache cannot serialize a reference to the build script
+    val python = venvPython.asFile
+    outputs.file(python)
+    onlyIf { !python.exists() }
+    commandLine("python3", "-m", "venv", pythonVenv.asFile.absolutePath)
 }
 
-// TODO only relevant for private projects, public project snapshots are released to maven central
-//publishing {
-//    if (isPublishingToGitHub) {
-//        repositories {
-//            maven {
-//                name = "GitHubPackages"
-//                url = uri("https://maven.pkg.github.com/xemantic/xemantic-kotlin-core")
-//                credentials(PasswordCredentials::class)
-//            }
-//        }
-//    }
-//}
+val installPythonPackages = tasks.register<Exec>("installPythonPackages") {
+    description = "Installs jep into the virtual environment of the tests"
+    dependsOn(createPythonVenv)
+    // only jep, like a clean environment of an agent, the tests declare the packages they use as dependencies
+    val packages = listOf("jep==${libs.versions.jep.get()}")
+    inputs.property("packages", packages)
+    // in the virtual environment, so that the packages are installed again when it is recreated
+    val marker = pythonVenv.file("installed-packages.txt")
+    outputs.file(marker)
+    commandLine(listOf(venvPython.asFile.absolutePath, "-m", "pip", "install", "--quiet", "--disable-pip-version-check") + packages)
+    doLast {
+        marker.asFile.writeText(packages.joinToString("\n"))
+    }
+}
+
+tasks.test {
+    // the installed packages as an input, so that the tests rerun after changing them
+    inputs.files(installPythonPackages)
+    environment("VIRTUAL_ENV", pythonVenv.asFile.absolutePath)
+    // the dependencies declared by the tests are installed from scratch on every run, not into the user cache,
+    // so that a test can check that a dependency is not installed yet
+    val dependencyDirectory = layout.buildDirectory.dir("python-dependencies").get().asFile
+    systemProperty("xemantic.kotlin.script.python.dependencyDirectory", dependencyDirectory.absolutePath)
+    doFirst {
+        dependencyDirectory.deleteRecursively()
+    }
+    // Jep loads its native library with System.load, restricted since JDK 24
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    useJUnitPlatform()
+    if (JavaVersion.current().isCompatibleWith(JavaVersion.VERSION_23)) {
+        // the fast JAR file system of the Kotlin compiler calls sun.misc.Unsafe, the option is unknown before JDK 23
+        jvmArgs("--sun-misc-unsafe-memory-access=allow")
+    }
+}
 
 powerAssert {
     functions = listOf(
@@ -198,9 +181,9 @@ mavenPublishing {
 
         licenses {
             license {
-                name = "The Apache License, Version 2.0"
-                url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
-                distribution = "https://www.apache.org/licenses/LICENSE-2.0.txt"
+                name = "GNU Affero General Public License v3.0"
+                url = "https://www.gnu.org/licenses/agpl-3.0.txt"
+                distribution = "https://www.gnu.org/licenses/agpl-3.0.txt"
             }
         }
 
