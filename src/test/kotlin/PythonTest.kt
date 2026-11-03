@@ -211,23 +211,16 @@ class PythonTest {
             class Broken:
                 def __repr__(self):
                     raise ValueError('no repr')
-            import gc, weakref
-            references = []
-            def tracked(value):
-                references.append(weakref.ref(value))
-                return value
             """.trimIndent()
         )
 
         // when
         val exception = assertFailsWith<JepException> {
-            python("[tracked(Point()), tracked(Broken()), tracked(Point())]")
+            python("[Point(), Broken(), Point()]")
         }
 
         // then
         assert(exception.message!!.contains("no repr"))
-        // all the objects are closed, also the one not converted yet
-        assert(python.eval<Boolean>("gc.collect() >= 0 and all(r() is None for r in references)"))
         assert(python("[Point()]") == listOf("Point"))
     }
 
@@ -252,6 +245,78 @@ class PythonTest {
 
         // then
         assert(result === list)
+    }
+
+    @Test
+    fun `should not change Kotlin collection holding Python objects when reading it`() {
+        // given
+        val list = mutableListOf<Any?>()
+        python["k"] = list
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            k.add(Point())
+            k.add(len)
+            """.trimIndent()
+        )
+
+        // when
+        val result = python["k"]
+
+        // then
+        // the list holding Python objects is not rendered by power-assert, which cannot do it on this thread
+        val copied = result !== list
+        val size = list.size
+        assert(result == listOf("Point", "<built-in function len>"))
+        assert(copied)
+        assert(size == 2)
+        assert(python("k.get(1)('abc')") == 3L)
+        assert(python("k.get(0)") == "Point")
+    }
+
+    @Test
+    fun `should return repr of the same Python object held twice by Kotlin collection`() {
+        // given
+        val list = mutableListOf<Any?>()
+        python["k"] = list
+        python["f"] = { value: Any? ->
+            list.add(value)
+            list.add(value)
+        }
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            f(Point())
+            """.trimIndent()
+        )
+
+        // when
+        val result = python["k"]
+
+        // then
+        assert(result == listOf("Point", "Point"))
+    }
+
+    @Test
+    fun `should copy self-referencing Kotlin collection holding Python object`() {
+        // given
+        val list = mutableListOf<Any?>()
+        list.add(list)
+        python["s"] = list
+        python.exec("s.add(len)")
+
+        // when
+        val result = python["s"]
+
+        // then
+        // the list holding a Python object is not rendered by power-assert, which cannot do it on this thread
+        val copied = result !== list
+        assert(copied)
+        assert(result is List<*> && result[0] === result && result[1] == "<built-in function len>")
     }
 
     @Test
