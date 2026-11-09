@@ -96,8 +96,17 @@ otherwise the code can declare it as a dependency, see below.
   python("import numpy as np; a = np.arange(10)") // null
   python("a.sum()")                                 // 45L
   ```
-  The value is converted by Jep to its default Java type,
-  and a value which Jep cannot convert is returned as its Python `repr`.
+  The value is converted by Jep to its default Java type.
+* A value returned by `python(code)`, `eval` or `python["name"]`, which Jep cannot convert,
+  like a module, a function or an instance of a Python class,
+  is returned as its Python `repr`, also when nested in a `List`, a `Set`, a `Map` or an array,
+  as a Python object can be used only on the thread of its `Python`:
+  ```kotlin
+  python("[len, 1]") // listOf("<built-in function len>", 1L)
+  ```
+  If different keys of a `dict`, or elements of a `Set`, have the same `repr`,
+  an `IllegalStateException` is thrown, not to drop an entry silently,
+  and `eval<PyObject>` (or an array of them) fails with an `IllegalArgumentException`.
 * For an AI agent, the `Python` can be started lazily, only when a script uses it,
   as the first one initializes the Python environment:
   ```kotlin

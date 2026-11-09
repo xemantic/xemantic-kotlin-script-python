@@ -61,9 +61,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *
  * The values are converted between Java and Python by Jep, e.g. a Python `int` becomes a [Long],
  * a `str` a [String], and a `list` a [List].
- * A returned value which Jep cannot convert, also when nested in a [List], a [Map] or an array,
+ * A returned value which Jep cannot convert, also when nested in a [Collection], a [Map] or an array,
  * becomes its Python `repr`, as a Python object cannot be used outside the thread of this `Python`.
- * If different keys of a `dict` have the same `repr`, e.g. `{'Point': 1, Point(): 2}`,
+ * If different keys of a `dict`, or elements of a [Set], have the same `repr`, e.g. `{'Point': 1, Point(): 2}`,
  * an [IllegalStateException] is thrown, not to drop an entry silently.
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
@@ -126,7 +126,7 @@ public class Python private constructor(
      *
      * @throws jep.JepException if the code fails, with the type and the message of the Python exception.
      * @throws PythonDependencyException if the declared dependencies cannot be installed.
-     * @throws IllegalStateException if different keys of a returned `dict` have the same `repr`.
+     * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public operator fun invoke(@Language("python") code: String): Any? = call {
         PythonDependencies.install(code, this)
@@ -142,12 +142,12 @@ public class Python private constructor(
     /**
      * Evaluates a Python [expression], converting its value to the reified type [T].
      *
-     * A value which Jep cannot convert, e.g. of `eval<Any>("len")`, or nested in a [List] or a [Map],
+     * A value which Jep cannot convert, e.g. of `eval<Any>("len")`, or nested in a [Collection] or a [Map],
      * becomes its Python `repr`.
      *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
-     * @throws IllegalArgumentException if [T] is a [PyObject], which cannot leave the thread of this `Python`.
-     * @throws IllegalStateException if different keys of a returned `dict` have the same `repr`.
+     * @throws IllegalArgumentException if [T] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`.
+     * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
         eval(expression, T::class.javaObjectType)
@@ -155,26 +155,26 @@ public class Python private constructor(
     /**
      * Evaluates a Python [expression], converting its value to the given [type].
      *
-     * A value which Jep cannot convert, e.g. of `eval("len", Any::class.java)`, or nested in a [List] or a [Map],
+     * A value which Jep cannot convert, e.g. of `eval("len", Any::class.java)`, or nested in a [Collection] or a [Map],
      * becomes its Python `repr`.
      *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
-     * @throws IllegalArgumentException if the [type] is a [PyObject], which cannot leave the thread of this `Python`.
-     * @throws IllegalStateException if different keys of a returned `dict` have the same `repr`.
+     * @throws IllegalArgumentException if the [type] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`.
+     * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T {
-        require(!PyObject::class.java.isAssignableFrom(type)) { "A PyObject cannot leave the thread of Python" }
+        require(!type.holdsPyObject()) { "A PyObject cannot leave the thread of Python" }
         return call { type.cast(toJava(getValue(expression, type))) }
     }
 
     /**
      * Returns the value of the global variable of the given [name], converted to a Java object.
      *
-     * A value which Jep cannot convert, e.g. of an imported module, or nested in a [List] or a [Map],
+     * A value which Jep cannot convert, e.g. of an imported module, or nested in a [Collection] or a [Map],
      * becomes its Python `repr`.
      *
      * @throws jep.JepException if there is no such variable.
-     * @throws IllegalStateException if different keys of a `dict` have the same `repr`.
+     * @throws IllegalStateException if different keys of a `dict`, or elements of a [Set], have the same `repr`.
      */
     public operator fun get(name: String): Any? = call { toJava(getValue(name)) }
 
@@ -250,12 +250,16 @@ public class Python private constructor(
         }
     }
 
+    /** Whether this type is a [PyObject], or an array of them, also of arrays. */
+    private fun Class<*>.holdsPyObject(): Boolean =
+        PyObject::class.java.isAssignableFrom(this) || componentType?.holdsPyObject() == true
+
     private fun checkNotClosed() {
         if (closed.get()) throw closedException()
     }
 
     /**
-     * Replaces each [PyObject] of the [value], also nested in a [List], a [Map] or an array, with its `repr`,
+     * Replaces each [PyObject] of the [value], also nested in a [Collection], a [Map] or an array, with its `repr`,
      * as it is bound to the thread of this interpreter.
      *
      * Only a top-level [PyObject] is closed, as it is created by Jep for this value.
@@ -264,7 +268,7 @@ public class Python private constructor(
      */
     private fun SharedInterpreter.toJava(value: Any?): Any? = when (value) {
         is PyObject -> value.use { PyObjectConverter(this).use { converter -> converter.convert(it) } }
-        is List<*>, is Map<*, *>, is Array<*> -> PyObjectConverter(this).use { it.convert(value) }
+        is Collection<*>, is Map<*, *>, is Array<*> -> PyObjectConverter(this).use { it.convert(value) }
         else -> value
     }
 
@@ -272,7 +276,8 @@ public class Python private constructor(
      * Converts a value returned by Jep, see [toJava].
      *
      * A value without any [PyObject] is returned as it is.
-     * Otherwise each [List], [Map] and array reachable from it is copied, never changed,
+     * Otherwise each [Collection], [Map] and array reachable from it is copied, never changed,
+     * a [Set] to a [LinkedHashSet], and another [Collection] than a [List] to an [ArrayList],
      * also when it contains itself, so that the copy contains itself as well.
      * The same [PyObject] becomes the same `repr`.
      */
@@ -286,14 +291,14 @@ public class Python private constructor(
         fun convert(value: Any?): Any? =
             if (containsPyObject(value, Collections.newSetFromMap(IdentityHashMap()))) copy(value) else value
 
-        private fun containsPyObject(value: Any?, visited: MutableSet<Any>): Boolean = when {
-            value is PyObject -> true
-            value == null || !visited.add(value) -> false
-            value is List<*> -> value.any { containsPyObject(it, visited) }
-            value is Map<*, *> -> value.any { (key, element) ->
+        // only the containers are tracked, which can form a cycle, not to track each element of a large list
+        private fun containsPyObject(value: Any?, visited: MutableSet<Any>): Boolean = when (value) {
+            is PyObject -> true
+            is Collection<*> -> visited.add(value) && value.any { containsPyObject(it, visited) }
+            is Map<*, *> -> visited.add(value) && value.any { (key, element) ->
                 containsPyObject(key, visited) || containsPyObject(element, visited)
             }
-            value is Array<*> -> value.any { containsPyObject(it, visited) }
+            is Array<*> -> visited.add(value) && value.any { containsPyObject(it, visited) }
             else -> false
         }
 
@@ -302,7 +307,14 @@ public class Python private constructor(
             copies[value]?.let { return it }
             return when (value) {
                 is PyObject -> repr(value).also { copies[value] = it }
-                is List<*> -> ArrayList<Any?>(value.size).also { copy ->
+                is Set<*> -> LinkedHashSet<Any?>().also { copy ->
+                    copies[value] = copy
+                    value.forEach { element ->
+                        val copiedElement = copy(element)
+                        check(copy.add(copiedElement)) { "Different elements of a set have the same repr: $copiedElement" }
+                    }
+                }
+                is Collection<*> -> ArrayList<Any?>(value.size).also { copy ->
                     copies[value] = copy
                     value.forEach { copy.add(copy(it)) }
                 }

@@ -22,6 +22,7 @@ import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.should
 import jep.JepException
+import jep.python.PyCallable
 import jep.python.PyObject
 import kotlin.concurrent.thread
 import kotlin.io.path.Path
@@ -366,6 +367,76 @@ class PythonTest {
 
         // then
         assert(exception.message == "A PyObject cannot leave the thread of Python")
+    }
+
+    @Test
+    fun `should reject evaluating to array of PyObject`() {
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            python.eval("[[len, abs]]", Array<Array<PyCallable>>::class.java)
+        }
+
+        // then
+        assert(exception.message == "A PyObject cannot leave the thread of Python")
+    }
+
+    @Test
+    fun `should copy Kotlin set holding Python object`() {
+        // given
+        val set = LinkedHashSet<Any?>()
+        set.add("a")
+        python["s"] = set
+        python.exec("s.add(len)")
+
+        // when
+        val result = python["s"]
+        val nested = python("[s]")
+
+        // then
+        // the set holding a Python object is not rendered by power-assert, which cannot do it on this thread
+        val copied = result !== set
+        assert(copied)
+        assert(result is Set<*> && result == setOf("a", "<built-in function len>"))
+        assert(nested is List<*> && nested.single() is Set<*> && nested == listOf(setOf("a", "<built-in function len>")))
+        assert(python("s.size()") == 2L)
+    }
+
+    @Test
+    fun `should copy Kotlin collection holding Python object`() {
+        // given
+        val queue = java.util.ArrayDeque<Any?>()
+        python["q"] = queue
+        python.exec("q.add(len)")
+
+        // when
+        val result = python["q"]
+
+        // then
+        assert(result is Collection<*> && result.toList() == listOf("<built-in function len>"))
+    }
+
+    @Test
+    fun `should reject set elements of the same repr`() {
+        // given
+        val set = LinkedHashSet<Any?>()
+        set.add("Point")
+        python["s"] = set
+        python.exec(
+            """
+            class Point:
+                def __repr__(self):
+                    return 'Point'
+            s.add(Point())
+            """.trimIndent()
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            python["s"]
+        }
+
+        // then
+        assert(exception.message == "Different elements of a set have the same repr: Point")
     }
 
     @Test
