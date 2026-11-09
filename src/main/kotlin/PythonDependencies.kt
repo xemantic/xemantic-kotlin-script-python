@@ -283,11 +283,13 @@ internal object PythonDependencies {
                 return None
 
         def is_unmodified_since_uv_install(path, distribution):
-            # uv records the modification time of a local archive in uv_cache.json, not its hash
+            # uv records the change time of a local archive in uv_cache.json, the last write time on Windows,
+            # not its hash
             try:
                 timestamp = json.loads(distribution.read_text("uv_cache.json") or "null")["timestamp"]
                 installed_time = timestamp["secs_since_epoch"] * 1_000_000_000 + timestamp["nanos_since_epoch"]
-                return os.stat(path).st_mtime_ns == installed_time
+                status = os.stat(path)
+                return (status.st_mtime_ns if os.name == "nt" else status.st_ctime_ns) == installed_time
             except (OSError, ValueError, TypeError, KeyError):
                 return False
 
@@ -336,8 +338,12 @@ internal object PythonDependencies {
             if isinstance(legacy_hash, str) and "=" in legacy_hash:
                 hashes.setdefault(*legacy_hash.split("=", 1))
             hashes.update(parse_qsl(installed["url"].partition("#")[2]))
-            hashes = {name: str(value).lower() for name, value in hashes.items() if name in hashlib.algorithms_guaranteed}
-            requested = {name: value.lower() for name, value in options.items() if name in hashlib.algorithms_guaranteed}
+            # a shake digest has no fixed length to compute and compare
+            if any(name.startswith("shake_") for name in options):
+                return False
+            algorithms = {name for name in hashlib.algorithms_guaranteed if not name.startswith("shake_")}
+            hashes = {name: str(value).lower() for name, value in hashes.items() if name in algorithms}
+            requested = {name: value.lower() for name, value in options.items() if name in algorithms}
             if any(name in hashes and hashes[name] != value for name, value in requested.items()):
                 return False
             if urlsplit(url).scheme.lower() != "file":
@@ -351,8 +357,18 @@ internal object PythonDependencies {
                 return file_digests(path, expected) == expected
             return not requested and is_unmodified_since_uv_install(path, distribution)
 
+        def is_url(dependency):
+            # of the requirements validated by is_missing
+            if Requirement is None:
+                return False
+            requirement = Requirement(dependency)
+            return requirement.url is not None and (requirement.marker is None or requirement.marker.evaluate())
+
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
+            # pip resolves the missing ones without the dependency directory, so it would install a distribution
+            # required by them from the index over the one installed from a URL, also in the same version
+            missing = [dependency for dependency in dependencies if dependency in missing or is_url(dependency)]
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)

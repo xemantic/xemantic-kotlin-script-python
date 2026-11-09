@@ -21,6 +21,8 @@ package com.xemantic.kotlin.script.python
 import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import java.lang.reflect.Proxy
+import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
 import java.time.Instant
@@ -29,6 +31,7 @@ import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
+import kotlin.io.path.getLastModifiedTime
 import kotlin.io.path.readBytes
 import kotlin.io.path.setLastModifiedTime
 import kotlin.io.path.writeText
@@ -553,17 +556,18 @@ class PythonDependenciesTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should plan local archive dependency installed by uv as installed for unchanged modification time`() {
+    fun `should plan local archive dependency installed by uv as installed for unchanged change time`() {
         // given
-        // uv records no hash of a local archive, but its modification time in uv_cache.json
+        // uv records no hash of a local archive, but its change time in uv_cache.json, the last write time on Windows
         val archiveDirectory = createTempDirectory("python-archive")
         try {
             val archive = archiveDirectory.resolve("probe-1.0.tar.gz")
             archive.writeText("archive content")
+            // a modification time other than the change time
             archive.setLastModifiedTime(FileTime.from(Instant.ofEpochSecond(1_700_000_000, 123_456_700)))
             val url = archive.toUri().toString()
             val directUrl = """{"url":"$url","archive_info":{}}"""
-            val uvCache = """{"timestamp":{"secs_since_epoch":1700000000,"nanos_since_epoch":123456700},"commit":null,"tags":null,"env":{},"directories":{}}"""
+            val uvCache = uvCache(uvTimestamp(archive))
 
             // when
             val installs = planInstalls("direct-url-probe @ $url", directUrl, uvCache)
@@ -577,16 +581,16 @@ class PythonDependenciesTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should plan local archive dependency installed by uv as missing for changed modification time`() {
+    fun `should plan local archive dependency installed by uv as missing for changed change time`() {
         // given
         val archiveDirectory = createTempDirectory("python-archive")
         try {
             val archive = archiveDirectory.resolve("probe-1.0.tar.gz")
             archive.writeText("rebuilt archive content")
-            archive.setLastModifiedTime(FileTime.from(Instant.ofEpochSecond(1_700_000_001, 123_456_700)))
             val dependency = "direct-url-probe @ ${archive.toUri()}"
             val directUrl = """{"url":"${archive.toUri()}","archive_info":{}}"""
-            val uvCache = """{"timestamp":{"secs_since_epoch":1700000000,"nanos_since_epoch":123456700},"commit":null,"tags":null,"env":{},"directories":{}}"""
+            // as if installed before the archive was rebuilt
+            val uvCache = uvCache(uvTimestamp(archive).minusSeconds(1))
 
             // when
             val installs = planInstalls(dependency, directUrl, uvCache)
@@ -645,6 +649,44 @@ class PythonDependenciesTest {
 
         // then
         assert(installs.isEmpty())
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should plan local archive dependency with unverifiable hash as missing`() {
+        // given
+        // a shake digest has no fixed length to compare
+        val archiveDirectory = createTempDirectory("python-archive")
+        try {
+            val archive = archiveDirectory.resolve("probe-1.0.tar.gz")
+            archive.writeText("archive content")
+            val url = "${archive.toUri()}#shake_256=$HASH"
+            val dependency = "direct-url-probe @ $url"
+            val directUrl = """{"url":"$url","archive_info":{}}"""
+
+            // when
+            val installs = planInstalls(dependency, directUrl)
+
+            // then
+            assert(installs == listOf(dependency))
+        } finally {
+            archiveDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should plan installed URL dependency for installation with missing dependency`() {
+        // given
+        // pip resolves the missing dependency without the dependency directory,
+        // so a distribution required by it would be installed from the index over the one installed from the URL
+        val directUrl = """{"url": "https://example.com/probe.git", "vcs_info": {"vcs": "git", "commit_id": "$COMMIT", "requested_revision": "v1"}}"""
+        val dependency = "direct-url-probe @ git+https://example.com/probe.git@v1"
+
+        // when
+        val installs = planInstalls(dependency, directUrl, otherDependencies = listOf("nonexistent-dependency"))
+
+        // then
+        assert(installs == listOf(dependency, "nonexistent-dependency"))
     }
 
     @Test
@@ -717,7 +759,12 @@ class PythonDependenciesTest {
      * or from an index when `null`.
      */
     @OptIn(ExperimentalPathApi::class)
-    private fun planInstalls(dependency: String, directUrl: String?, uvCache: String? = null): List<String> {
+    private fun planInstalls(
+        dependency: String,
+        directUrl: String?,
+        uvCache: String? = null,
+        otherDependencies: List<String> = emptyList()
+    ): List<String> {
         PythonEnvironment.initialize()
         val directory = createTempDirectory("python-dependencies")
         try {
@@ -725,13 +772,23 @@ class PythonDependenciesTest {
             distInfo.resolve("METADATA").writeText("Metadata-Version: 2.1\nName: direct-url-probe\nVersion: 1.0\n")
             if (directUrl != null) distInfo.resolve("direct_url.json").writeText(directUrl)
             if (uvCache != null) distInfo.resolve("uv_cache.json").writeText(uvCache)
-            return PythonDependencies.plan("dependencies = ['$dependency']\n", directory.toString(), emptyList())
+            val dependencies = (listOf(dependency) + otherDependencies).joinToString(", ") { "'$it'" }
+            return PythonDependencies.plan("dependencies = [$dependencies]\n", directory.toString(), emptyList())
                 .filter { it.first == "install" }
                 .map { it.second }
         } finally {
             directory.deleteRecursively()
         }
     }
+
+    /** The time of the [archive] which uv records in `uv_cache.json`: its change time, or last write time on Windows. */
+    private fun uvTimestamp(archive: Path): Instant =
+        if (System.getProperty("os.name").startsWith("Windows")) archive.getLastModifiedTime().toInstant()
+        else (Files.getAttribute(archive, "unix:ctime") as FileTime).toInstant()
+
+    private fun uvCache(timestamp: Instant): String =
+        """{"timestamp":{"secs_since_epoch":${timestamp.epochSecond},"nanos_since_epoch":${timestamp.nano}},""" +
+            """"commit":null,"tags":null,"env":{},"directories":{}}"""
 
     private companion object {
         const val COMMIT = "0123456789abcdef0123456789abcdef01234567"

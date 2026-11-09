@@ -139,8 +139,10 @@ otherwise the code can declare it as a dependency, see below.
   is installed once for the same URL and revision, or commit, of a VCS repository —
   so a branch is not updated to its later commits —
   and once for the same URL of a remote archive, and its hash if the installer recorded it (pip does, uv does not),
-  or for the same content of a local archive (its modification time when installed by uv),
-  while a local directory, or a dependency with extras, is installed again on each use.
+  or for the same content of a local archive (its change time when installed by uv, the last write time on Windows),
+  while a local directory, or a dependency with extras, is installed again on each use,
+  and any direct URL dependency is installed again together with another missing dependency of the same code,
+  so that pip does not replace it with a distribution from the index required by the other one.
   To update a branch, or a remote archive changing its content under the same URL,
   change the URL — for example, pin the commit — or delete the dependency directory.
   A dependency which cannot be installed fails the call with `PythonDependencyException`, with the output of the installer.
