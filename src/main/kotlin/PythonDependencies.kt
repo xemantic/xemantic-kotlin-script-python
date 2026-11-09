@@ -212,7 +212,9 @@ internal object PythonDependencies {
         # before any import which can fail, so that the input is always read
         request = json.loads(sys.stdin.read())
 
-        import importlib, importlib.metadata as metadata, os, re
+        import hashlib, importlib, importlib.metadata as metadata, os, re
+        from urllib.parse import parse_qsl, urlsplit, urlunsplit
+        from urllib.request import url2pathname
 
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
@@ -253,12 +255,79 @@ internal object PythonDependencies {
                     return False
                 name = requirement.name
             try:
-                version = metadata.version(name)
+                distribution = metadata.distribution(name)
             except metadata.PackageNotFoundError:
                 return True
             if Requirement is None:
                 return specified
-            return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
+            if requirement.url is not None:
+                return not is_installed_from(requirement.url, distribution)
+            return not requirement.specifier.contains(distribution.version, prereleases=True)
+
+        def without_credentials(url):
+            # direct_url.json holds the URL without credentials, and without the fragment
+            parts = urlsplit(url)
+            return urlunsplit((parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path, parts.query, ""))
+
+        def file_hash(url, algorithm):
+            try:
+                with open(url2pathname(urlsplit(url).path), "rb") as file:
+                    digest = hashlib.new(algorithm)
+                    for chunk in iter(lambda: file.read(1 << 20), b""):
+                        digest.update(chunk)
+                    return digest.hexdigest()
+            except (OSError, ValueError):
+                return None
+
+        def is_installed_from(url, distribution):
+            # compared with the direct_url.json of the distribution, PEP 610, without hitting the network
+            try:
+                installed = json.loads(distribution.read_text("direct_url.json") or "null")
+            except ValueError:
+                return False
+            if not isinstance(installed, dict) or not isinstance(installed.get("url"), str):
+                return False
+            url, _, fragment = url.partition("#")
+            options = dict(parse_qsl(fragment))
+            if options.pop("subdirectory", None) != installed.get("subdirectory"):
+                return False
+            vcs, plus, _ = urlsplit(url).scheme.partition("+")
+            vcs_info = installed.get("vcs_info")
+            if plus and vcs in ("git", "hg", "svn", "bzr"):
+                # a branch or a tag is satisfied by the commit installed for it before, as the snippet requests
+                # the same thing, and the latest commit cannot be known without the network
+                parts = urlsplit(url[len(vcs) + 1:])
+                path, at, revision = parts.path.rpartition("@")
+                if not at:
+                    path, revision = parts.path, None
+                if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != vcs:
+                    return False
+                installed_url = installed["url"]
+                if installed_url.startswith(vcs + "+"):
+                    installed_url = installed_url[len(vcs) + 1:]
+                if without_credentials(parts._replace(path=path).geturl()) != without_credentials(installed_url):
+                    return False
+                if revision is not None and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+                    return vcs_info.get("commit_id") == revision
+                return vcs_info.get("requested_revision") == revision
+            archive_info = installed.get("archive_info")
+            if vcs_info is not None or not isinstance(archive_info, dict):
+                # a local directory can change without changing its URL, so it is always installed again
+                return False
+            if without_credentials(url) != without_credentials(installed["url"]):
+                return False
+            hashes = archive_info.get("hashes")
+            hashes = dict(hashes) if isinstance(hashes, dict) else {}
+            legacy_hash = archive_info.get("hash")
+            if isinstance(legacy_hash, str) and "=" in legacy_hash:
+                hashes.setdefault(*legacy_hash.split("=", 1))
+            requested = {name: value for name, value in options.items() if name in hashlib.algorithms_guaranteed}
+            if urlsplit(url).scheme.lower() == "file" and not requested:
+                # a local archive can be rebuilt without changing its URL, so its content is compared
+                requested = {name: file_hash(url, name) for name in hashes if name in hashlib.algorithms_guaranteed}
+                if not requested:
+                    return False
+            return all(hashes.get(name) == value for name, value in requested.items())
 
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:

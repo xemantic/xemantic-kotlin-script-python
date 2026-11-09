@@ -135,6 +135,11 @@ otherwise the code can declare it as a dependency, see below.
   The installed dependencies are shared by all the `Python` interpreters of the JVM,
   and they cannot change the versions of the distributions of the Python environment itself,
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.
+  A direct URL dependency, like `pkg @ git+https://host/repo@v1`,
+  is installed once for the same URL and revision, or commit, of a VCS repository —
+  so a branch is not updated to its later commits —
+  and once for the same URL, and hash if given, of an archive, or the same content of a local archive,
+  while a local directory is installed again on each use, as its content can change.
   A dependency which cannot be installed fails the call with `PythonDependencyException`, with the output of the installer.
 * A Python exception fails the call with `jep.JepException`,
   reported by the `ScriptSession` as an `ExecutionPhase.EVALUATION` error, like:
