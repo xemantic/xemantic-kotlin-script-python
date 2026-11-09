@@ -381,6 +381,47 @@ class PythonTest {
     }
 
     @Test
+    fun `should reject evaluating to PyObject after close as closed`() {
+        // given
+        python.close()
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            python.eval<PyObject>("len")
+        }
+
+        // then
+        assert(exception.message == "Python is closed")
+    }
+
+    @Test
+    fun `should evaluate to typed nested array holding repr of value not convertible to Java`() {
+        // given
+        val arrayOfLists = arrayOf<List<*>>().javaClass
+
+        // when
+        val arrays = python.eval("[[len]]", Array<Array<Any>>::class.java)
+        val lists = python.eval("[[len]]", arrayOfLists)
+
+        // then
+        assert(arrays.single().toList() == listOf("<built-in function len>"))
+        assert(lists.toList() == listOf(listOf("<built-in function len>")))
+    }
+
+    @Test
+    fun `should widen Kotlin array of Python objects holding repr`() {
+        // given
+        python["a"] = arrayOfNulls<PyObject>(1)
+        python.exec("a[0] = len")
+
+        // when
+        val result = python["a"]
+
+        // then
+        assert(result is Array<*> && result.toList() == listOf("<built-in function len>"))
+    }
+
+    @Test
     fun `should copy Kotlin set holding Python object`() {
         // given
         val set = LinkedHashSet<Any?>()

@@ -162,9 +162,10 @@ public class Python private constructor(
      * @throws IllegalArgumentException if the [type] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
-    public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T {
+    public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T = call {
+        // checked in the call, so that a closed Python fails as closed
         require(!type.holdsPyObject()) { "A PyObject cannot leave the thread of Python" }
-        return call { type.cast(toJava(getValue(expression, type))) }
+        type.cast(toJava(getValue(expression, type)))
     }
 
     /**
@@ -277,7 +278,9 @@ public class Python private constructor(
      *
      * A value without any [PyObject] is returned as it is.
      * Otherwise each [Collection], [Map] and array reachable from it is copied, never changed,
-     * a [Set] to a [LinkedHashSet], and another [Collection] than a [List] to an [ArrayList],
+     * a [Set] to a [LinkedHashSet], another [Collection] than a [List] to an [ArrayList],
+     * and an array to an array of the same component type, unless it cannot hold a `repr`, like `PyObject[]`,
+     * which is widened to `Object[]`, so that the copy can be cast to the type requested from [eval],
      * also when it contains itself, so that the copy contains itself as well.
      * The same [PyObject] becomes the same `repr`.
      */
@@ -326,12 +329,27 @@ public class Python private constructor(
                         copy[copiedKey] = copy(element)
                     }
                 }
-                is Array<*> -> arrayOfNulls<Any?>(value.size).also { copy ->
+                is Array<*> -> newArray(value.javaClass.componentType, value.size).also { copy ->
                     copies[value] = copy
                     value.forEachIndexed { index, element -> copy[index] = copy(element) }
                 }
                 else -> value
             }
+        }
+
+        /**
+         * Creates an array, which can hold the copy of each element of an array of the [componentType]:
+         * a type which can hold a [PyObject], but not its `repr`, is widened to [Any], also of a nested array.
+         */
+        private fun newArray(componentType: Class<*>, size: Int): Array<Any?> {
+            @Suppress("UNCHECKED_CAST")
+            return java.lang.reflect.Array.newInstance(copyType(componentType), size) as Array<Any?>
+        }
+
+        private fun copyType(type: Class<*>): Class<*> = when {
+            type.isArray -> java.lang.reflect.Array.newInstance(copyType(type.componentType), 0).javaClass
+            type.isAssignableFrom(PyObject::class.java) && !type.isAssignableFrom(String::class.java) -> Any::class.java
+            else -> type
         }
 
         private fun repr(value: PyObject): String {
