@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import java.util.concurrent.Callable
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
@@ -28,7 +29,7 @@ import kotlin.concurrent.thread
 import kotlin.test.Test
 
 /**
- * Tests of [Python.close] racing the calls made from other threads.
+ * Tests of [Python.close] racing the calls made from other threads, or called from a Kotlin callback.
  *
  * The races are made deterministic with latches:
  * a Kotlin callback blocks a running call on the Python thread,
@@ -227,21 +228,102 @@ class PythonCloseTest {
         }
     }
 
+    @Test
+    fun `should close Python from Kotlin callback after running call returns`() {
+        // given
+        val events = CopyOnWriteArrayList<String>()
+        val closeTaskRan = CountDownLatch(1)
+        Python.withDecoratedExecutor(interceptingExecutor(
+            // only the task of close() is submitted as a Runnable, the calls are submitted as a Callable
+            decorateRunnable = { task ->
+                Runnable {
+                    task.run()
+                    events += "closed on ${Thread.currentThread().name}"
+                    closeTaskRan.countDown()
+                }
+            }
+        )).use { python ->
+            var pythonThread: String? = null
+            python["stop"] = {
+                pythonThread = Thread.currentThread().name
+                python.close()
+                events += "stop returned on ${Thread.currentThread().name}"
+            }
+            python["after"] = { events += "after on ${Thread.currentThread().name}" }
+            var execFailure: Throwable? = null
+
+            // when
+            // bounded, only to fail instead of hanging the JVM, if it deadlocks
+            val caller = thread(isDaemon = true, name = "caller") {
+                execFailure = runCatching { python.exec("stop()\nafter()") }.exceptionOrNull()
+            }
+            caller.join(10_000)
+
+            // then
+            assert(!caller.isAlive)
+            assert(execFailure == null)
+            assert(closeTaskRan.await(10, SECONDS))
+            assert(pythonThread?.startsWith("python-") == true)
+            assert(events == listOf(
+                "stop returned on $pythonThread",
+                "after on $pythonThread",
+                "closed on $pythonThread"
+            ))
+            val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+            assert(laterFailure is IllegalStateException)
+            assert(laterFailure.message == "Python is closed")
+        }
+    }
+
+    @Test
+    fun `should let running call call back Python after close requested from Kotlin callback`() {
+        // given
+        Python().use { python ->
+            python.exec("factor = 3")
+            python["stop"] = { python.close() }
+            python["scale"] = { n: Long -> n * python.eval<Long>("factor") }
+            var result: Any? = null
+            var failure: Throwable? = null
+
+            // when
+            // bounded, only to fail instead of hanging the JVM, if it deadlocks
+            val caller = thread(isDaemon = true, name = "caller") {
+                runCatching { python("stop()\nscale(7)") }
+                    .onSuccess { result = it }
+                    .onFailure { failure = it }
+            }
+            caller.join(10_000)
+
+            // then
+            assert(!caller.isAlive)
+            assert(failure == null)
+            assert(result == 21L)
+            val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+            assert(laterFailure is IllegalStateException)
+            assert(laterFailure.message == "Python is closed")
+        }
+    }
+
     /**
      * Decorates the executor of a [Python], to call on the calling thread:
      * [beforeSubmit] before, and [afterSubmit] after submitting each task, telling if it was accepted,
-     * and [beforeShutdown] before shutting the executor down.
+     * and [beforeShutdown] before shutting the executor down,
+     * while each submitted [Runnable] is replaced with the one returned by [decorateRunnable].
+     *
+     * The task of [Python.close] is the only one submitted as a [Runnable], the calls are submitted as a [Callable],
+     * so [decorateRunnable] intercepts only the closing of the interpreter.
      */
     private fun interceptingExecutor(
         beforeSubmit: () -> Unit = {},
         afterSubmit: (accepted: Boolean) -> Unit = {},
-        beforeShutdown: () -> Unit = {}
+        beforeShutdown: () -> Unit = {},
+        decorateRunnable: (Runnable) -> Runnable = { it }
     ): (ExecutorService) -> ExecutorService = { executor ->
         object : ExecutorService by executor {
 
             override fun <T> submit(task: Callable<T>): Future<T> = intercept { executor.submit(task) }
 
-            override fun submit(task: Runnable): Future<*> = intercept { executor.submit(task) }
+            override fun submit(task: Runnable): Future<*> = intercept { executor.submit(decorateRunnable(task)) }
 
             override fun shutdown() {
                 beforeShutdown()
