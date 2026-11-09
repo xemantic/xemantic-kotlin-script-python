@@ -22,8 +22,17 @@ import com.xemantic.kotlin.test.assert
 import com.xemantic.kotlin.test.have
 import com.xemantic.kotlin.test.should
 import jep.JepException
+import java.nio.file.Path
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
+import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectories
+import kotlin.io.path.createTempDirectory
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.listDirectoryEntries
+import kotlin.io.path.outputStream
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -296,6 +305,61 @@ class PythonTest {
 
         // then
         assert(sum == 45L)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should fail dependency conflicting with requirement of distribution of dependency directory`() {
+        // given
+        val directory = PythonEnvironment.dependencyDirectory!!.createDirectories()
+        val wheels = createTempDirectory("python-wheels")
+        try {
+            // installed by an earlier snippet, not imported
+            directory.writeDistribution("issue28-conflict-dependent", "1.0", "issue28-conflict-dependency<2")
+            directory.writeDistribution("issue28-conflict-dependency", "1.0")
+            // a local wheel, so that the installer needs no index to find the conflict
+            val wheel = wheels.writeWheel("issue28-conflict-dependency", "2.0")
+
+            // when
+            val exception = assertFailsWith<PythonDependencyException> {
+                python.exec(
+                    """
+                    # /// script
+                    # dependencies = ["issue28-conflict-dependency @ ${wheel.toUri()}"]
+                    # ///
+                    """.trimIndent()
+                )
+            }
+
+            // then
+            val message = exception.message!!
+            assert("issue28-conflict-dependency" in message)
+            assert(
+                "The dependency directory $directory keeps the distributions it holds compatible" in message
+            )
+        } finally {
+            directory.listDirectoryEntries("issue28_conflict_*").forEach { it.deleteRecursively() }
+            wheels.deleteRecursively()
+        }
+    }
+
+    /** Writes a wheel of a distribution without modules into this directory. */
+    private fun Path.writeWheel(name: String, version: String): Path {
+        val distribution = name.replace('-', '_')
+        val distInfo = "$distribution-$version.dist-info"
+        val wheel = resolve("$distribution-$version-py3-none-any.whl")
+        ZipOutputStream(wheel.outputStream()).use { zip ->
+            mapOf(
+                "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n",
+                "$distInfo/WHEEL" to "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                "$distInfo/RECORD" to "$distInfo/METADATA,,\n$distInfo/WHEEL,,\n$distInfo/RECORD,,\n"
+            ).forEach { (entry, content) ->
+                zip.putNextEntry(ZipEntry(entry))
+                zip.write(content.toByteArray())
+                zip.closeEntry()
+            }
+        }
+        return wheel
     }
 
     @Test

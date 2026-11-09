@@ -135,6 +135,18 @@ otherwise the code can declare it as a dependency, see below.
   The installed dependencies are shared by all the `Python` interpreters of the JVM,
   and they cannot change the versions of the distributions of the Python environment itself,
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.
+  The other distributions of the dependency directory can be upgraded,
+  but only within the versions the installed distributions require of them,
+  e.g. a dependency requiring `attrs>=24` cannot upgrade `attrs` 23,
+  installed earlier for a distribution requiring `attrs<24`, which would break the next time it is imported.
+  The dependencies declared by the code are not recorded, only checked whenever the code runs,
+  so other code can change the version of a dependency it declared directly,
+  and the next time it runs, it gets the declared version installed again,
+  or fails, if an installed distribution requires the other version.
+  A dependency conflicting with the dependency directory fails the call with `PythonDependencyException`,
+  as there can be only one version of a distribution in the directory —
+  code with dependencies conflicting with the ones of other code needs its own `PythonEnvironment.dependencyDirectory`,
+  in a JVM of its own, as the dependency directory is shared by all the `Python` interpreters of the JVM.
   A dependency which cannot be installed fails the call with `PythonDependencyException`, with the output of the installer.
 * A Python exception fails the call with `jep.JepException`,
   reported by the `ScriptSession` as an `ExecutionPhase.EVALUATION` error, like:

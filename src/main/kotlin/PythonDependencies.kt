@@ -42,7 +42,9 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  * into the dependency directory of the [PythonEnvironment], shared by all the [Python] interpreters.
  *
  * The distributions of the environment itself, and the ones already imported from the dependency directory,
- * are kept in their versions, as a module cannot be replaced once imported.
+ * are kept in their versions, as a module cannot be replaced once imported,
+ * and the other distributions of the dependency directory in the versions required by the installed ones,
+ * so that a new dependency does not break the installed ones.
  */
 internal object PythonDependencies {
 
@@ -179,7 +181,13 @@ internal object PythonDependencies {
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
-                    "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
+                    "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output\n" +
+                        "The dependency directory $directory keeps the distributions it holds compatible " +
+                        "with the ones requiring them, and the imported ones in their versions, " +
+                        "as well as the distributions of the Python environment, " +
+                        "so a dependency conflicting with them cannot be installed: " +
+                        "set another PythonEnvironment.dependencyDirectory for the code declaring it, " +
+                        "or delete the dependency directory, when no Python uses it, to start from scratch."
                 )
             }
         } finally {
@@ -199,7 +207,9 @@ internal object PythonDependencies {
 
     /**
      * Prints the dependencies to install, as `install <requirement>`,
-     * and the distributions to keep in their versions, as `constraint <name>==<version>`,
+     * the distributions to keep in their versions, as `constraint <name>==<version>`,
+     * and the specifiers required of the other distributions by the installed ones, as `constraint <name><specifier>`,
+     * but not the ones of a distribution declared as a dependency to install, as it is replaced,
      * or exits with the error.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
@@ -240,9 +250,15 @@ internal object PythonDependencies {
             except ImportError:
                 Requirement = None
 
+        def canonical(name):
+            return re.sub(r"[-_.]+", "-", name).lower()
+
+        def name_of(dependency):
+            return re.match(r"\s*([A-Za-z0-9._-]*)", dependency).group(1)
+
         def is_missing(dependency):
             if Requirement is None:
-                name = re.match(r"\s*([A-Za-z0-9._-]*)", dependency).group(1)
+                name = name_of(dependency)
                 specified = dependency.strip() != name
             else:
                 try:
@@ -260,21 +276,49 @@ internal object PythonDependencies {
                 return specified
             return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
 
+        def required_specifiers(distribution):
+            # the requirements of the distribution, without the ones of its extras, and of other environments
+            for dependency in distribution.requires or []:
+                try:
+                    requirement = Requirement(dependency)
+                    if requirement.marker is None or requirement.marker.evaluate({"extra": ""}):
+                        yield requirement
+                except Exception:
+                    # an invalid requirement, or marker, of an installed distribution cannot be honored anyway
+                    pass
+
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
+            upgraded = {canonical(name_of(dependency)) for dependency in missing}
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)
-            constraints = {}
+            # the distributions kept in their versions: the ones of the environment, and the imported ones
+            pinned = {}
+            # the specifiers which the installed distributions require of the other ones
+            required = {}
+            seen = set()
             for distribution in metadata.distributions():
                 name = distribution.metadata["Name"]
+                if not name or canonical(name) in seen:
+                    # shadowed by a distribution found before, like by the import system
+                    continue
+                seen.add(canonical(name))
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
-                if name and (not in_dependencies or name in in_use):
-                    constraints.setdefault(name, distribution.version)
+                if not in_dependencies or name in in_use or Requirement is None:
+                    # without packaging, the requirements cannot be read, so all the distributions are kept
+                    pinned[canonical(name)] = (name, distribution.version)
+                if Requirement is not None and canonical(name) not in upgraded:
+                    for requirement in required_specifiers(distribution):
+                        key = canonical(requirement.name)
+                        required[key] = required.get(key, requirement.specifier) & requirement.specifier
             for dependency in missing:
                 print("install", dependency)
-            for name, version in constraints.items():
+            for name, version in pinned.values():
                 print("constraint", f"{name}=={version}")
+            for name, specifier in required.items():
+                if specifier and name not in pinned:
+                    print("constraint", f"{name}{specifier}")
     """.trimIndent()
 
 }
