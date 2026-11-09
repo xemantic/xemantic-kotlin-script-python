@@ -44,17 +44,20 @@ class PythonDependenciesTest {
 
     private val python = Path(System.getenv("VIRTUAL_ENV"), "bin", "python").toString()
 
-    private val directory = createTempDirectory("python-dependencies")
+    private val tempPaths = mutableListOf<Path>()
 
-    private val constraints = createTempFile("python-constraints", ".txt")
+    /** A temporary path, created only by the tests using it, and deleted after them. */
+    private fun tempPath(create: () -> Path) = lazy { create().also { tempPaths.add(it) } }
 
-    private val sources = createTempDirectory("python-sources")
+    private val directory by tempPath { createTempDirectory("python-dependencies") }
+
+    private val constraints by tempPath { createTempFile("python-constraints", ".txt") }
+
+    private val sources by tempPath { createTempDirectory("python-sources") }
 
     @AfterTest
-    fun deleteFiles() {
-        directory.deleteRecursively()
-        constraints.deleteRecursively()
-        sources.deleteRecursively()
+    fun deleteTempPaths() {
+        tempPaths.forEach { it.deleteRecursively() }
     }
 
     private fun pipInstall(
@@ -65,14 +68,23 @@ class PythonDependenciesTest {
         environment = environment
     )
 
-    /** Runs the [code] with the dependency directory, as `directory`, first on `sys.path`. */
-    private fun pythonOfDirectory(@Language("python") code: String): String {
+    /** Installs the [requirements] with [pipInstall], as the setup of a test, which must succeed. */
+    private fun pipInstalled(vararg requirements: String) {
+        val (exitCode, output) = pipInstall(*requirements)
+        assert(exitCode == 0, output)
+    }
+
+    /**
+     * Runs the [code] with the dependency directory, as `directory`, first on `sys.path`,
+     * and the [arguments] following it in `sys.argv`.
+     */
+    private fun pythonOfDirectory(@Language("python") code: String, vararg arguments: String): String {
         val (exitCode, output) = runProcess(
             listOf(
                 python, "-c",
                 "import sys; directory = sys.argv[1]; sys.path.insert(0, directory)\n$code",
                 directory.toString()
-            )
+            ) + arguments
         )
         assert(exitCode == 0, output)
         return output
@@ -86,7 +98,7 @@ class PythonDependenciesTest {
             listOf(
                 python, "-c",
                 PythonDependencies.PIP_PINNED_REQUIREMENT +
-                    "\nimport json, sys\nprint(pinned_requirement(json.load(sys.stdin), requested_urls(sys.argv[1:])))"
+                    "\nimport json, sys\nprint(pinned_requirement(json.load(sys.stdin), url_credentials(sys.argv[1:])))"
             ) + requirements,
             input = distribution
         )
@@ -382,7 +394,7 @@ class PythonDependenciesTest {
     @Test
     fun `should keep distribution of dependency directory when pip installs dependency requiring it`() {
         // given
-        val installed = pipInstall("idna==3.10")
+        pipInstalled("idna==3.10")
         val idnaModule = directory.resolve("idna").resolve("__init__.py")
         val idnaKey = idnaModule.fileKey()
 
@@ -390,7 +402,6 @@ class PythonDependenciesTest {
         val (exitCode, output) = pipInstall("requests")
 
         // then
-        assert(installed.exitCode == 0)
         assert(exitCode == 0, output)
         assert(directory.resolve("requests").exists())
         assert(idnaModule.fileKey() == idnaKey)
@@ -403,13 +414,12 @@ class PythonDependenciesTest {
     @Test
     fun `should replace distribution of dependency directory when pip installs newer version of it`() {
         // given
-        val installed = pipInstall("idna==3.6")
+        pipInstalled("idna==3.6")
 
         // when
         val (exitCode, output) = pipInstall("idna>=3.7")
 
         // then
-        assert(installed.exitCode == 0)
         assert(exitCode == 0, output)
         val versions = pythonOfDirectory(
             """
@@ -429,13 +439,12 @@ class PythonDependenciesTest {
     @Test
     fun `should keep sibling packages of namespace package when pip installs another one`() {
         // given
-        val installed = pipInstall("jaraco.functools")
+        pipInstalled("jaraco.functools")
 
         // when
         val (exitCode, output) = pipInstall("jaraco.context")
 
         // then
-        assert(installed.exitCode == 0)
         assert(exitCode == 0, output)
         assert(directory.resolve("jaraco").resolve("functools").exists())
         assert(directory.resolve("jaraco").resolve("context").exists())
@@ -535,6 +544,57 @@ class PythonDependenciesTest {
             redacted == "pkg @ git+https://****@gitlab.com/org/private.git, " +
                 "authpkg @ http://****@127.0.0.1:8765/authpkg-1.0-py3-none-any.whl, idna"
         )
+    }
+
+    @Test
+    fun `should redact whole credentials with at sign in password`() {
+        // when
+        val redacted = PythonDependencies.redactCredentials("pkg @ https://user:p@ss@host/pkg.whl")
+
+        // then
+        assert(redacted == "pkg @ https://****@host/pkg.whl")
+    }
+
+    /**
+     * pip reuses the credentials of a host for all its URLs,
+     * so a direct reference required by a requested one, from the same host, has to be pinned with them too.
+     */
+    @Test
+    fun `should pin required distribution from URL with credentials of requirement from the same host`() {
+        // when
+        val requirement = pinnedRequirement(
+            """
+            {
+              "metadata": {"name": "b", "version": "1.0"},
+              "is_direct": true,
+              "requested": false,
+              "download_info": {"url": "https://host/b-1.0-py3-none-any.whl", "archive_info": {}}
+            }
+            """.trimIndent(),
+            "a @ https://user:tok@host/a-1.0-py3-none-any.whl"
+        )
+
+        // then
+        assert(requirement == "b @ https://user:tok@host/b-1.0-py3-none-any.whl")
+    }
+
+    @Test
+    fun `should pin distribution from URL without credentials of requirement from other host`() {
+        // when
+        val requirement = pinnedRequirement(
+            """
+            {
+              "metadata": {"name": "b", "version": "1.0"},
+              "is_direct": true,
+              "requested": false,
+              "download_info": {"url": "https://other/b-1.0-py3-none-any.whl", "archive_info": {}}
+            }
+            """.trimIndent(),
+            "a @ https://user:tok@host/a-1.0-py3-none-any.whl"
+        )
+
+        // then
+        assert(requirement == "b @ https://other/b-1.0-py3-none-any.whl")
     }
 
     @Test
@@ -657,20 +717,55 @@ class PythonDependenciesTest {
         assert(requirement == "pkg @ file:///src/pkg")
     }
 
-    /** The installation report of pip, resolving the distributions to install, exists since pip 22.2. */
+    /**
+     * The installation report of pip, resolving the distributions to install, exists since pip 22.2,
+     * while an older pip, like 22.0.2 of a virtual environment of Ubuntu 22.04, still has to install the dependencies.
+     */
     @Test
-    fun `should report minimum pip version when pip is older`() {
+    fun `should install with upgrading pip command when pip is older than 22_2`() {
         // given
-        val oldPip = sources.resolve("old-pip")
-        oldPip.resolve("pip").createDirectories().resolve("__init__.py").writeText("__version__ = \"22.1.2\"\n")
+        val oldPip = sources.resolve("old-pip").resolve("pip").createDirectories()
+        oldPip.resolve("__init__.py").writeText("__version__ = \"22.1.2\"\n")
+        // records the arguments of the pip command, instead of installing
+        oldPip.resolve("__main__.py").writeText(
+            "import json, os, sys\n" +
+                "with open(os.path.join(os.path.dirname(__file__), 'arguments.json'), 'w') as file:\n" +
+                "    json.dump(sys.argv[1:], file)\n"
+        )
 
         // when
-        val (exitCode, output) = pipInstall("idna", environment = mapOf("PYTHONPATH" to oldPip.toString()))
+        val (exitCode, output) = pipInstall("idna", environment = mapOf("PYTHONPATH" to oldPip.parent.toString()))
 
         // then
-        assert(exitCode != 0)
-        assert(output.contains("pip 22.2"), output)
-        assert(output.contains("22.1.2"), output)
+        assert(exitCode == 0, output)
+        val arguments = pythonOfDirectory(
+            "import json; print(*json.load(open(sys.argv[2])), sep='\\n')\n",
+            oldPip.resolve("arguments.json").toString()
+        ).lines()
+        assert(
+            arguments == listOf(
+                "install", "--quiet", "--disable-pip-version-check", "--no-input", "--upgrade",
+                "--target", directory.toString(), "--constraint", constraints.toString(), "idna"
+            )
+        )
+    }
+
+    /** A `.dist-info` directory without metadata, e.g. left by an interrupted installation. */
+    @Test
+    fun `should install with pip next to dist-info directory without metadata`() {
+        // given
+        directory.resolve("broken-1.0.dist-info").createDirectories()
+
+        // when
+        val (exitCode, output) = pipInstall(
+            "idna==3.10",
+            // Python 3.12 deprecates reading a missing metadata field, raising KeyError in the future
+            environment = mapOf("PYTHONWARNINGS" to "error::DeprecationWarning:__main__")
+        )
+
+        // then
+        assert(exitCode == 0, output)
+        assert(directory.resolve("idna").exists())
     }
 
     private companion object {

@@ -198,42 +198,42 @@ internal object PythonDependencies {
      * The `pinned_requirement` Python function,
      * returning the requirement of exactly the distribution resolved in an installation report of pip,
      * like `direct_url_as_pep440_direct_reference` of pip,
-     * and the `requested_urls` function, returning the URLs of the requirements by their distribution names.
+     * and the `url_credentials` function, returning the credentials of the URLs of the requirements by their hosts.
      *
      * The report has the URLs without their credentials,
-     * which are taken back from the URL of the requirement, if the distribution is a requested one.
+     * which are taken back from the URL of a requirement with the same host,
+     * also for a distribution required by a requested one, like pip reuses the credentials of a host for all its URLs.
      */
     @Language("python")
     internal val PIP_PINNED_REQUIREMENT = """
-        def requested_urls(requirements):
+        def url_credentials(requirements):
+            from urllib.parse import urlsplit
             from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
-            from pip._vendor.packaging.utils import canonicalize_name
-            urls = {}
+            credentials = {}
             for requirement in requirements:
                 try:
-                    parsed = Requirement(requirement)
+                    url = Requirement(requirement).url
                 except InvalidRequirement:
                     continue
-                if parsed.url:
-                    urls[canonicalize_name(parsed.name)] = parsed.url
-            return urls
+                if url:
+                    # the password can contain "@" too
+                    user_info, at, host = urlsplit(url).netloc.rpartition("@")
+                    if at:
+                        credentials.setdefault(host, user_info)
+            return credentials
 
-        def with_credentials(url, requested_url):
+        def with_credentials(url, credentials):
             from urllib.parse import urlsplit, urlunsplit
-            credentials, at, host = urlsplit(requested_url).netloc.rpartition("@")
             parts = urlsplit(url)
-            if not at or parts.netloc.rpartition("@")[2] != host:
+            if "@" in parts.netloc or parts.netloc not in credentials:
                 return url
-            return urlunsplit(parts._replace(netloc=f"{credentials}@{host}"))
+            return urlunsplit(parts._replace(netloc=f"{credentials[parts.netloc]}@{parts.netloc}"))
 
-        def pinned_requirement(distribution, urls):
-            from pip._vendor.packaging.utils import canonicalize_name
+        def pinned_requirement(distribution, credentials):
             name, download = distribution["metadata"]["name"], distribution["download_info"]
             if not distribution["is_direct"]:
                 return f"{name}=={distribution['metadata']['version']}"
-            url = download["url"]
-            if distribution.get("requested") and canonicalize_name(name) in urls:
-                url = with_credentials(url, urls[canonicalize_name(name)])
+            url = with_credentials(download["url"], credentials)
             fragments = []
             if "vcs_info" in download:
                 vcs = download["vcs_info"]
@@ -260,6 +260,9 @@ internal object PythonDependencies {
      * and then only these are installed, without their dependencies, into an empty staging directory.
      * Its files are merged into the dependency directory, after removing the files of the replaced distributions,
      * so that a directory shared with other distributions, like a namespace package, is kept.
+     *
+     * pip older than 22.2 has no installation report to resolve with,
+     * so it installs and upgrades the requirements directly, also the distributions already in the dependency directory.
      */
     @Language("python")
     private val PIP_INSTALL = PIP_PINNED_REQUIREMENT + "\n\n" + """
@@ -272,12 +275,16 @@ internal object PythonDependencies {
         try:
             from pip import __version__ as pip_version
         except ImportError:
-            sys.exit(f"Installing Python dependencies needs uv, or pip 22.2 or newer, but {sys.executable} has no pip")
+            sys.exit(f"Installing Python dependencies needs uv, or pip, but {sys.executable} has no pip")
+
+        options = ["--quiet", "--disable-pip-version-check", "--no-input"]
+
         if tuple(int(part) for part in re.findall(r"\d+", pip_version)[:2]) < (22, 2):
-            sys.exit(
-                f"Installing Python dependencies needs uv, or pip 22.2 or newer, but {sys.executable} has pip {pip_version}, "
-                f"upgrade it with: {sys.executable} -m pip install --upgrade pip"
-            )
+            # without the installation report, the distributions of the directory are installed again
+            sys.exit(subprocess.run(
+                [sys.executable, "-m", "pip", "install"] + options
+                + ["--upgrade", "--target", directory, "--constraint", constraints] + requirements
+            ).returncode)
 
         from pip._vendor.packaging.utils import canonicalize_name
 
@@ -285,7 +292,6 @@ internal object PythonDependencies {
         for stale in Path(directory).glob(".staging-*"):
             shutil.rmtree(stale, ignore_errors=True)
 
-        options = ["--quiet", "--disable-pip-version-check", "--no-input"]
         pip_seeing_directory = [
             sys.executable, "-c",
             "import runpy, sys; sys.path.append(sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__', alter_sys=True)",
@@ -302,13 +308,16 @@ internal object PythonDependencies {
                 resolved = json.load(file)["install"]
         if not resolved:
             sys.exit()
-        urls = requested_urls(requirements)
+        credentials = url_credentials(requirements)
 
         def distributions(path):
             found = {}
             for entry in Path(path).glob("*.dist-info"):
-                name = metadata.PathDistribution(entry).metadata["Name"]
-                if entry.is_dir() and name:
+                if not entry.is_dir():
+                    continue
+                # a field missing from the metadata is deprecated to read with [], raising KeyError in the future
+                name = metadata.PathDistribution(entry).metadata.get("Name")
+                if name:
                     found.setdefault(canonicalize_name(name), []).append(entry)
             return found
 
@@ -334,7 +343,7 @@ internal object PythonDependencies {
             installation = subprocess.run(
                 [sys.executable, "-m", "pip"] + options
                 + ["install", "--no-deps", "--target", staging]
-                + [pinned_requirement(distribution, urls) for distribution in resolved]
+                + [pinned_requirement(distribution, credentials) for distribution in resolved]
             )
             if installation.returncode != 0:
                 sys.exit(installation.returncode)
@@ -356,7 +365,7 @@ internal object PythonDependencies {
             shutil.rmtree(staging, ignore_errors=True)
     """.trimIndent()
 
-    private val urlCredentials = Regex("(?<=://)[^/@\\s]+@")
+    private val urlCredentials = Regex("(?<=://)[^/\\s]+@")
 
     /** Replaces the credentials of the URLs in the [text] with `****`. */
     internal fun redactCredentials(text: String): String = text.replace(urlCredentials, "****@")

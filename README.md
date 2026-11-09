@@ -127,7 +127,13 @@ otherwise the code can declare it as a dependency, see below.
   from rdkit import Chem
   ```
   The missing dependencies are installed before executing the code,
-  with [uv](https://docs.astral.sh/uv/) if it is on the `PATH`, or with `pip` of the Python executable otherwise,
+  with [uv](https://docs.astral.sh/uv/) if it is on the `PATH`, or with `pip` of the Python executable otherwise.
+  Without uv, pip 22.2 or newer is recommended:
+  an older pip, like 22.0.2 of a virtual environment of Ubuntu 22.04,
+  does not see the dependencies already installed,
+  so it installs them again, with all their own dependencies, whenever another dependency requires them,
+  and can fail replacing the files of a module already imported, like a `.pyd` file of `numpy` on Windows.
+  The dependencies are installed
   into `PythonEnvironment.dependencyDirectory`,
   by default the directory of the `xemantic.kotlin.script.python.dependencyDirectory` system property, if set,
   or otherwise `~/.cache/xemantic-kotlin-script-python/<python>-<hash of the environment>`,
