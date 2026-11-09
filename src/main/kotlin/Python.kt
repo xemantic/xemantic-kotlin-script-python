@@ -146,7 +146,11 @@ public class Python private constructor(
      * becomes its Python `repr`.
      *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
-     * @throws IllegalArgumentException if [T] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`.
+     * A value holding Python objects is copied to a [List], a [Set], a [Map] or an array, see [Python],
+     * so it cannot be of another collection type, like `ArrayDeque`.
+     *
+     * @throws IllegalArgumentException if [T] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`,
+     * or if [T] is another collection type, and the value holds Python objects.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
@@ -159,13 +163,23 @@ public class Python private constructor(
      * becomes its Python `repr`.
      *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
-     * @throws IllegalArgumentException if the [type] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`.
+     * A value holding Python objects is copied to a [List], a [Set], a [Map] or an array, see [Python],
+     * so it cannot be of another collection type, like `ArrayDeque`.
+     *
+     * @throws IllegalArgumentException if the [type] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`,
+     * or if the [type] is another collection type, and the value holds Python objects.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T = call {
         // checked in the call, so that a closed Python fails as closed
         require(!type.holdsPyObject()) { "A PyObject cannot leave the thread of Python" }
-        type.cast(toJava(getValue(expression, type)))
+        val raw = getValue(expression, type)
+        val value = toJava(raw)
+        // a copy is a List, a Set, a Map, or an array, which might not be the type requested
+        require(value === raw || type.isInstance(value)) {
+            "A value holding Python objects is copied to a List, a Set, a Map or an array, which is not a ${type.name}"
+        }
+        type.cast(value)
     }
 
     /**
@@ -339,7 +353,8 @@ public class Python private constructor(
 
         /**
          * Creates an array, which can hold the copy of each element of an array of the [componentType]:
-         * a type which can hold a [PyObject], but not its `repr`, is widened to [Any], also of a nested array.
+         * a type which can hold a [PyObject], or its subtype, but not its `repr`, is widened to [Any],
+         * also of a nested array.
          */
         private fun newArray(componentType: Class<*>, size: Int): Array<Any?> {
             @Suppress("UNCHECKED_CAST")
@@ -349,6 +364,7 @@ public class Python private constructor(
         private fun copyType(type: Class<*>): Class<*> = when {
             type.isArray -> java.lang.reflect.Array.newInstance(copyType(type.componentType), 0).javaClass
             type.isAssignableFrom(PyObject::class.java) && !type.isAssignableFrom(String::class.java) -> Any::class.java
+            PyObject::class.java.isAssignableFrom(type) -> Any::class.java
             else -> type
         }
 

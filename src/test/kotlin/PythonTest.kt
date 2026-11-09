@@ -422,6 +422,37 @@ class PythonTest {
     }
 
     @Test
+    fun `should widen Kotlin array of Python object subtype holding repr`() {
+        // given
+        python["a"] = arrayOfNulls<PyCallable>(1)
+        python.exec("a[0] = len")
+
+        // when
+        val result = python["a"]
+
+        // then
+        assert(result is Array<*> && result.toList() == listOf("<built-in function len>"))
+    }
+
+    @Test
+    fun `should reject evaluating to concrete collection type holding Python object`() {
+        // given
+        python["q"] = java.util.ArrayDeque<Any?>()
+        python.exec("q.add(len)")
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            python.eval("q", java.util.ArrayDeque::class.java)
+        }
+
+        // then
+        assert(
+            exception.message == "A value holding Python objects is copied to a List, a Set, a Map or an array, " +
+                    "which is not a java.util.ArrayDeque"
+        )
+    }
+
+    @Test
     fun `should copy Kotlin set holding Python object`() {
         // given
         val set = LinkedHashSet<Any?>()
