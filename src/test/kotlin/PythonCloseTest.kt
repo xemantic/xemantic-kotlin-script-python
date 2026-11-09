@@ -24,9 +24,12 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit.MILLISECONDS
 import java.util.concurrent.TimeUnit.SECONDS
 import kotlin.concurrent.thread
 import kotlin.test.Test
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 
 /**
  * Tests of [Python.close] racing the calls made from other threads, or called from a Kotlin callback.
@@ -190,7 +193,7 @@ class PythonCloseTest {
     }
 
     @Test
-    fun `should complete running call calling back Python while close waits for it`() {
+    fun `should complete running call calling back Python after close is called from another thread`() {
         // given
         val callbackEntered = CountDownLatch(1)
         val releaseCallback = CountDownLatch(1)
@@ -304,6 +307,138 @@ class PythonCloseTest {
         }
     }
 
+    @Test
+    fun `should close Python from another thread a Kotlin callback waits for`() {
+        // given
+        val events = CopyOnWriteArrayList<String>()
+        val closeTaskRan = CountDownLatch(1)
+        Python.withDecoratedExecutor(interceptingExecutor(
+            decorateRunnable = { task ->
+                Runnable {
+                    task.run()
+                    events += "closed"
+                    closeTaskRan.countDown()
+                }
+            }
+        )).use { python ->
+            python["stop"] = {
+                thread(isDaemon = true, name = "closer") { python.close() }.join()
+                events += "stop returned"
+            }
+            python["after"] = { events += "after" }
+            var execFailure: Throwable? = null
+
+            // when
+            // bounded, only to fail instead of hanging the JVM, if it deadlocks
+            val caller = thread(isDaemon = true, name = "caller") {
+                execFailure = runCatching { python.exec("stop()\nafter()") }.exceptionOrNull()
+            }
+            caller.join(DEADLOCK_TIMEOUT)
+
+            // then
+            assert(!caller.isAlive)
+            assert(execFailure == null)
+            assert(closeTaskRan.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+            assert(events == listOf("stop returned", "after", "closed"))
+            val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+            assert(laterFailure is IllegalStateException)
+            assert(laterFailure.message == "Python is closed")
+        }
+    }
+
+    @Test
+    fun `should close Python from coroutine on another dispatcher a Kotlin callback blocks on`() {
+        // given
+        Python().use { python ->
+            python["stop"] = { runBlocking(Dispatchers.IO) { python.close() } }
+            var failure: Throwable? = null
+
+            // when
+            // bounded, only to fail instead of hanging the JVM, if it deadlocks
+            val caller = thread(isDaemon = true, name = "caller") {
+                failure = runCatching { python.exec("stop()") }.exceptionOrNull()
+            }
+            caller.join(DEADLOCK_TIMEOUT)
+
+            // then
+            assert(!caller.isAlive)
+            assert(failure == null)
+            val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+            assert(laterFailure is IllegalStateException)
+            assert(laterFailure.message == "Python is closed")
+        }
+    }
+
+    @Test
+    fun `should close Python from Kotlin callback called on a thread started by Python`() {
+        // given
+        val closeTaskRan = CountDownLatch(1)
+        Python.withDecoratedExecutor(interceptingExecutor(
+            decorateRunnable = { task ->
+                Runnable {
+                    task.run()
+                    closeTaskRan.countDown()
+                }
+            }
+        )).use { python ->
+            var stopThread: Thread? = null
+            python["stop"] = {
+                stopThread = Thread.currentThread()
+                python.close()
+            }
+            var result: Any? = null
+            var failure: Throwable? = null
+
+            // when
+            // bounded, only to fail instead of hanging the JVM, if it deadlocks
+            val caller = thread(isDaemon = true, name = "caller") {
+                runCatching {
+                    python(
+                        """
+                        import threading
+                        t = threading.Thread(target=stop)
+                        t.start()
+                        t.join()
+                        'joined'
+                        """.trimIndent()
+                    )
+                }
+                    .onSuccess { result = it }
+                    .onFailure { failure = it }
+            }
+            caller.join(DEADLOCK_TIMEOUT)
+
+            // then
+            assert(!caller.isAlive)
+            assert(failure == null)
+            assert(result == "joined")
+            assert(closeTaskRan.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+            // a thread of Python, not the one running the calls
+            assert(stopThread?.name?.startsWith("python-") == false)
+        }
+    }
+
+    @Test
+    fun `should wait for interpreter to be closed when closing Python without running call`() {
+        // given
+        val closeTaskRan = CountDownLatch(1)
+        val python = Python.withDecoratedExecutor(interceptingExecutor(
+            decorateRunnable = { task ->
+                Runnable {
+                    task.run()
+                    closeTaskRan.countDown()
+                }
+            }
+        ))
+        python.exec("x = 1")
+
+        // when
+        python.close()
+
+        // then
+        assert(closeTaskRan.count == 0L)
+    }
+
     /**
      * Decorates the executor of a [Python], to call on the calling thread:
      * [beforeSubmit] before, and [afterSubmit] after submitting each task, telling if it was accepted,
@@ -341,6 +476,13 @@ class PythonCloseTest {
             }
 
         }
+    }
+
+    private companion object {
+
+        /** Generous, so that only a deadlock, never a load of the machine, fails a test. */
+        const val DEADLOCK_TIMEOUT = 120_000L
+
     }
 
 }
