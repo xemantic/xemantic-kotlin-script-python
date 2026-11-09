@@ -87,8 +87,9 @@ public object PythonEnvironment {
     internal lateinit var executable: String
         private set
 
-    /** The standard error of the successful probe of the [executable], e.g. a warning, see [embeddedPythonFailure]. */
-    private var probeError: String = ""
+    /** The starter of the interpreters of the embedded CPython, resolved on the first use of [Python]. */
+    internal lateinit var starter: EmbeddedPythonStarter
+        private set
 
     @Synchronized
     internal fun initialize() {
@@ -104,7 +105,7 @@ public object PythonEnvironment {
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         this.executable = executable
-        this.probeError = probeError
+        starter = EmbeddedPythonStarter(executable, probeError)
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
         }
@@ -141,24 +142,6 @@ public object PythonEnvironment {
         .setProgramName(executable)
 
     /**
-     * The [cause] of the failure of the embedded CPython to initialize, e.g. its first interpreter,
-     * with what the probe of its [executable] wrote to the standard error, if anything:
-     * a warning of a successful probe, e.g. `Could not find platform libraries` of a wrong `PYTHONHOME`,
-     * might tell why the embedded CPython, configured the same way, fails.
-     *
-     * @return the [cause] itself, if the probe wrote nothing to the standard error.
-     */
-    internal fun embeddedPythonFailure(
-        cause: Throwable,
-        executable: String = this.executable,
-        probeError: String = this.probeError
-    ): Throwable = if (probeError.isEmpty()) cause else IllegalStateException(
-        "Cannot initialize the embedded Python $executable: ${cause.message}\n" +
-            "The probe of this Python wrote to the standard error:\n$probeError",
-        cause
-    )
-
-    /**
      * Checks that the embedded CPython of the [interpreter] runs in UTF-8 mode, see [embeddedPythonConfig].
      *
      * @throws IllegalStateException if it does not.
@@ -189,11 +172,13 @@ public object PythonEnvironment {
         // only the probe's own check blames jep, any other failure is the one of Python itself,
         // e.g. of a pyenv shim of a version which is not installed
         check(result.exitCode != PROBE_JEP_MISSING_EXIT_CODE) {
-            "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
+            withOutput(
+                "Cannot find the jep package of $python, install it with: $python -m pip install jep",
                 result.failureOutput
+            )
         }
         check(result.exitCode == 0) {
-            "Cannot run Python $python, it failed with exit code ${result.exitCode}:\n" + result.failureOutput
+            withOutput("Cannot run Python $python, it failed with exit code ${result.exitCode}", result.failureOutput)
         }
         val parsed = try {
             parseProbeOutput(result.output)
@@ -212,8 +197,14 @@ public object PythonEnvironment {
         check(probe.executable.isNotEmpty()) {
             "Python cannot tell the path of its executable (sys.executable is empty): $python"
         }
-        return probe.copy(error = result.error)
+        // limited, as it is kept for the lifetime of the JVM; a warning of Python at startup comes first
+        val error = if (result.error.length <= PROBE_ERROR_LIMIT) result.error
+        else result.error.take(PROBE_ERROR_LIMIT) + "\n[truncated]"
+        return probe.copy(error = error)
     }
+
+    private fun withOutput(headline: String, output: String) =
+        if (output.isEmpty()) headline else "$headline\n$output"
 
     /**
      * The [PythonProbe] of the standard [output] of [probeCommand].
@@ -245,7 +236,8 @@ public object PythonEnvironment {
      * as text, a path which is not valid UTF-8, e.g. `/home/josé` in ISO-8859-1,
      * would be surrogate-escaped by Python in UTF-8 mode, and could not be encoded to UTF-8,
      * while the JVM would decode a path of UTF-8 bytes to another one, in another encoding of its locale.
-     * Without the `jep` package, it writes nothing, and exits with the [PROBE_JEP_MISSING_EXIT_CODE].
+     * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
+     * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
      * The lines are written with an empty line before them, in case the standard output written before does not end with a newline,
      * and as bytes, without the newline translation of the text mode, e.g. on Windows,
      * to the original standard output, as `sys.stdout` might be replaced, e.g. by a `sitecustomize` module,
@@ -257,6 +249,8 @@ public object PythonEnvironment {
         |import importlib.util, os, sys
         |jep_spec = importlib.util.find_spec('jep')
         |if jep_spec is None or not jep_spec.submodule_search_locations:
+        |    if jep_spec is not None:
+        |        print('jep is not the package, but the module:', jep_spec.origin, file=sys.stderr)
         |    sys.exit($PROBE_JEP_MISSING_EXIT_CODE)
         |values = [
         |    sys.executable,
@@ -279,6 +273,9 @@ public object PythonEnvironment {
      * 126 and 127 of a shell which cannot run the command, and above 128 of a signal.
      */
     internal const val PROBE_JEP_MISSING_EXIT_CODE = 83
+
+    /** The maximum length of the standard error of the probe kept as [PythonProbe.error]. */
+    internal const val PROBE_ERROR_LIMIT = 8192
 
     internal const val PROBE_BEGIN = "--- xemantic-kotlin-script-python probe begin ---"
 
@@ -362,6 +359,63 @@ private fun String.hexToPath(): String? {
         .onUnmappableCharacter(CodingErrorAction.REPORT)
         .decode(ByteBuffer.wrap(bytes))
         .toString()
+}
+
+/**
+ * Creates the interpreters of the embedded CPython of the Python [executable],
+ * telling a failure of its startup with what the probe of the [executable] wrote to the standard error, if anything,
+ * as a warning of a successful probe, e.g. `Could not find platform libraries` of a wrong `PYTHONHOME`,
+ * might tell why the embedded CPython, configured the same way, fails.
+ */
+internal class EmbeddedPythonStarter(private val executable: String, private val probeError: String) {
+
+    /** Whether an interpreter has been created, so that the embedded CPython has started. */
+    @Volatile
+    private var started = false
+
+    /**
+     * Creates an interpreter with [create], and checks it with [check], closing it if the check fails.
+     *
+     * @throws IllegalStateException if the embedded CPython fails to start,
+     * with the original failure as its cause:
+     * any failure before the first interpreter is created, or an [Error] of Jep, at any time,
+     * e.g. the one with which Jep rethrows the failure of initializing CPython,
+     * also when it is retried, or an [UnsatisfiedLinkError] of its native libraries.
+     * Any other failure, after the embedded CPython has started, is thrown as is.
+     */
+    fun <T : AutoCloseable> createInterpreter(create: () -> T, check: (T) -> Unit): T {
+        val interpreter = try {
+            create()
+        } catch (e: VirtualMachineError) {
+            // e.g. an OutOfMemoryError, which is no failure of the embedded CPython
+            throw e
+        } catch (e: Throwable) {
+            if (started && e !is Error) throw e
+            throw startupFailure(e)
+        }
+        started = true
+        try {
+            check(interpreter)
+        } catch (e: Throwable) {
+            try {
+                interpreter.close()
+            } catch (closing: Throwable) {
+                e.addSuppressed(closing)
+            }
+            throw e
+        }
+        return interpreter
+    }
+
+    private fun startupFailure(cause: Throwable): IllegalStateException {
+        val message = "Cannot initialize the embedded Python $executable: ${cause.message ?: cause}"
+        return IllegalStateException(
+            if (probeError.isEmpty()) message
+            else "$message\nThe probe of this Python wrote to the standard error, which might tell why:\n$probeError",
+            cause
+        )
+    }
+
 }
 
 /**

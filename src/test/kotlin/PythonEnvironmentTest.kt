@@ -19,6 +19,7 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import jep.JepException
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.nio.file.Path
@@ -408,45 +409,162 @@ class PythonEnvironmentTest {
             assert(
                 message.startsWith("Cannot find the jep package of $python") &&
                     "pip install jep" in message &&
-                    "Traceback" !in message
+                    "Traceback" !in message &&
+                    !message.endsWith("\n")
             )
         } finally {
             directory.deleteRecursively()
         }
     }
 
+    @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should report stderr of probe on failure of embedded Python`() {
+    fun `should name module shadowing jep package of Python`() {
         // given
-        val cause = IllegalStateException("Jep could not initialize")
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, "")
+        // a module on PYTHONPATH, before the site-packages, where the jep package is installed
+        val module = directory.resolve("site").resolve("jep.py")
+        module.writeText("")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            assert(message.startsWith("Cannot find the jep package of $python") && module.toString() in message)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should limit stderr kept of successful probe`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        python.writeText(
+            """
+            |#!/bin/sh
+            |echo "Could not find platform libraries" >&2
+            |head -c 1000000 /dev/zero | tr '\0' 'w' >&2
+            |exec "$venvPython" "${'$'}@"
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python.toString())
+
+            // then
+            // measured, as power-assert would render the whole error on failure
+            val length = probe.error.length
+            val startsWithWarning = probe.error.startsWith("Could not find platform libraries")
+            val truncated = probe.error.endsWith("[truncated]")
+            assert(length <= 9000 && startsWithWarning && truncated)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should report stderr of probe on Error of embedded Python startup`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "Could not find platform libraries <exec_prefix>")
+        // like jep's MainInterpreter, rethrowing the failure of initializing CPython
+        val error = Error(IllegalStateException("failed to get the Python codec of the filesystem encoding"))
 
         // when
-        val failure = PythonEnvironment.embeddedPythonFailure(
-            cause,
-            executable = "/venv/bin/python",
-            probeError = "Could not find platform libraries <exec_prefix>"
-        )
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw error }, check = {})
+        }
 
         // then
-        val message = failure.message!!
+        val message = exception.message!!
         assert(
-            failure.cause === cause &&
-                "/venv/bin/python" in message &&
-                "Jep could not initialize" in message &&
+            exception.cause === error &&
+                message.startsWith("Cannot initialize the embedded Python /venv/bin/python") &&
+                "failed to get the Python codec of the filesystem encoding" in message &&
                 "Could not find platform libraries <exec_prefix>" in message
         )
     }
 
     @Test
-    fun `should keep failure of embedded Python when probe wrote no stderr`() {
+    fun `should report Error of embedded Python which previously failed to start after another started`() {
         // given
-        val cause = IllegalStateException("Jep could not initialize")
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "a warning")
+        starter.createInterpreter(create = { FakeInterpreter() }, check = {}).close()
+        val error = Error("The main Python interpreter previously failed to initialize.")
 
         // when
-        val failure = PythonEnvironment.embeddedPythonFailure(cause, executable = "/venv/bin/python", probeError = "")
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw error }, check = {})
+        }
 
         // then
-        assert(failure === cause)
+        assert(exception.cause === error && "a warning" in exception.message!!)
+    }
+
+    @Test
+    fun `should report failure of first embedded Python startup the same way without stderr of probe`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "")
+        val cause = JepException("Error importing shared module")
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            exception.cause === cause &&
+                message == "Cannot initialize the embedded Python /venv/bin/python: Error importing shared module"
+        )
+    }
+
+    @Test
+    fun `should not report stderr of probe on failure of interpreter after embedded Python started`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "a warning")
+        starter.createInterpreter(create = { FakeInterpreter() }, check = {}).close()
+        val cause = JepException("unrelated failure")
+
+        // when
+        val exception = assertFailsWith<JepException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        assert(exception === cause)
+    }
+
+    @Test
+    fun `should close interpreter failing its check`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "")
+        val interpreter = FakeInterpreter()
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { interpreter }, check = { error("not in UTF-8 mode") })
+        }
+
+        // then
+        assert(exception.message == "not in UTF-8 mode" && interpreter.closed)
+    }
+
+    private class FakeInterpreter : AutoCloseable {
+        var closed = false
+        override fun close() {
+            closed = true
+        }
     }
 
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */

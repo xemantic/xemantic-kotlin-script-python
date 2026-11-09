@@ -18,7 +18,6 @@
 
 package com.xemantic.kotlin.script.python
 
-import jep.JepException
 import jep.SharedInterpreter
 import jep.python.PyCallable
 import jep.python.PyObject
@@ -62,6 +61,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * a `str` a [String], and a `list` a [List].
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
+ * If it cannot be resolved, or the embedded CPython fails to start, the call fails with an [IllegalStateException],
+ * with the original failure, e.g. of Jep, as its cause.
+ * Its message includes what the probe of the Python executable wrote to the standard error, if anything,
+ * e.g. the `Could not find platform libraries` warning of a wrong `PYTHONHOME`, which might tell why.
+ * Once the embedded CPython fails to start, every `Python` fails, as it can be started only once per JVM.
  */
 public class Python private constructor(
     decorateExecutor: (ExecutorService) -> ExecutorService
@@ -220,18 +224,11 @@ public class Python private constructor(
                 checkNotClosed()
                 val interpreter = interpreter ?: run {
                     PythonEnvironment.initialize()
-                    // the first one initializes the embedded CPython, which might fail like its probe warned
-                    try {
-                        SharedInterpreter()
-                    } catch (e: JepException) {
-                        throw PythonEnvironment.embeddedPythonFailure(e)
-                    } catch (e: LinkageError) {
-                        // e.g. an UnsatisfiedLinkError of the native libraries
-                        throw PythonEnvironment.embeddedPythonFailure(e)
-                    }.also {
-                        interpreter = it
-                        PythonEnvironment.checkUtf8Mode(it)
-                    }
+                    // assigned only once checked, so that a later call does not use an interpreter failing the check
+                    PythonEnvironment.starter.createInterpreter(
+                        create = { SharedInterpreter() },
+                        check = { PythonEnvironment.checkUtf8Mode(it) }
+                    ).also { interpreter = it }
                 }
                 interpreter.block()
             }
