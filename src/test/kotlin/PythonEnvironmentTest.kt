@@ -19,14 +19,16 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
-import java.nio.file.attribute.PosixFilePermissions
 import java.io.IOException
+import java.nio.file.attribute.PosixFilePermissions
+import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
+import kotlin.io.path.exists
 import kotlin.io.path.readText
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
@@ -154,19 +156,95 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should destroy process when writing its input fails`() {
+    fun `should run process writing much to stdout before consuming its stdin`() {
+        // given
+        val size = 10_000_000
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(venvPython, "-c", "import shutil, sys; shutil.copyfileobj(sys.stdin, sys.stdout)"),
+            input = "x".repeat(size)
+        )
+
+        // then
+        // counted, as power-assert would render the whole output on failure
+        val length = output.length
+        val notEchoed = output.count { it != 'x' }
+        assert(exitCode == 0 && length == size && notEchoed == 0)
+    }
+
+    @Test
+    fun `should return exit code and output of process ending before consuming its stdin`() {
+        // when
+        val result = runProcess(
+            listOf(venvPython, "-c", "import sys; print('failure before reading stdin'); sys.exit(3)"),
+            input = "x".repeat(10_000_000)
+        )
+
+        // then
+        assert(result == ProcessResult(exitCode = 3, output = "failure before reading stdin", error = ""))
+    }
+
+    @Test
+    fun `should destroy process and rethrow when reading its output fails`() {
         // given
         val pidFile = createTempFile("python-pid", ".txt")
-        val script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); os.close(0); time.sleep(600)"
+        // the output is closed after the failure, so the process outlives it, to keep running, like a stuck one
+        val script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid()))\n" +
+            "try:\n" +
+            "    while True: sys.stdout.write('x' * 65536)\n" +
+            "except BrokenPipeError:\n" +
+            "    time.sleep(600)"
 
         try {
             // when
-            assertFailsWith<IOException> {
-                runProcess(listOf(venvPython, "-c", script, pidFile.toString()), input = "x".repeat(10_000_000))
+            val exception = assertFailsWith<IOException> {
+                runProcess(
+                    listOf(venvPython, "-c", script, pidFile.toString()),
+                    readOutput = { reader ->
+                        reader.read(CharArray(1024))
+                        throw IOException("reading output failed")
+                    }
+                )
             }
 
             // then
+            assert(exception.message == "reading output failed")
             val pid = pidFile.readText().toLong()
+            assert(ProcessHandle.of(pid).map { it.isAlive }.orElse(false) == false)
+        } finally {
+            pidFile.deleteIfExists()
+        }
+    }
+
+    @Test
+    fun `should destroy process when interrupted while waiting for it`() {
+        // given
+        val pidFile = createTempFile("python-pid", ".txt")
+        val script = "import os, sys, time; open(sys.argv[1] + '.tmp', 'w').write(str(os.getpid())); " +
+            "os.replace(sys.argv[1] + '.tmp', sys.argv[1]); time.sleep(600)"
+        pidFile.deleteIfExists()
+        var failure: Throwable? = null
+        val runner = thread {
+            try {
+                runProcess(listOf(venvPython, "-c", script, pidFile.toString()), input = "x".repeat(10_000_000))
+            } catch (e: Throwable) {
+                failure = e
+            }
+        }
+
+        try {
+            // the runner checked, so that the test fails, instead of waiting forever, when it fails to start Python
+            while (!pidFile.exists() && runner.isAlive) Thread.sleep(10)
+            assert(pidFile.exists())
+            val pid = pidFile.readText().toLong()
+
+            // when
+            runner.interrupt()
+            runner.join()
+
+            // then
+            assert(failure is InterruptedException)
             assert(ProcessHandle.of(pid).map { it.isAlive }.orElse(false) == false)
         } finally {
             pidFile.deleteIfExists()
