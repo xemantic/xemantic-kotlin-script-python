@@ -96,12 +96,7 @@ public object PythonEnvironment {
         if (initialized) return
         val python = (pythonExecutable ?: defaultPythonExecutable()).toString()
         val (executable, cacheTag, prefix, jepLocation, probeError) = probePython(python)
-        val jepDir = Path(jepLocation)
-        val library = jepDir.listDirectoryEntries().firstOrNull {
-            it.name.startsWith("libjep.") || it.name == "jep.dll"
-        } ?: throw IllegalStateException(
-            "No native Jep library in $jepDir, reinstall jep with: $python -m pip install jep"
-        )
+        val library = jepLibrary(Path(jepLocation), python)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         this.executable = executable
@@ -119,6 +114,28 @@ public object PythonEnvironment {
             )
         }
         initialized = true
+    }
+
+    /**
+     * The native library of Jep in the [jepDirectory], the directory of the `jep` package of the [python].
+     *
+     * @throws IllegalStateException if there is none, or the [jepDirectory] cannot be listed.
+     */
+    internal fun jepLibrary(jepDirectory: Path, python: String): Path {
+        val entries = try {
+            jepDirectory.listDirectoryEntries()
+        } catch (e: IOException) {
+            throw IllegalStateException(
+                "Cannot list the directory of the jep package of $python: $jepDirectory, " +
+                    "reinstall jep with: $python -m pip install jep",
+                e
+            )
+        }
+        return entries.firstOrNull {
+            it.name.startsWith("libjep.") || it.name == "jep.dll"
+        } ?: throw IllegalStateException(
+            "No native Jep library in $jepDirectory, reinstall jep with: $python -m pip install jep"
+        )
     }
 
     /**
@@ -190,18 +207,30 @@ public object PythonEnvironment {
             )
         }
         val probe = checkNotNull(parsed) {
-            "Cannot read the values of the Python environment probe of $python from its output:\n" +
+            withOutput(
+                "Cannot read the values of the Python environment probe of $python from its output",
                 result.failureOutput
+            )
         }
         // the embedded CPython needs it to find the pyvenv.cfg of a virtual environment, and pip is run with it
         check(probe.executable.isNotEmpty()) {
             "Python cannot tell the path of its executable (sys.executable is empty): $python"
         }
         // limited, as it is kept for the lifetime of the JVM; a warning of Python at startup comes first
-        val error = if (result.error.length <= PROBE_ERROR_LIMIT) result.error
-        else result.error.take(PROBE_ERROR_LIMIT) + "\n[truncated]"
-        return probe.copy(error = error)
+        return probe.copy(error = limitProbeError(result.error))
     }
+
+    /** The [error] of the probe, limited to [PROBE_ERROR_LIMIT] characters, including the note of truncation. */
+    private fun limitProbeError(error: String): String {
+        if (error.length <= PROBE_ERROR_LIMIT) return error
+        val end = (PROBE_ERROR_LIMIT - PROBE_ERROR_TRUNCATED.length).let {
+            // not between the two chars of a surrogate pair
+            if (error[it - 1].isHighSurrogate()) it - 1 else it
+        }
+        return error.substring(0, end) + PROBE_ERROR_TRUNCATED
+    }
+
+    private const val PROBE_ERROR_TRUNCATED = "\n[truncated]"
 
     private fun withOutput(headline: String, output: String) =
         if (output.isEmpty()) headline else "$headline\n$output"
@@ -378,10 +407,11 @@ internal class EmbeddedPythonStarter(private val executable: String, private val
      *
      * @throws IllegalStateException if the embedded CPython fails to start,
      * with the original failure as its cause:
-     * any failure before the first interpreter is created, or an [Error] of Jep, at any time,
-     * e.g. the one with which Jep rethrows the failure of initializing CPython,
+     * any failure before the first interpreter is created,
+     * e.g. the [Error] with which Jep rethrows the failure of initializing CPython,
      * also when it is retried, or an [UnsatisfiedLinkError] of its native libraries.
-     * Any other failure, after the embedded CPython has started, is thrown as is.
+     * Any failure after the first interpreter is created is thrown as is,
+     * as the embedded CPython starts once per JVM.
      */
     fun <T : AutoCloseable> createInterpreter(create: () -> T, check: (T) -> Unit): T {
         val interpreter = try {
@@ -390,7 +420,7 @@ internal class EmbeddedPythonStarter(private val executable: String, private val
             // e.g. an OutOfMemoryError, which is no failure of the embedded CPython
             throw e
         } catch (e: Throwable) {
-            if (started && e !is Error) throw e
+            if (started) throw e
             throw startupFailure(e)
         }
         started = true
@@ -408,7 +438,9 @@ internal class EmbeddedPythonStarter(private val executable: String, private val
     }
 
     private fun startupFailure(cause: Throwable): IllegalStateException {
-        val message = "Cannot initialize the embedded Python $executable: ${cause.message ?: cause}"
+        // Jep wraps the failure of initializing CPython in an Error, whose message is its toString()
+        val reason = cause.cause?.takeIf { cause.message == it.toString() } ?: cause
+        val message = "Cannot initialize the embedded Python $executable: ${reason.message ?: reason}"
         return IllegalStateException(
             if (probeError.isEmpty()) message
             else "$message\nThe probe of this Python wrote to the standard error, which might tell why:\n$probeError",
