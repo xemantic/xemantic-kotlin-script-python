@@ -116,7 +116,8 @@ public object PythonEnvironment {
     /**
      * Asks the [python] executable about itself.
      *
-     * @throws IllegalStateException if it cannot be run, or has no `jep` package.
+     * @throws IllegalStateException if it cannot be run, has no `jep` package,
+     * does not write the values of the probe, or cannot tell the path of its executable.
      */
     internal fun probePython(python: String): PythonProbe {
         val result = try {
@@ -128,7 +129,15 @@ public object PythonEnvironment {
             "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
                 result.failureOutput
         }
-        return parseProbeOutput(result.output)
+        val probe = checkNotNull(parseProbeOutput(result.output)) {
+            "Cannot read the values of the Python environment probe of $python from its output:\n" +
+                result.failureOutput
+        }
+        // the embedded CPython needs it to find the pyvenv.cfg of a virtual environment, and pip is run with it
+        check(probe.executable.isNotEmpty()) {
+            "Python cannot tell the path of its executable (sys.executable is empty): $python"
+        }
+        return probe
     }
 
     /**
@@ -138,17 +147,15 @@ public object PythonEnvironment {
      * as anything else run by Python, e.g. a `sitecustomize` module or a `.pth` file,
      * can write to the standard output as well, before or after them.
      *
-     * @throws IllegalStateException if the [output] has no such values.
+     * @return the probe, or `null` if the [output] has no such values.
      */
-    internal fun parseProbeOutput(output: String): PythonProbe {
+    internal fun parseProbeOutput(output: String): PythonProbe? {
         // the output is trimmed, also of the newline before the first line
         val lines = "\n$output"
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
         val values = if (begin == null || end == null) null else lines.substring(begin, end).split('\u0000')
-        check(values != null && values.size == 4) {
-            "Cannot read the values of the Python environment probe from its output:\n$output"
-        }
+        if (values == null || values.size != 4) return null
         val (executable, cacheTag, prefix, jepLocation) = values
         return PythonProbe(executable, cacheTag, prefix, jepLocation)
     }
@@ -158,7 +165,9 @@ public object PythonEnvironment {
      *
      * It writes its values, separated by NUL, which no path can contain, between the [PROBE_BEGIN] and [PROBE_END] lines,
      * with an empty line before them, in case the standard output written before does not end with a newline,
-     * and as bytes, without the newline translation of the text mode, e.g. on Windows.
+     * and as bytes, without the newline translation of the text mode, e.g. on Windows,
+     * to the original standard output, as `sys.stdout` might be replaced, e.g. by a `sitecustomize` module,
+     * with a stream which has no `buffer`, or which does not write to the standard output at all.
      */
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
@@ -172,14 +181,15 @@ public object PythonEnvironment {
         |]
         |payload = '\0'.join('' if value is None else str(value) for value in values)
         |sys.stdout.flush()
-        |sys.stdout.buffer.write(('\n$PROBE_BEGIN\n' + payload + '\n$PROBE_END\n').encode('utf-8'))
-        |sys.stdout.flush()
+        |sys.__stdout__.flush()
+        |sys.__stdout__.buffer.write(('\n$PROBE_BEGIN\n' + payload + '\n$PROBE_END\n').encode('utf-8'))
+        |sys.__stdout__.flush()
         |""".trimMargin()
     )
 
-    private const val PROBE_BEGIN = "--- xemantic-kotlin-script-python probe begin ---"
+    internal const val PROBE_BEGIN = "--- xemantic-kotlin-script-python probe begin ---"
 
-    private const val PROBE_END = "--- xemantic-kotlin-script-python probe end ---"
+    internal const val PROBE_END = "--- xemantic-kotlin-script-python probe end ---"
 
     private const val DEPENDENCY_DIRECTORY_PROPERTY = "xemantic.kotlin.script.python.dependencyDirectory"
 

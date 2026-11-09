@@ -45,6 +45,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should probe Python which writes to stderr`() {
         // given
+        val expected = PythonEnvironment.probePython(venvPython)
         val directory = createTempDirectory("python-probe")
         val python = directory.resolve("python")
         python.writeText(
@@ -55,7 +56,6 @@ class PythonEnvironmentTest {
             |""".trimMargin()
         )
         python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
-        val expected = PythonEnvironment.probePython(venvPython)
 
         try {
             // when
@@ -72,12 +72,12 @@ class PythonEnvironmentTest {
     @Test
     fun `should probe Python whose sitecustomize writes lines to stdout`() {
         // given
+        val expected = PythonEnvironment.probePython(venvPython)
         val directory = createTempDirectory("python-probe")
         val python = pythonWithSitecustomize(
             directory,
             "print('sitecustomize noise')\nprint('more noise')\n"
         )
-        val expected = PythonEnvironment.probePython(venvPython)
 
         try {
             // when
@@ -94,12 +94,12 @@ class PythonEnvironmentTest {
     @Test
     fun `should probe Python whose sitecustomize writes to stdout without trailing newline`() {
         // given
+        val expected = PythonEnvironment.probePython(venvPython)
         val directory = createTempDirectory("python-probe")
         val python = pythonWithSitecustomize(
             directory,
             "import sys\nsys.stdout.write('noise without newline')\n"
         )
-        val expected = PythonEnvironment.probePython(venvPython)
 
         try {
             // when
@@ -114,34 +114,174 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should probe Python with empty executable`() {
+    fun `should probe Python whose sitecustomize replaces stdout with wrapper without buffer`() {
         // given
-        val directory = createTempDirectory("python-probe")
-        // Python sets an empty sys.executable when it cannot tell the path of its executable
-        val python = pythonWithSitecustomize(directory, "import sys\nsys.executable = ''\n")
         val expected = PythonEnvironment.probePython(venvPython)
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(
+            directory,
+            """
+            |import sys
+            |class Wrapper:
+            |    def __init__(self, stream): self.stream = stream
+            |    def write(self, text): return self.stream.write(text)
+            |    def flush(self): self.stream.flush()
+            |sys.stdout = Wrapper(sys.stdout)
+            |print('noise through wrapper', end='')
+            |""".trimMargin()
+        )
 
         try {
             // when
             val probe = PythonEnvironment.probePython(python)
 
             // then
-            assert(probe == expected.copy(executable = ""))
+            assert(probe == expected)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should fail clearly on probe of Python with empty executable`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        // Python sets an empty sys.executable when it cannot tell the path of its executable
+        val python = pythonWithSitecustomize(directory, "import sys\nsys.executable = ''\n")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            assert("sys.executable is empty" in message && python in message)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report executable, stderr and stdout of probe output without values`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        python.writeText(
+            """
+            |#!/bin/sh
+            |echo "unexpected stdout"
+            |echo "unexpected stderr" >&2
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python.toString())
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                python.toString() in message && "unexpected stdout" in message && "unexpected stderr" in message
+            )
         } finally {
             directory.deleteRecursively()
         }
     }
 
     @Test
-    fun `should fail clearly on probe output without values`() {
+    fun `should parse probe output with output before and after values`() {
+        // given
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")}\nmore noise"
+
         // when
-        val exception = assertFailsWith<IllegalStateException> {
-            PythonEnvironment.parseProbeOutput("unexpected output")
-        }
+        val probe = PythonEnvironment.parseProbeOutput(output)
 
         // then
-        assert("unexpected output" in exception.message!!)
+        assert(probe == PythonProbe("/venv/bin/python", "cpython-313", "/venv", "/venv/jep"))
     }
+
+    @Test
+    fun `should parse probe output with marker lines repeated before values`() {
+        // given
+        val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
+            "${PythonEnvironment.PROBE_BEGIN}\n" +
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == PythonProbe("/venv/bin/python", "cpython-313", "/venv", "/venv/jep"))
+    }
+
+    @Test
+    fun `should parse probe output with empty first value`() {
+        // given
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep")
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == PythonProbe("", "cpython-313", "/venv", "/venv/jep"))
+    }
+
+    @Test
+    fun `should parse probe output with values containing spaces and non-ASCII`() {
+        // given
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep")
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == PythonProbe("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep"))
+    }
+
+    @Test
+    fun `should not parse probe output without values`() {
+        // when
+        val probe = PythonEnvironment.parseProbeOutput("unexpected output")
+
+        // then
+        assert(probe == null)
+    }
+
+    @Test
+    fun `should not parse probe output with begin marker but without end marker`() {
+        // given
+        val output = "${PythonEnvironment.PROBE_BEGIN}\n/venv/bin/python\u0000cpython-313\u0000/venv\u0000/venv/jep"
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == null)
+    }
+
+    @Test
+    fun `should not parse probe output without exactly four values`() {
+        // given
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "extra")
+
+        // when
+        val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
+
+        // then
+        assert(probes == listOf(null, null))
+    }
+
+    /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
+    private fun probePayload(vararg values: String): String =
+        "${PythonEnvironment.PROBE_BEGIN}\n${values.joinToString("\u0000")}\n${PythonEnvironment.PROBE_END}"
 
     /**
      * A shim of the venv Python in the [directory], with a `sitecustomize` module of the [code] on its `PYTHONPATH`,
