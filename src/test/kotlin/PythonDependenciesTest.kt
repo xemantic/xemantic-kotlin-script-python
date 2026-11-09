@@ -219,4 +219,91 @@ class PythonDependenciesTest {
         assert(metadata == null)
     }
 
+    @Test
+    fun `should plan with more imported modules than fit on command line`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // about 6 MB of names, more than ARG_MAX of macOS and Linux, and the 32767 characters of Windows,
+        // and enough to hang if the distributions of the environment are scanned again for each module
+        val imported = List(300_000) { "imported_module_$it" }
+
+        // when
+        val plan = PythonDependencies.plan("dependencies = [\"nonexistent-dependency\"]\n", directory, imported)
+
+        // then
+        assert(("install" to "nonexistent-dependency") in plan)
+    }
+
+    @Test
+    fun `should plan for metadata with quotes, backslashes, line breaks and non-ASCII characters`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val metadata = "title = \"\\\"q\\\" \\\\ \u00fc\u2028 \uD83D\uDE00 \\u0001\"\r\n" +
+            "dependencies = [\n  \"nonexistent-dependency\",\n]\n"
+
+        // when
+        val plan = PythonDependencies.plan(metadata, directory, listOf("sys", "\u00fcber"))
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
+    }
+
+    @Test
+    fun `should plan without tomllib of Python before 3_11`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // None in sys.modules makes the import fail with ModuleNotFoundError, like on Python 3.10,
+        // and without tomli, the copy vendored by pip is used
+        val code = "import sys; sys.modules.update(dict.fromkeys(['tomllib', 'tomli'], None))\n" +
+            PythonDependencies.PLAN
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", code, directory),
+            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
+        )
+
+        // then
+        assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+    }
+
+    @Test
+    fun `should fail plan on invalid metadata without tomllib of Python before 3_11`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val code = "import sys; sys.modules.update(dict.fromkeys(['tomllib', 'tomli'], None))\n" +
+            PythonDependencies.PLAN
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", code, directory),
+            input = """{"metadata": "dependencies = \n", "modules": []}"""
+        )
+
+        // then
+        assert(exitCode != 0 && output.startsWith("Invalid '# /// script' metadata: "))
+    }
+
+    @Test
+    fun `should fail plan with clear message without any TOML parser`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val code = "import sys; sys.modules.update(dict.fromkeys(['tomllib', 'tomli', 'pip'], None))\n" +
+            PythonDependencies.PLAN
+
+        // when
+        val (exitCode, output) = runProcess(
+            listOf(PythonEnvironment.executable, "-c", code, directory),
+            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
+        )
+
+        // then
+        assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+    }
+
 }
