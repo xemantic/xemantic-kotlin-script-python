@@ -21,6 +21,7 @@ package com.xemantic.kotlin.script.python
 import jep.MainInterpreter
 import jep.PyConfig
 import java.io.IOException
+import java.io.Reader
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.concurrent.thread
@@ -217,13 +218,16 @@ internal data class ProcessResult(
  * The process runs in the working [directory], by default the one of the JVM.
  * The [environment] variables are added to the inherited ones,
  * and every Python process exchanges its standard streams in UTF-8, whatever its locale.
+ *
+ * The [readOutput] reads the whole standard output, a test seam for a failure of reading it.
  */
 internal fun runProcess(
     command: List<String>,
     input: String? = null,
     mergeErrorStream: Boolean = true,
     environment: Map<String, String> = emptyMap(),
-    directory: Path? = null
+    directory: Path? = null,
+    readOutput: (Reader) -> String = { it.readText() }
 ): ProcessResult {
     // a file, unlike a pipe, does not block the process when nobody reads it
     val errorFile = if (mergeErrorStream) null else createTempFile("process-stderr", ".txt")
@@ -260,10 +264,13 @@ internal fun runProcess(
             var outputFailure: Throwable? = null
             val reader = thread(name = "process-stdout", isDaemon = true) {
                 try {
-                    output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+                    output = process.inputStream.bufferedReader().use(readOutput).trim()
                 } catch (e: Throwable) {
-                    // e.g. an OutOfMemoryError, rethrown on the calling thread
+                    // e.g. an OutOfMemoryError, rethrown on the calling thread;
+                    // the process is destroyed, as it might never end without its output read,
+                    // and the calling thread would wait for it forever
                     outputFailure = e
+                    process.destroyForcibly()
                 }
             }
             val exitCode = process.waitFor()
