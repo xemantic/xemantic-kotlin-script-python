@@ -20,13 +20,14 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import java.nio.file.attribute.PosixFilePermissions
-import java.io.IOException
+import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
+import kotlin.io.path.exists
 import kotlin.io.path.readText
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
@@ -154,19 +155,59 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should destroy process when writing its input fails`() {
+    fun `should run process writing much to stdout before consuming its stdin`() {
+        // given
+        val input = "x".repeat(10_000_000)
+
+        // when
+        val result = runProcess(
+            listOf(venvPython, "-c", "import shutil, sys; shutil.copyfileobj(sys.stdin, sys.stdout)"),
+            input = input
+        )
+
+        // then
+        assert(result.exitCode == 0)
+        assert(result.output == input)
+    }
+
+    @Test
+    fun `should return exit code and output of process ending before consuming its stdin`() {
+        // when
+        val result = runProcess(
+            listOf(venvPython, "-c", "import sys; print('failure before reading stdin'); sys.exit(3)"),
+            input = "x".repeat(10_000_000)
+        )
+
+        // then
+        assert(result == ProcessResult(exitCode = 3, output = "failure before reading stdin", error = ""))
+    }
+
+    @Test
+    fun `should destroy process when interrupted while waiting for it`() {
         // given
         val pidFile = createTempFile("python-pid", ".txt")
-        val script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); os.close(0); time.sleep(600)"
+        val script = "import os, sys, time; open(sys.argv[1] + '.tmp', 'w').write(str(os.getpid())); " +
+            "os.replace(sys.argv[1] + '.tmp', sys.argv[1]); time.sleep(600)"
+        pidFile.deleteIfExists()
+        var failure: Throwable? = null
+        val runner = thread {
+            try {
+                runProcess(listOf(venvPython, "-c", script, pidFile.toString()), input = "x".repeat(10_000_000))
+            } catch (e: Throwable) {
+                failure = e
+            }
+        }
 
         try {
+            while (!pidFile.exists()) Thread.sleep(10)
+            val pid = pidFile.readText().toLong()
+
             // when
-            assertFailsWith<IOException> {
-                runProcess(listOf(venvPython, "-c", script, pidFile.toString()), input = "x".repeat(10_000_000))
-            }
+            runner.interrupt()
+            runner.join()
 
             // then
-            val pid = pidFile.readText().toLong()
+            assert(failure is InterruptedException)
             assert(ProcessHandle.of(pid).map { it.isAlive }.orElse(false) == false)
         } finally {
             pidFile.deleteIfExists()

@@ -20,8 +20,10 @@ package com.xemantic.kotlin.script.python
 
 import jep.MainInterpreter
 import jep.PyConfig
+import java.io.IOException
 import java.nio.file.Path
 import java.security.MessageDigest
+import kotlin.concurrent.thread
 import kotlin.io.path.Path
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
@@ -218,14 +220,35 @@ internal fun runProcess(
         if (errorFile == null) builder.redirectErrorStream(true) else builder.redirectError(errorFile.toFile())
         val process = builder.start()
         try {
-            process.outputStream.bufferedWriter().use { writer ->
-                if (input != null) writer.write(input)
+            // the input is written, and the output read, on their own threads, as either of them can block,
+            // when the process writes more than the pipe buffer to its output before consuming all its input;
+            // the calling thread waits for the process, so that it can be interrupted
+            val writer = thread(name = "process-stdin", isDaemon = true) {
+                try {
+                    process.outputStream.bufferedWriter().use { writer ->
+                        if (input != null) writer.write(input)
+                    }
+                } catch (_: IOException) {
+                    // a broken pipe, when the process ends, or closes its input, without reading all of it,
+                    // e.g. on a failure, which its exit code and output tell, not the broken pipe
+                }
             }
-            val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+            var output: String? = null
+            var outputFailure: IOException? = null
+            val reader = thread(name = "process-stdout", isDaemon = true) {
+                try {
+                    output = process.inputStream.bufferedReader().use { it.readText() }.trim()
+                } catch (e: IOException) {
+                    outputFailure = e
+                }
+            }
             val exitCode = process.waitFor()
-            return ProcessResult(exitCode, output, errorFile?.readText()?.trim() ?: "")
+            reader.join()
+            writer.join()
+            outputFailure?.let { throw it }
+            return ProcessResult(exitCode, output!!, errorFile?.readText()?.trim() ?: "")
         } finally {
-            // e.g. a broken pipe of the input, when the process does not read it
+            // e.g. when interrupted while waiting for the process
             if (process.isAlive) {
                 process.destroyForcibly()
                 process.waitFor()
