@@ -22,11 +22,15 @@ import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import java.lang.reflect.Proxy
 import java.nio.file.Path
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
+import kotlin.io.path.outputStream
+import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -313,91 +317,76 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should constrain distribution of dependency directory to versions its installed dependents require`() {
+    fun `should plan requirements of distributions of dependency directory`() {
         // given
         PythonEnvironment.initialize()
-        withDependencyDirectory { directory ->
-            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2,>=1")
-            directory.writeDistribution("issue28-other-dependent", "1.0", "Issue28_Dependency!=1.5")
+        withDirectory { directory ->
+            directory.writeDistribution("issue28-dependent", "1.0", "Issue28_Dependency<2,>=1", "issue28-other!=1.5")
             directory.writeDistribution("issue28-dependency", "1.9")
 
             // when
-            val plan = PythonDependencies.plan(
-                "dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList()
-            )
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
 
             // then
-            val constraints = plan.filter { it.first == "constraint" }.map { it.second }
-            assert(constraints.filter { "issue28" in it.lowercase() } == listOf("issue28-dependency!=1.5,<2,>=1"))
+            assert(
+                plan.filter { it.first == "requirement" } == listOf(
+                    "requirement" to "issue28-dependent 1.0 issue28-dependency <2,>=1",
+                    "requirement" to "issue28-dependent 1.0 issue28-other !=1.5"
+                )
+            )
         }
     }
 
     @Test
-    fun `should not constrain distribution of dependency directory which no other one requires`() {
+    fun `should not plan requirements of extras and other platforms`() {
         // given
         PythonEnvironment.initialize()
-        withDependencyDirectory { directory ->
-            directory.writeDistribution("issue28-dependency", "1.0")
-
-            // when
-            val plan = PythonDependencies.plan(
-                "dependencies = [\"issue28-dependency>=2\"]\n", directory.toString(), emptyList()
-            )
-
-            // then
-            assert(plan.filter { "issue28" in it.second } == listOf("install" to "issue28-dependency>=2"))
-        }
-    }
-
-    @Test
-    fun `should not constrain by requirements of extras and other platforms`() {
-        // given
-        PythonEnvironment.initialize()
-        withDependencyDirectory { directory ->
+        withDirectory { directory ->
             directory.writeDistribution(
                 "issue28-dependent", "1.0",
                 "issue28-extra-dependency<2; extra == \"socks\"",
                 "issue28-platform-dependency<2; sys_platform == \"nonexistent\"",
+                "issue28-any-version-dependency",
                 "issue28-dependency[socks]<2; python_version >= \"3\""
             )
 
             // when
-            val plan = PythonDependencies.plan(
-                "dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList()
-            )
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
 
             // then
             // a constraint cannot have extras
-            val constraints = plan.filter { it.first == "constraint" && "issue28" in it.second }
-            assert(constraints == listOf("constraint" to "issue28-dependency<2"))
+            assert(
+                plan.filter { it.first == "requirement" } ==
+                    listOf("requirement" to "issue28-dependent 1.0 issue28-dependency <2")
+            )
         }
     }
 
     @Test
-    fun `should not constrain by requirements of distribution being upgraded`() {
+    fun `should not plan requirements of distribution with several dist-info directories`() {
         // given
         PythonEnvironment.initialize()
-        withDependencyDirectory { directory ->
+        withDirectory { directory ->
+            // pip --target leaves the dist-info of the replaced version behind
             directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
-            directory.writeDistribution("issue28-dependency", "1.0")
+            directory.writeDistribution("issue28-dependent", "2.0", "issue28-dependency>=2")
+            directory.writeDistribution("issue28-dependency", "2.0")
 
             // when
-            val plan = PythonDependencies.plan(
-                "dependencies = [\"Issue28.Dependent>=2\"]\n", directory.toString(), emptyList()
-            )
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
 
             // then
-            assert(plan.filter { "issue28" in it.second.lowercase() } == listOf("install" to "Issue28.Dependent>=2"))
+            assert(plan.none { it.first == "requirement" })
         }
     }
 
     @Test
-    fun `should constrain imported distribution of dependency directory to its version`() {
+    fun `should keep imported distribution of dependency directory in its version`() {
         // given
         PythonEnvironment.initialize()
-        withDependencyDirectory { directory ->
+        withDirectory { directory ->
             directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
-            directory.writeDistribution("issue28-dependency", "1.5", topLevel = "issue28_dependency")
+            directory.writeDistribution("issue28-dependency", "1.5")
 
             // when
             val plan = PythonDependencies.plan(
@@ -405,16 +394,18 @@ class PythonDependenciesTest {
             )
 
             // then
-            val constraints = plan.filter { it.first == "constraint" && "issue28" in it.second }
-            assert(constraints == listOf("constraint" to "issue28-dependency==1.5"))
+            // no requirement is needed of a distribution kept in its version
+            assert(
+                plan.filter { "issue28-dependency" in it.second } == listOf("constraint" to "issue28-dependency==1.5")
+            )
         }
     }
 
     @Test
-    fun `should constrain every distribution of dependency directory without packaging to read requirements`() {
+    fun `should not keep distribution of dependency directory in its version without packaging`() {
         // given
         PythonEnvironment.initialize()
-        withDependencyDirectory { directory ->
+        withDirectory { directory ->
             directory.writeDistribution("issue28-dependency", "1.0")
             // None in sys.modules makes the import fail, like without packaging, and without pip vendoring it
             val code = "import sys; sys.modules.update(dict.fromkeys(['packaging', 'pip._vendor.packaging'], None))\n" +
@@ -423,16 +414,135 @@ class PythonDependenciesTest {
             // when
             val (exitCode, output) = runProcess(
                 listOf(PythonEnvironment.executable, "-c", code, directory.toString()),
-                input = """{"metadata": "dependencies = [\"issue28-new\"]\n", "modules": []}"""
+                input = """{"metadata": "dependencies = [\"issue28-dependency>=2\"]\n", "modules": []}"""
             )
 
             // then
-            assert(exitCode == 0 && "constraint issue28-dependency==1.0" in output.lines())
+            assert(exitCode == 0)
+            assert(output.lines().filter { "issue28" in it } == listOf("install issue28-dependency>=2"))
+        }
+    }
+
+    @Test
+    fun `should fail installing dependency breaking requirement of installed distribution`() {
+        // given
+        PythonEnvironment.initialize()
+        withLocalIndex { directory, index ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+            directory.writeDistribution("issue28-dependency", "1.0")
+            index.writeWheel("issue28-dependency", "2.0")
+            index.writeWheel("issue28-new", "1.0", "issue28-dependency>=2")
+
+            // when
+            val exception = assertFailsWith<PythonDependencyException> {
+                directory.installDependencies(index, "issue28-new")
+            }
+
+            // then
+            val message = exception.message!!
+            assert("issue28-dependency <2, required by issue28-dependent 1.0" in message)
+            assert(directory.version("issue28_dependency") == "1.0")
+        }
+    }
+
+    @Test
+    fun `should fail installing dependency between contradictory requirements of installed distributions`() {
+        // given
+        PythonEnvironment.initialize()
+        withLocalIndex { directory, index ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+            directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency>=3")
+            index.writeWheel("issue28-dependency", "2.0")
+            index.writeWheel("issue28-new", "1.0", "issue28-dependency")
+
+            // when
+            val exception = assertFailsWith<PythonDependencyException> {
+                directory.installDependencies(index, "issue28-new")
+            }
+
+            // then
+            val message = exception.message!!
+            assert("issue28-dependency <2, required by issue28-dependent 1.0" in message)
+            assert("issue28-dependency >=3, required by issue28-other-dependent 1.0" in message)
+        }
+    }
+
+    @Test
+    fun `should install version of dependency within requirement of installed distribution`() {
+        // given
+        PythonEnvironment.initialize()
+        withLocalIndex { directory, index ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+            directory.writeDistribution("issue28-dependency", "0.9")
+            index.writeWheel("issue28-dependency", "1.0")
+            index.writeWheel("issue28-dependency", "2.0")
+            index.writeWheel("issue28-new", "1.0", "issue28-dependency>=1")
+
+            // when
+            directory.installDependencies(index, "issue28-new")
+
+            // then
+            assert(directory.version("issue28_dependency") == "1.0")
+        }
+    }
+
+    @Test
+    fun `should upgrade installed distribution together with distribution it requires`() {
+        // given
+        PythonEnvironment.initialize()
+        withLocalIndex { directory, index ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+            directory.writeDistribution("issue28-dependency", "1.0")
+            index.writeWheel("issue28-dependent", "2.0", "issue28-dependency>=2")
+            index.writeWheel("issue28-dependency", "2.0")
+            index.writeWheel("issue28-new", "1.0", "issue28-dependent>=2")
+
+            // when
+            directory.installDependencies(index, "issue28-new")
+
+            // then
+            assert(directory.version("issue28_dependent") == "2.0" && directory.version("issue28_dependency") == "2.0")
+        }
+    }
+
+    @Test
+    fun `should fail installing unavailable dependency without blaming dependency directory`() {
+        // given
+        PythonEnvironment.initialize()
+        withLocalIndex { directory, index ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+
+            // when
+            val exception = assertFailsWith<PythonDependencyException> {
+                directory.installDependencies(index, "issue28-nonexistent")
+            }
+
+            // then
+            val message = exception.message!!
+            assert(message.startsWith("Cannot install Python dependencies issue28-nonexistent:"))
+            assert("required by" !in message && "dependency directory" !in message)
+        }
+    }
+
+    /** Plans and installs the [dependencies] into this directory, only from the wheels of the [index] directory. */
+    private fun Path.installDependencies(index: Path, vararg dependencies: String) {
+        val metadata = "dependencies = [${dependencies.joinToString { "\"$it\"" }}]\n"
+        val plan = PythonDependencies.plan(metadata, toString(), emptyList())
+        val installerOptions = listOf("--no-index", "--find-links", index.toString())
+        PythonDependencies.install(plan, toString(), installerOptions)
+    }
+
+    /** The version of the distribution of the [module], written by [writeDistribution] or [writeWheel]. */
+    private fun Path.version(module: String) = resolve(module).resolve("__init__.py").readText()
+
+    private fun withLocalIndex(block: (directory: Path, index: Path) -> Unit) {
+        withDirectory { directory ->
+            withDirectory { index -> block(directory, index) }
         }
     }
 
     @OptIn(ExperimentalPathApi::class)
-    private fun withDependencyDirectory(block: (Path) -> Unit) {
+    private fun withDirectory(block: (Path) -> Unit) {
         val directory = createTempDirectory("python-dependencies")
         try {
             block(directory)
@@ -443,20 +553,39 @@ class PythonDependenciesTest {
 
 }
 
-/** Writes the metadata of a distribution installed into this directory, with a module of the [topLevel] name, if given. */
-internal fun Path.writeDistribution(
-    name: String,
-    version: String,
-    vararg requirements: String,
-    topLevel: String? = null
-) {
-    val distInfo = resolve("${name.replace('-', '_')}-$version.dist-info").createDirectories()
-    distInfo.resolve("METADATA").writeText(
-        "Metadata-Version: 2.1\nName: $name\nVersion: $version\n" +
-            requirements.joinToString("") { "Requires-Dist: $it\n" }
-    )
-    if (topLevel != null) {
-        resolve("$topLevel.py").writeText("")
-        distInfo.resolve("RECORD").writeText("$topLevel.py,,\n")
+/**
+ * Writes the metadata of a distribution installed into this directory, with its package,
+ * whose `__init__.py` contains its version.
+ */
+internal fun Path.writeDistribution(name: String, version: String, vararg requirements: String) {
+    val distribution = name.replace('-', '_')
+    val distInfo = resolve("$distribution-$version.dist-info").createDirectories()
+    distInfo.resolve("METADATA").writeText(metadata(name, version, requirements))
+    distInfo.resolve("RECORD").writeText("$distribution/__init__.py,,\n")
+    resolve(distribution).createDirectories().resolve("__init__.py").writeText(version)
+}
+
+/** Writes a wheel into this directory, like [writeDistribution] would install it. */
+internal fun Path.writeWheel(name: String, version: String, vararg requirements: String) {
+    val distribution = name.replace('-', '_')
+    val distInfo = "$distribution-$version.dist-info"
+    ZipOutputStream(resolve("$distribution-$version-py3-none-any.whl").outputStream()).use { zip ->
+        mapOf(
+            "$distribution/__init__.py" to version,
+            "$distInfo/METADATA" to metadata(name, version, requirements),
+            "$distInfo/WHEEL" to "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            "$distInfo/RECORD" to
+                listOf("$distribution/__init__.py", "$distInfo/METADATA", "$distInfo/WHEEL", "$distInfo/RECORD")
+                    .joinToString("") { "$it,,\n" }
+        ).forEach { (entry, content) ->
+            zip.putNextEntry(ZipEntry(entry))
+            zip.write(content.toByteArray())
+            zip.closeEntry()
+        }
     }
 }
+
+private fun metadata(name: String, version: String, requirements: Array<out String>) =
+    "Metadata-Version: 2.1\nName: $name\nVersion: $version\n" +
+        requirements.joinToString("") { "Requires-Dist: $it\n" }
+

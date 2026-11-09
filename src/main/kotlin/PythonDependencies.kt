@@ -44,6 +44,7 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  * The distributions of the environment itself, and the ones already imported from the dependency directory,
  * are kept in their versions, as a module cannot be replaced once imported,
  * and the other distributions of the dependency directory in the versions required by the installed ones,
+ * unless the dependencies replace these as well,
  * so that a new dependency does not break the installed ones.
  */
 internal object PythonDependencies {
@@ -113,11 +114,7 @@ internal object PythonDependencies {
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
             List::class.java
         ).map { it.toString() }
-        val plan = plan(metadata, directory, imported)
-        val missing = plan.filter { it.first == "install" }.map { it.second }
-        if (missing.isNotEmpty()) {
-            installMissing(missing, plan.filter { it.first == "constraint" }.map { it.second }, directory)
-        }
+        install(plan(metadata, directory, imported), directory)
         @Suppress("UNCHECKED_CAST")
         val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
         if (directory !in path) {
@@ -130,7 +127,7 @@ internal object PythonDependencies {
      * Runs the [PLAN] for the [metadata], found by [scriptMetadata], the dependency [directory],
      * and the [imported] top-level modules.
      *
-     * @return the `install` and `constraint` entries of the plan, as pairs of the kind and the value.
+     * @return the `install`, `constraint` and `requirement` entries of the plan, as pairs of the kind and the value.
      * @throws PythonDependencyException if the plan cannot be made.
      */
     fun plan(metadata: String, directory: String, imported: List<String>): List<Pair<String, String>> {
@@ -158,38 +155,140 @@ internal object PythonDependencies {
         append('"')
     }
 
-    private fun installMissing(missing: List<String>, constraints: List<String>, directory: String) {
+    /** A requirement of a distribution installed in the dependency directory, of the [PLAN]. */
+    private class InstalledRequirement(
+        val dependent: String,
+        val version: String,
+        val name: String,
+        val specifier: String
+    ) {
+        override fun toString() = "$name $specifier, required by $dependent $version"
+    }
+
+    /**
+     * Installs the `install` entries of the [plan], of the [PLAN], into the dependency [directory],
+     * with the [installerOptions] given to the installer, e.g. its index.
+     *
+     * The `requirement` entries, of the distributions installed in the directory, become constraints,
+     * except the ones of the distributions which the dependencies resolve to,
+     * as the resolution of the installer replaces them, if needed, honoring the requirements of their new versions,
+     * so they are resolved first, but only when there are such requirements.
+     *
+     * @throws PythonDependencyException if the dependencies cannot be installed.
+     */
+    fun install(plan: List<Pair<String, String>>, directory: String, installerOptions: List<String> = emptyList()) {
+        val missing = plan.filter { it.first == "install" }.map { it.second }
+        if (missing.isEmpty()) return
+        val pinned = plan.filter { it.first == "constraint" }.map { it.second }
+        val requirements = plan.filter { it.first == "requirement" }.map {
+            val (dependent, version, name, specifier) = it.second.split(' ')
+            InstalledRequirement(dependent, version, name, specifier)
+        }
+        val uv = findOnPath("uv")
+        val protecting = if (requirements.isEmpty()) emptyList() else {
+            val resolved = resolve(missing, pinned, directory, uv, installerOptions)
+            requirements.filter { it.dependent !in resolved && it.name in resolved }
+        }
+        val constraints = pinned + protecting.groupBy { it.name }.map { (name, requirements) ->
+            name + requirements.joinToString(",") { it.specifier }
+        }
+        val (exitCode, output) = withConstraints(constraints) { constraintsFile ->
+            runProcess(
+                if (uv != null) {
+                    listOf(
+                        uv, "pip", "install", "--quiet",
+                        "--python", PythonEnvironment.executable,
+                        "--target", directory,
+                        "--constraints", constraintsFile
+                    )
+                } else {
+                    listOf(
+                        PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
+                        "--disable-pip-version-check", "--no-input", "--upgrade",
+                        "--target", directory,
+                        "--constraint", constraintsFile
+                    )
+                } + installerOptions + missing
+            )
+        }
+        if (exitCode != 0) {
+            val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
+            // resolved without the requirements of the installed distributions, so these are the conflict
+            throw PythonDependencyException(
+                if (protecting.isEmpty()) message else message + "\n" +
+                    "The dependencies conflict with the requirements of the distributions " +
+                    "installed in the dependency directory $directory:\n" +
+                    protecting.joinToString("") { "  $it\n" } +
+                    "Installing them would break these distributions, so they need another dependency directory, " +
+                    "see PythonEnvironment.dependencyDirectory, " +
+                    "or the dependency directory can be deleted, when no Python uses it, to start from scratch."
+            )
+        }
+    }
+
+    /**
+     * The canonical names of the distributions which the [missing] dependencies resolve to,
+     * with the [pinned] constraints,
+     * without installing them, or the dependency directory, which pip ignores with `--target` anyway.
+     */
+    private fun resolve(
+        missing: List<String>,
+        pinned: List<String>,
+        directory: String,
+        uv: String?,
+        installerOptions: List<String>
+    ): Set<String> {
+        val (exitCode, output, error) = withConstraints(pinned) { constraintsFile ->
+            if (uv != null) {
+                runProcess(
+                    listOf(
+                        uv, "pip", "compile", "-", "--quiet", "--no-header", "--no-annotate",
+                        "--python", PythonEnvironment.executable,
+                        "--constraints", constraintsFile
+                    ) + installerOptions,
+                    input = missing.joinToString("\n"),
+                    mergeErrorStream = false
+                )
+            } else {
+                val (exitCode, report, error) = runProcess(
+                    listOf(
+                        PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
+                        "--disable-pip-version-check", "--no-input", "--dry-run", "--report", "-",
+                        "--target", directory,
+                        "--constraint", constraintsFile
+                    ) + installerOptions + missing,
+                    mergeErrorStream = false
+                )
+                if (exitCode != 0) ProcessResult(exitCode, report, error) else runProcess(
+                    listOf(PythonEnvironment.executable, "-c", REPORTED_NAMES),
+                    input = report,
+                    mergeErrorStream = false
+                )
+            }
+        }
+        if (exitCode != 0) {
+            throw PythonDependencyException(
+                "Cannot install Python dependencies ${missing.joinToString(", ")}:\n" +
+                    listOf(output, error).filter { it.isNotEmpty() }.joinToString("\n")
+            )
+        }
+        // uv lists name==version, or name @ url, pip only the name
+        return output.lines()
+            .mapNotNull { Regex("^[A-Za-z0-9][A-Za-z0-9._-]*").find(it)?.value }
+            .map { it.lowercase().replace(Regex("[-_.]+"), "-") }
+            .toSet()
+    }
+
+    /** The names of the distributions to install, in the pip installation report on the standard input. */
+    @Language("python")
+    private const val REPORTED_NAMES =
+        "import json, sys; print(*(it['metadata']['name'] for it in json.load(sys.stdin)['install']), sep='\\n')"
+
+    private fun <T> withConstraints(constraints: List<String>, block: (constraintsFile: String) -> T): T {
         val constraintsFile = createTempFile("python-constraints", ".txt")
         try {
             constraintsFile.writeLines(constraints)
-            val uv = findOnPath("uv")
-            val command = if (uv != null) {
-                listOf(
-                    uv, "pip", "install", "--quiet",
-                    "--python", PythonEnvironment.executable,
-                    "--target", directory,
-                    "--constraints", constraintsFile.toString()
-                )
-            } else {
-                listOf(
-                    PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
-                    "--disable-pip-version-check", "--no-input", "--upgrade",
-                    "--target", directory,
-                    "--constraint", constraintsFile.toString()
-                )
-            } + missing
-            val (exitCode, output) = runProcess(command)
-            if (exitCode != 0) {
-                throw PythonDependencyException(
-                    "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output\n" +
-                        "The dependency directory $directory keeps the distributions it holds compatible " +
-                        "with the ones requiring them, and the imported ones in their versions, " +
-                        "as well as the distributions of the Python environment, " +
-                        "so a dependency conflicting with them cannot be installed: " +
-                        "set another PythonEnvironment.dependencyDirectory for the code declaring it, " +
-                        "or delete the dependency directory, when no Python uses it, to start from scratch."
-                )
-            }
+            return block(constraintsFile.toString())
         } finally {
             constraintsFile.deleteIfExists()
         }
@@ -208,9 +307,12 @@ internal object PythonDependencies {
     /**
      * Prints the dependencies to install, as `install <requirement>`,
      * the distributions to keep in their versions, as `constraint <name>==<version>`,
-     * and the specifiers required of the other distributions by the installed ones, as `constraint <name><specifier>`,
-     * but not the ones of a distribution declared as a dependency to install, as it is replaced,
-     * or exits with the error.
+     * and the requirements of the distributions of the dependency directory,
+     * as `requirement <dependent> <version> <name> <specifier>`, with canonical names,
+     * which [install] turns into constraints, or exits with the error.
+     * Without packaging, to read the requirements, there are none,
+     * and with several `dist-info` directories of a distribution, left behind by pip, there are none of it,
+     * as which of them describes the installed files is unknown.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
@@ -244,21 +346,17 @@ internal object PythonDependencies {
 
         try:
             from packaging.requirements import Requirement, InvalidRequirement
+            from packaging.utils import canonicalize_name
         except ImportError:
             try:
                 from pip._vendor.packaging.requirements import Requirement, InvalidRequirement
+                from pip._vendor.packaging.utils import canonicalize_name
             except ImportError:
                 Requirement = None
 
-        def canonical(name):
-            return re.sub(r"[-_.]+", "-", name).lower()
-
-        def name_of(dependency):
-            return re.match(r"\s*([A-Za-z0-9._-]*)", dependency).group(1)
-
         def is_missing(dependency):
             if Requirement is None:
-                name = name_of(dependency)
+                name = re.match(r"\s*([A-Za-z0-9._-]*)", dependency).group(1)
                 specified = dependency.strip() != name
             else:
                 try:
@@ -276,8 +374,8 @@ internal object PythonDependencies {
                 return specified
             return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
 
-        def required_specifiers(distribution):
-            # the requirements of the distribution, without the ones of its extras, and of other environments
+        def requirements_of(distribution):
+            # without the ones of its extras, and of other environments
             for dependency in distribution.requires or []:
                 try:
                     requirement = Requirement(dependency)
@@ -289,36 +387,35 @@ internal object PythonDependencies {
 
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
-            upgraded = {canonical(name_of(dependency)) for dependency in missing}
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)
-            # the distributions kept in their versions: the ones of the environment, and the imported ones
-            pinned = {}
-            # the specifiers which the installed distributions require of the other ones
-            required = {}
-            seen = set()
+            constraints = {}
             for distribution in metadata.distributions():
                 name = distribution.metadata["Name"]
-                if not name or canonical(name) in seen:
-                    # shadowed by a distribution found before, like by the import system
-                    continue
-                seen.add(canonical(name))
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
-                if not in_dependencies or name in in_use or Requirement is None:
-                    # without packaging, the requirements cannot be read, so all the distributions are kept
-                    pinned[canonical(name)] = (name, distribution.version)
-                if Requirement is not None and canonical(name) not in upgraded:
-                    for requirement in required_specifiers(distribution):
-                        key = canonical(requirement.name)
-                        required[key] = required.get(key, requirement.specifier) & requirement.specifier
+                if name and (not in_dependencies or name in in_use):
+                    constraints.setdefault(name, distribution.version)
             for dependency in missing:
                 print("install", dependency)
-            for name, version in pinned.values():
+            for name, version in constraints.items():
                 print("constraint", f"{name}=={version}")
-            for name, specifier in required.items():
-                if specifier and name not in pinned:
-                    print("constraint", f"{name}{specifier}")
+            if Requirement is not None:
+                kept = {canonicalize_name(name) for name in constraints}
+                installed = {}
+                for distribution in metadata.distributions(path=[directory]):
+                    name = distribution.metadata["Name"]
+                    if name:
+                        installed.setdefault(canonicalize_name(name), []).append(distribution)
+                for name, distributions in installed.items():
+                    # pip --target leaves the dist-info of a replaced version behind,
+                    # and which of them describes the installed files is unknown
+                    if len(distributions) == 1:
+                        distribution = distributions[0]
+                        for requirement in requirements_of(distribution):
+                            required = canonicalize_name(requirement.name)
+                            if requirement.specifier and required not in kept:
+                                print("requirement", name, distribution.version, required, requirement.specifier)
     """.trimIndent()
 
 }
