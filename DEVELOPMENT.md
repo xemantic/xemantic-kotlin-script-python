@@ -18,10 +18,18 @@ or with the `ORG_GRADLE_PROJECT_basePython` environment variable, e.g. on CI:
 ```
 
 It has to be Python 3.10 or newer, otherwise the build fails before creating the environment.
-The base Python and its version are recorded in `.venv/base-python.txt`,
-and `.venv` is created again when they change,
-or when this file is missing,
-like in an environment of an older build, or a half-made one.
+
+An existing `.venv` is judged by its own Python:
+it is kept when this Python runs, is 3.10 or newer, and has `pip`,
+otherwise it is created again.
+Without `basePython` set, the `python3` on the `PATH` is not even checked then,
+so that an IDE with another `python3` keeps the environment created in a shell.
+With `basePython` set, `.venv` is also created again when it is of another base Python,
+compared by the prefix and version of the interpreter, not by the path given.
+The previous `.venv` is moved aside to `.venv.previous` meanwhile,
+and restored when creating the new one fails.
+The base Python of `.venv` is recorded in `.venv/base-python.txt`,
+an input of the tests, so that they run again after it changes.
 
 ## Update gradlew wrapper
 

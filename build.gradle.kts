@@ -1,4 +1,4 @@
-@file:OptIn(ExperimentalKotlinGradlePluginApi::class, ExperimentalAbiValidation::class)
+@file:OptIn(ExperimentalKotlinGradlePluginApi::class, ExperimentalAbiValidation::class, ExperimentalPathApi::class)
 
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -6,6 +6,11 @@ import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 import org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation
 import org.jreleaser.model.Active
 import java.io.ByteArrayOutputStream
+import java.nio.file.LinkOption
+import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.exists
+import kotlin.io.path.moveTo
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -101,64 +106,106 @@ interface InjectedServices {
 }
 
 val createPythonVenv = tasks.register("createPythonVenv") {
-    description = "Creates the Python virtual environment of the tests, again when it is incomplete or its base Python changed"
+    description = "Creates the Python virtual environment of the tests, unless a complete one of the base Python exists"
     // the PATH of the Gradle daemon can differ from the one of the shell, e.g. resolve to an old python3 of macOS,
-    // so the base Python can be chosen with -PbasePython=..., or the ORG_GRADLE_PROJECT_basePython variable on CI
-    val basePython = providers.gradleProperty("basePython").getOrElse("python3")
+    // so the base Python can be chosen with -PbasePython=..., or the ORG_GRADLE_PROJECT_basePython variable on CI;
+    // only when chosen, it can replace a complete environment, so that a daemon of an IDE with another python3
+    // on its PATH keeps the environment created in a shell
+    val chosenBasePython = providers.gradleProperty("basePython").orNull
+    val basePython = chosenBasePython ?: "python3"
     // local values, as the configuration cache cannot serialize a reference to the build script
     val exec = objects.newInstance<InjectedServices>().exec
-    val venv = pythonVenv.asFile
-    // written only after the environment is created successfully, so a missing one means a half-made,
-    // or a pre-existing one, of a Python which was never checked
-    val marker = pythonVenv.file("base-python.txt").asFile
+    val venv = pythonVenv.asFile.toPath()
+    val python = venvPython.asFile
+    // the previous environment, moved aside while creating a new one, to be restored when it fails
+    val previousVenv = layout.projectDirectory.dir(".venv.previous").asFile.toPath()
+    // the identity of the base Python of the environment, an input of the tests, so that they rerun when it changes
+    val identityFile = pythonVenv.file("base-python.txt").asFile
+    outputs.file(identityFile)
+    outputs.upToDateWhen { false }
     doLast {
-        fun run(vararg command: String): Triple<Int, String, String> {
+        // isolated (-I), so that no sitecustomize prints into the output, prints the identity of the base Python:
+        // its prefix and version, same for python3 and /usr/bin/python3, but not for python3.12 and python3.13;
+        // exits with 3 when too old for jep, 4 without pip, which only a virtual environment needs
+        fun probe(python: String): Triple<Int, List<String>, String>? {
             val out = ByteArrayOutputStream()
             val err = ByteArrayOutputStream()
             val result = try {
                 exec.exec {
-                    commandLine(*command)
+                    commandLine(
+                        python, "-I", "-c",
+                        "import sys, importlib.util; print(sys.base_prefix); print('%d.%d.%d' % sys.version_info[:3]); " +
+                            "sys.exit(3 if sys.version_info < (3, 10) else 4 if importlib.util.find_spec('pip') is None else 0)"
+                    )
                     standardOutput = out
                     errorOutput = err
                     isIgnoreExitValue = true
                 }
             } catch (e: Exception) {
-                throw GradleException("Cannot run the base Python '$basePython', set another one with -PbasePython=<path>", e)
+                return null
             }
-            return Triple(result.exitValue, out.toString().trim(), err.toString().trim())
+            // the last lines, as a .pth file of the site-packages can still print before
+            return Triple(result.exitValue, out.toString().trim().lines(), err.toString().trim())
         }
-        // checked before creating the environment, as a too old Python fails only later, when pip finds no jep;
-        // isolated (-I), so that no sitecustomize prints into the version, exit code 3 meaning too old
-        val (exitValue, output, error) = run(
-            basePython, "-I", "-c",
-            "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(3 if sys.version_info < (3, 10) else 0)"
-        )
-        // the last line, as a .pth file of the site-packages can still print before
-        val version = output.lines().last()
-        when (exitValue) {
-            0 -> {}
-            3 -> throw GradleException(
-                "The base Python '$basePython' is version $version, but jep requires Python 3.10 or newer, " +
-                    "set another one with -PbasePython=<path>"
-            )
-            else -> throw GradleException(
-                "The base Python '$basePython' failed with exit value $exitValue, set another one with -PbasePython=<path>:\n$error"
-            )
+        fun identity(lines: List<String>) = lines.takeLast(2).joinToString("\n")
+
+        val venvProbe = if (python.exists()) probe(python.absolutePath) else null
+        val venvIdentity = venvProbe?.takeIf { it.first == 0 && it.second.size >= 2 }?.let { identity(it.second) }
+        val identity = if (venvIdentity != null && chosenBasePython == null) {
+            venvIdentity
+        } else {
+            val hint = "set another one with -PbasePython=<path>"
+            val (exitValue, lines, error) = probe(basePython)
+                ?: throw GradleException("Cannot run the base Python '$basePython', jep requires Python 3.10 or newer, $hint")
+            when (exitValue) {
+                0, 4 -> {}
+                3 -> throw GradleException(
+                    "The base Python '$basePython' is version ${lines.last()}, but jep requires Python 3.10 or newer, $hint"
+                )
+                else -> throw GradleException(
+                    "The base Python '$basePython' failed with exit value $exitValue, " +
+                        "jep requires Python 3.10 or newer, $hint:\n$error"
+                )
+            }
+            val baseIdentity = identity(lines)
+            if (baseIdentity != venvIdentity) {
+                val version = lines.last()
+                logger.lifecycle(
+                    when {
+                        venvProbe == null -> "Creating the Python virtual environment $venv with $basePython ($version)"
+                        venvIdentity == null -> "The Python virtual environment $venv is too old or incomplete, " +
+                            "creating it again with $basePython ($version)"
+                        else -> "The Python virtual environment $venv is of another base Python, " +
+                            "creating it again with $basePython ($version)"
+                    }
+                )
+                // moved aside instead of deleted, to be restored when the new one fails, unless without its python,
+                // like the empty directory which Gradle creates for the identity file;
+                // not created elsewhere and moved, as the scripts of a virtual environment contain its absolute path
+                previousVenv.deleteRecursively()
+                if (python.toPath().exists(LinkOption.NOFOLLOW_LINKS)) venv.moveTo(previousVenv) else venv.deleteRecursively()
+                val out = ByteArrayOutputStream()
+                val result = exec.exec {
+                    commandLine(basePython, "-m", "venv", venv.toString())
+                    standardOutput = out
+                    errorOutput = out
+                    isIgnoreExitValue = true
+                }
+                if (result.exitValue != 0) {
+                    // otherwise a half-made environment, e.g. without pip, would be taken for a complete one
+                    venv.deleteRecursively()
+                    val restored = previousVenv.exists(LinkOption.NOFOLLOW_LINKS)
+                    if (restored) previousVenv.moveTo(venv)
+                    throw GradleException(
+                        "Cannot create the Python virtual environment with '$basePython', exit value ${result.exitValue}" +
+                            (if (restored) ", the previous one is kept" else "") + ":\n" + out.toString().trim()
+                    )
+                }
+                previousVenv.deleteRecursively()
+            }
+            baseIdentity
         }
-        val baseInfo = "$basePython\n$version"
-        if (marker.isFile && marker.readText() == baseInfo) return@doLast
-        logger.lifecycle("Creating the Python virtual environment $venv with $basePython ($version)")
-        venv.deleteRecursively()
-        val (venvExitValue, venvOutput, venvError) = run(basePython, "-m", "venv", venv.absolutePath)
-        if (venvExitValue != 0) {
-            // otherwise a half-made environment, e.g. without pip, would be taken for a complete one
-            venv.deleteRecursively()
-            throw GradleException(
-                "Cannot create the Python virtual environment with '$basePython', exit value $venvExitValue:\n" +
-                    listOf(venvOutput, venvError).filter { it.isNotEmpty() }.joinToString("\n")
-            )
-        }
-        marker.writeText(baseInfo)
+        if (!identityFile.isFile || identityFile.readText() != identity) identityFile.writeText(identity)
     }
 }
 
@@ -178,8 +225,8 @@ val installPythonPackages = tasks.register<Exec>("installPythonPackages") {
 }
 
 tasks.test {
-    // the installed packages as an input, so that the tests rerun after changing them
-    inputs.files(installPythonPackages)
+    // the installed packages and the base Python of the environment as inputs, so that the tests rerun after changing them
+    inputs.files(installPythonPackages, createPythonVenv)
     environment("VIRTUAL_ENV", pythonVenv.asFile.absolutePath)
     // the dependencies declared by the tests are installed from scratch on every run, not into the user cache,
     // so that a test can check that a dependency is not installed yet
