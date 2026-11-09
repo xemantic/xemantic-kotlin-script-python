@@ -58,12 +58,16 @@ import java.util.concurrent.atomic.AtomicInteger
  * which then closes this `Python` after the running call.
  *
  * A Kotlin function can be set as a global variable and called from Python, like `python["f"] = { n: Long -> n * 2 }`.
- * It runs on the thread of this `Python`, and can call it back.
- * It must not wait for another thread calling this `Python`, e.g. with `thread { python.eval<Long>("x") }.join()`,
- * `runBlocking(Dispatchers.IO) { python["x"] }`, or by Python code joining a `threading.Thread` doing so:
+ * It runs on the thread which calls it from Python: the thread of this `Python`,
+ * unless the Python code calls it from a thread of its own, like a `threading.Thread`.
+ * On the thread of this `Python` it can call this `Python` back directly, as a part of the running call,
+ * while on another thread, its call waits for its turn, like any call from another thread.
+ * The running call must not wait for another thread calling this `Python`, e.g. a Kotlin function
+ * with `thread { python.eval<Long>("x") }.join()`, or `runBlocking(Dispatchers.IO) { python["x"] }`,
+ * or Python code joining a `threading.Thread` which calls a Kotlin function calling this `Python`:
  * such a call waits for its turn behind the running call, which waits for it, so both wait forever.
- * It cannot be detected, as a call from another thread, made while a Kotlin function runs, can as well just wait for its turn.
- * Call this `Python` directly from the Kotlin function instead, on its thread.
+ * It cannot be detected, as a call from another thread, made during the running call, can as well just wait for its turn.
+ * Call this `Python` directly from a Kotlin function running on the thread of this `Python` instead.
  *
  * The values are converted between Java and Python by Jep, e.g. a Python `int` becomes a [Long],
  * a `str` a [String], and a `list` a [List].
@@ -213,15 +217,18 @@ public class Python private constructor(
     /**
      * Closes the interpreter and releases its thread.
      *
-     * Without a running call, it closes the interpreter on its thread, and waits for it,
+     * Unless a call is running, or starting or ending on the thread of this `Python`,
+     * it closes the interpreter on its thread, and waits for it,
      * so that the interpreter is closed when it returns.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
      * Calling it again has no effect, and returns immediately.
      *
-     * With a running call, it does not wait for it:
+     * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
      * still able to call back this `Python`, and the interpreter is closed after it returns.
-     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is lost.
+     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is not reported,
+     * and if the JVM exits before the running call returns, e.g. at the end of `main`,
+     * the interpreter is never closed, as its thread is a daemon one.
      * Waiting would deadlock, when the running call waits for `close()`:
      * when it is called by a Kotlin function called from Python, or by another thread, which this function,
      * or the Python code, waits for, and it cannot be told apart from a `close()` which the running call does not wait for.

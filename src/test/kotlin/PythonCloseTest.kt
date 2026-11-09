@@ -419,6 +419,54 @@ class PythonCloseTest {
     }
 
     @Test
+    fun `should return from close called from another thread while call is running`() {
+        // given
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val closeTaskRan = CountDownLatch(1)
+        Python.withDecoratedExecutor(interceptingExecutor(
+            decorateRunnable = { task ->
+                Runnable {
+                    task.run()
+                    closeTaskRan.countDown()
+                }
+            }
+        )).use { python ->
+            python["block"] = { n: Long ->
+                callbackEntered.countDown()
+                // longer than the bound of the closer, not to end the running call before it
+                assert(releaseCallback.await(2 * DEADLOCK_TIMEOUT, MILLISECONDS))
+                n
+            }
+            var runningResult: Long? = null
+            val running = thread(isDaemon = true, name = "running") {
+                runningResult = python.eval<Long>("block(42)")
+            }
+            assert(callbackEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+
+            // when
+            // bounded, only to fail instead of hanging the JVM, if close() waits for the running call
+            val closer = thread(isDaemon = true, name = "closer") { python.close() }
+            closer.join(DEADLOCK_TIMEOUT)
+            val closerReturned = !closer.isAlive
+            val closedBeforeCallEnded = closeTaskRan.count == 0L
+            releaseCallback.countDown()
+            running.join(DEADLOCK_TIMEOUT)
+
+            // then
+            assert(closerReturned)
+            assert(!closedBeforeCallEnded)
+            assert(!running.isAlive)
+            assert(runningResult == 42L)
+            // closed on the Python thread after the running call
+            assert(closeTaskRan.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+            val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+            assert(laterFailure is IllegalStateException)
+            assert(laterFailure.message == "Python is closed")
+        }
+    }
+
+    @Test
     fun `should wait for interpreter to be closed when closing Python without running call`() {
         // given
         val closeTaskRan = CountDownLatch(1)
