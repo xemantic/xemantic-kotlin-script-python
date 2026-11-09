@@ -261,7 +261,8 @@ internal object PythonDependencies {
             if Requirement is None:
                 return specified
             if requirement.url is not None:
-                return not is_installed_from(requirement.url, distribution)
+                # the dependencies of the extras are not checked (#47), so they are installed again with them
+                return bool(requirement.extras) or not is_installed_from(requirement.url, distribution)
             return not requirement.specifier.contains(distribution.version, prereleases=True)
 
         def without_credentials(url):
@@ -269,15 +270,26 @@ internal object PythonDependencies {
             parts = urlsplit(url)
             return urlunsplit((parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path, parts.query, ""))
 
-        def file_hash(url, algorithm):
+        def file_digests(path, algorithms):
+            # in one pass over the file for all the algorithms
             try:
-                with open(url2pathname(urlsplit(url).path), "rb") as file:
-                    digest = hashlib.new(algorithm)
+                digests = {algorithm: hashlib.new(algorithm) for algorithm in algorithms}
+                with open(path, "rb") as file:
                     for chunk in iter(lambda: file.read(1 << 20), b""):
-                        digest.update(chunk)
-                    return digest.hexdigest()
+                        for digest in digests.values():
+                            digest.update(chunk)
+                return {algorithm: digest.hexdigest() for algorithm, digest in digests.items()}
             except (OSError, ValueError):
                 return None
+
+        def is_unmodified_since_uv_install(path, distribution):
+            # uv records the modification time of a local archive in uv_cache.json, not its hash
+            try:
+                timestamp = json.loads(distribution.read_text("uv_cache.json") or "null")["timestamp"]
+                installed_time = timestamp["secs_since_epoch"] * 1_000_000_000 + timestamp["nanos_since_epoch"]
+                return os.stat(path).st_mtime_ns == installed_time
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
 
         def is_installed_from(url, distribution):
             # compared with the direct_url.json of the distribution, PEP 610, without hitting the network
@@ -316,18 +328,28 @@ internal object PythonDependencies {
                 return False
             if without_credentials(url) != without_credentials(installed["url"]):
                 return False
+            # pip records the hashes, also when not requested, while uv records none,
+            # but keeps the hash fragment in the URL of a local archive
             hashes = archive_info.get("hashes")
             hashes = dict(hashes) if isinstance(hashes, dict) else {}
             legacy_hash = archive_info.get("hash")
             if isinstance(legacy_hash, str) and "=" in legacy_hash:
                 hashes.setdefault(*legacy_hash.split("=", 1))
-            requested = {name: value for name, value in options.items() if name in hashlib.algorithms_guaranteed}
-            if urlsplit(url).scheme.lower() == "file" and not requested:
-                # a local archive can be rebuilt without changing its URL, so its content is compared
-                requested = {name: file_hash(url, name) for name in hashes if name in hashlib.algorithms_guaranteed}
-                if not requested:
-                    return False
-            return all(hashes.get(name) == value for name, value in requested.items())
+            hashes.update(parse_qsl(installed["url"].partition("#")[2]))
+            hashes = {name: str(value).lower() for name, value in hashes.items() if name in hashlib.algorithms_guaranteed}
+            requested = {name: value.lower() for name, value in options.items() if name in hashlib.algorithms_guaranteed}
+            if any(name in hashes and hashes[name] != value for name, value in requested.items()):
+                return False
+            if urlsplit(url).scheme.lower() != "file":
+                # a remote archive is trusted to keep its content under the same URL,
+                # as uv records no hash of it, not even the requested one
+                return True
+            # a local archive can be rebuilt without changing its URL, so its content is compared
+            path = url2pathname(urlsplit(url).path)
+            if hashes:
+                expected = {**hashes, **requested}
+                return file_digests(path, expected) == expected
+            return not requested and is_unmodified_since_uv_install(path, distribution)
 
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:

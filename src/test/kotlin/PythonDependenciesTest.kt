@@ -21,13 +21,16 @@ package com.xemantic.kotlin.script.python
 import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import java.lang.reflect.Proxy
+import java.nio.file.attribute.FileTime
 import java.security.MessageDigest
+import java.time.Instant
 import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.readBytes
+import kotlin.io.path.setLastModifiedTime
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -466,10 +469,10 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should plan archive dependency as missing for hash not recorded on installation`() {
+    fun `should plan local archive dependency as missing for hash not recorded on installation`() {
         // given
-        val directUrl = """{"url": "https://example.com/probe-1.0.tar.gz", "archive_info": {}}"""
-        val dependency = "direct-url-probe @ https://example.com/probe-1.0.tar.gz#sha256=$HASH"
+        val directUrl = """{"url": "file:///home/user/probe-1.0.tar.gz", "archive_info": {}}"""
+        val dependency = "direct-url-probe @ file:///home/user/probe-1.0.tar.gz#sha256=$HASH"
 
         // when
         val installs = planInstalls(dependency, directUrl)
@@ -548,6 +551,116 @@ class PythonDependenciesTest {
         }
     }
 
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should plan local archive dependency installed by uv as installed for unchanged modification time`() {
+        // given
+        // uv records no hash of a local archive, but its modification time in uv_cache.json
+        val archiveDirectory = createTempDirectory("python-archive")
+        try {
+            val archive = archiveDirectory.resolve("probe-1.0.tar.gz")
+            archive.writeText("archive content")
+            archive.setLastModifiedTime(FileTime.from(Instant.ofEpochSecond(1_700_000_000, 123_456_700)))
+            val url = archive.toUri().toString()
+            val directUrl = """{"url":"$url","archive_info":{}}"""
+            val uvCache = """{"timestamp":{"secs_since_epoch":1700000000,"nanos_since_epoch":123456700},"commit":null,"tags":null,"env":{},"directories":{}}"""
+
+            // when
+            val installs = planInstalls("direct-url-probe @ $url", directUrl, uvCache)
+
+            // then
+            assert(installs.isEmpty())
+        } finally {
+            archiveDirectory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should plan local archive dependency installed by uv as missing for changed modification time`() {
+        // given
+        val archiveDirectory = createTempDirectory("python-archive")
+        try {
+            val archive = archiveDirectory.resolve("probe-1.0.tar.gz")
+            archive.writeText("rebuilt archive content")
+            archive.setLastModifiedTime(FileTime.from(Instant.ofEpochSecond(1_700_000_001, 123_456_700)))
+            val dependency = "direct-url-probe @ ${archive.toUri()}"
+            val directUrl = """{"url":"${archive.toUri()}","archive_info":{}}"""
+            val uvCache = """{"timestamp":{"secs_since_epoch":1700000000,"nanos_since_epoch":123456700},"commit":null,"tags":null,"env":{},"directories":{}}"""
+
+            // when
+            val installs = planInstalls(dependency, directUrl, uvCache)
+
+            // then
+            assert(installs == listOf(dependency))
+        } finally {
+            archiveDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should plan local archive dependency as missing without recorded hash or modification time`() {
+        // given
+        val directUrl = """{"url": "file:///home/user/probe-1.0.tar.gz", "archive_info": {}}"""
+        val dependency = "direct-url-probe @ file:///home/user/probe-1.0.tar.gz"
+
+        // when
+        val installs = planInstalls(dependency, directUrl)
+
+        // then
+        assert(installs == listOf(dependency))
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should plan hashed local archive dependency installed by uv as installed`() {
+        // given
+        // uv keeps the hash fragment in the URL of a local archive, and records no hashes
+        val archiveDirectory = createTempDirectory("python-archive")
+        try {
+            val archive = archiveDirectory.resolve("probe-1.0.tar.gz")
+            archive.writeText("archive content")
+            val hash = MessageDigest.getInstance("SHA-256").digest(archive.readBytes()).joinToString("") { "%02x".format(it) }
+            val url = "${archive.toUri()}#sha256=$hash"
+            val directUrl = """{"url":"$url","archive_info":{}}"""
+
+            // when
+            val installs = planInstalls("direct-url-probe @ $url", directUrl)
+
+            // then
+            assert(installs.isEmpty())
+        } finally {
+            archiveDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should plan hashed remote archive dependency installed by uv as installed`() {
+        // given
+        // uv drops the hash fragment from the URL of a remote archive, and records no hashes
+        val directUrl = """{"url":"https://example.com/probe-1.0.tar.gz","archive_info":{}}"""
+
+        // when
+        val installs = planInstalls("direct-url-probe @ https://example.com/probe-1.0.tar.gz#sha256=$HASH", directUrl)
+
+        // then
+        assert(installs.isEmpty())
+    }
+
+    @Test
+    fun `should plan URL dependency with extras as missing`() {
+        // given
+        // the dependencies of the extras are not checked, see #47
+        val directUrl = """{"url": "https://example.com/probe.git", "vcs_info": {"vcs": "git", "commit_id": "$COMMIT", "requested_revision": "v1"}}"""
+        val dependency = "direct-url-probe[extra] @ git+https://example.com/probe.git@v1"
+
+        // when
+        val installs = planInstalls(dependency, directUrl)
+
+        // then
+        assert(installs == listOf(dependency))
+    }
+
     @Test
     fun `should plan local directory dependency as missing even for the same URL`() {
         // given
@@ -604,13 +717,14 @@ class PythonDependenciesTest {
      * or from an index when `null`.
      */
     @OptIn(ExperimentalPathApi::class)
-    private fun planInstalls(dependency: String, directUrl: String?): List<String> {
+    private fun planInstalls(dependency: String, directUrl: String?, uvCache: String? = null): List<String> {
         PythonEnvironment.initialize()
         val directory = createTempDirectory("python-dependencies")
         try {
             val distInfo = directory.resolve("direct_url_probe-1.0.dist-info").createDirectories()
             distInfo.resolve("METADATA").writeText("Metadata-Version: 2.1\nName: direct-url-probe\nVersion: 1.0\n")
             if (directUrl != null) distInfo.resolve("direct_url.json").writeText(directUrl)
+            if (uvCache != null) distInfo.resolve("uv_cache.json").writeText(uvCache)
             return PythonDependencies.plan("dependencies = ['$dependency']\n", directory.toString(), emptyList())
                 .filter { it.first == "install" }
                 .map { it.second }
