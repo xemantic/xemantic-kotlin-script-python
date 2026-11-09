@@ -87,9 +87,9 @@ fun main() = runBlocking {
 }
 ```
 
-`ScriptSession.execute` is a suspending function which needs a coroutine `Job`,
-so it is called within `runBlocking`, or another coroutine builder,
-and not directly from a `suspend fun main()`, which has none.
+`ScriptSession.execute` is a suspending function to call from a coroutine,
+e.g. within `runBlocking`, as above
+(with `xemantic-kotlin-script` 0.2.0, a `suspend fun main()` is not enough, as `execute` also needs a coroutine `Job`).
 The `kotlinx-coroutines-core` library comes as a dependency of `xemantic-kotlin-script`.
 
 The examples assume `numpy` installed in the Python environment,
