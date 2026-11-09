@@ -53,14 +53,19 @@ The Python executable is, in this order:
 The Python code imports the modules from the same paths as this executable,
 e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
 
-The embedded Python, like every Python process it starts, e.g. `pip`, runs in the [UTF-8 mode](https://peps.python.org/pep-0540/),
+The embedded Python, like every Python process started by this library, e.g. `pip`,
+runs in the [UTF-8 mode](https://peps.python.org/pep-0540/),
 whatever the locale, e.g. cp1252 on Windows, or `C` on Linux:
 the standard streams, and `open` without an `encoding`, use UTF-8.
-On Linux or macOS with a non-UTF-8 locale, e.g. ISO-8859-1,
+Only a `PYTHONIOENCODING` environment variable of the JVM, if set, still takes precedence over it,
+for the standard streams of the embedded Python.
+
+On Linux, or another POSIX system, with a locale whose encoding is not UTF-8, e.g. ISO-8859-1,
 the path of the Python executable, e.g. of the virtual environment, must be ASCII:
-Jep passes it to the embedded Python as UTF-8, which is then another path,
+Jep passes it to the embedded Python as JNI modified UTF-8, which is then another path,
 so that the embedded Python would not find the virtual environment,
 and fail with `ModuleNotFoundError: No module named 'jep'`.
+It does not apply to macOS and Windows, where Python decodes a path as UTF-8, whatever the locale.
 Other paths, like the one of the dependency directory in a home directory like `/home/josé`, can be non-ASCII.
 
 ## Usage

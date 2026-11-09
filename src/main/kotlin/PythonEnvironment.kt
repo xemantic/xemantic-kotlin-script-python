@@ -18,11 +18,15 @@
 
 package com.xemantic.kotlin.script.python
 
+import jep.Interpreter
 import jep.MainInterpreter
 import jep.PyConfig
 import java.io.IOException
 import java.io.Reader
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
 import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.concurrent.thread
@@ -103,8 +107,8 @@ public object PythonEnvironment {
         if (dependencyDirectory == null) {
             val prefixHash = MessageDigest.getInstance("SHA-256")
                 .digest(prefix.toByteArray())
-                .take(6)
-                .joinToString("") { "%02x".format(it) }
+                .copyOf(6)
+                .toHexString()
             dependencyDirectory = Path(
                 System.getProperty("user.home"), ".cache", "xemantic-kotlin-script-python", "$cacheTag-$prefixHash"
             )
@@ -122,8 +126,10 @@ public object PythonEnvironment {
      * as otherwise it would use the encoding of the locale of the JVM, e.g. cp1252 on Windows, or ASCII in the C locale,
      * for its standard streams and as the default encoding of `open`,
      * and fail with a `UnicodeEncodeError` printing, or a `UnicodeDecodeError` reading a UTF-8 file, non-ASCII text.
-     * Jep has no setter of the UTF-8 mode, but its command line option `-X utf8`,
-     * parsed by CPython before decoding the other values, enables it, also over a `PYTHONUTF8=0` environment variable.
+     * Jep has no setter of the UTF-8 mode, but its command line option `-X utf8` enables it,
+     * also over a `PYTHONUTF8=0` environment variable,
+     * as Jep 4.3 sets the argv before the other values, and CPython reads its options then,
+     * before decoding any other value; [checkUtf8Mode] tells if a version of Jep does not.
      */
     internal fun embeddedPythonConfig(executable: String): PyConfig = PyConfig.python()
         .setParseArgv(true)
@@ -131,10 +137,24 @@ public object PythonEnvironment {
         .setProgramName(executable)
 
     /**
+     * Checks that the embedded CPython of the [interpreter] runs in UTF-8 mode, see [embeddedPythonConfig].
+     *
+     * @throws IllegalStateException if it does not.
+     */
+    internal fun checkUtf8Mode(interpreter: Interpreter) {
+        val utf8Mode = interpreter.getValue("__import__('sys').flags.utf8_mode")
+        check(utf8Mode == 1L) {
+            "The embedded Python does not run in UTF-8 mode (sys.flags.utf8_mode is $utf8Mode), " +
+                "the version of Jep might not support enabling it with -X utf8 in PyConfig.setArgv"
+        }
+    }
+
+    /**
      * Asks the [python] executable about itself.
      *
      * @throws IllegalStateException if it cannot be run, has no `jep` package,
-     * does not write the values of the probe, or cannot tell the path of its executable.
+     * does not write the values of the probe, or cannot tell the path of its executable,
+     * or if its paths are not valid in the [filesystemCharset].
      */
     internal fun probePython(python: String): PythonProbe {
         val result = try {
@@ -146,7 +166,16 @@ public object PythonEnvironment {
             "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
                 result.failureOutput
         }
-        val probe = checkNotNull(parseProbeOutput(result.output)) {
+        val parsed = try {
+            parseProbeOutput(result.output)
+        } catch (e: CharacterCodingException) {
+            throw IllegalStateException(
+                "The paths of Python $python are not valid in the file system encoding of the JVM, " +
+                    "$filesystemCharset, run the JVM in a locale of the encoding of the file system, e.g. UTF-8",
+                e
+            )
+        }
+        val probe = checkNotNull(parsed) {
             "Cannot read the values of the Python environment probe of $python from its output:\n" +
                 result.failureOutput
         }
@@ -165,6 +194,7 @@ public object PythonEnvironment {
      * can write to the standard output as well, before or after them.
      *
      * @return the probe, or `null` if the [output] has no such values.
+     * @throws CharacterCodingException if a value is not valid in the [filesystemCharset].
      */
     internal fun parseProbeOutput(output: String): PythonProbe? {
         // the output is trimmed, also of the newline before the first line
@@ -268,22 +298,29 @@ internal val filesystemCharset: Charset =
  *
  * Python in UTF-8 mode decodes a path of the file system from UTF-8, surrogate-escaping the bytes which are not,
  * so under a non-UTF-8 locale, e.g. `/home/josé` in ISO-8859-1,
- * the `str` of the path of the JVM, as passed by Jep, would be another path, encoded in UTF-8.
+ * the `str` of the path of the JVM, as passed by Jep, would be another path, encoded in (modified) UTF-8.
  * A path in the command line of a Python process is decoded by Python the same way, and needs no such conversion.
  */
 internal fun pythonPath(path: String): String =
-    "__import__('os').fsdecode(bytes.fromhex('${path.toByteArray(filesystemCharset).toHex()}'))"
+    "__import__('os').fsdecode(bytes.fromhex('${path.toByteArray(filesystemCharset).toHexString()}'))"
 
-private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
-
-/** The path of the hex digits of its bytes in the [filesystemCharset], or `null` if they are not hex digits. */
+/**
+ * The path of the hex digits of its bytes in the [filesystemCharset], or `null` if they are not hex digits.
+ *
+ * @throws CharacterCodingException if the bytes are not valid in the [filesystemCharset],
+ * which would otherwise be replaced, and name another path.
+ */
 private fun String.hexToPath(): String? {
-    if (length % 2 != 0) return null
-    val bytes = ByteArray(length / 2)
-    for (i in bytes.indices) {
-        bytes[i] = substring(i * 2, i * 2 + 2).toIntOrNull(16)?.toByte() ?: return null
+    val bytes = try {
+        hexToByteArray()
+    } catch (_: IllegalArgumentException) {
+        return null
     }
-    return String(bytes, filesystemCharset)
+    return filesystemCharset.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+        .decode(ByteBuffer.wrap(bytes))
+        .toString()
 }
 
 /**

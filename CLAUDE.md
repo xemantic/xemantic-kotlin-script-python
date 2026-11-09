@@ -72,10 +72,11 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The embedded CPython does not detect a virtual environment by itself —
   without the venv's `python` as its program name (`PyConfig.setProgramName`), it ignores `pyvenv.cfg` and also imports from the global and user `site-packages` of the base Python.
   When a module is unexpectedly importable, check `sys.path` of the embedded interpreter, not of `.venv/bin/python`.
-- A Java `String` reaches Python as UTF-8 — `PyConfig` values via `GetStringUTFChars`, values as `str` —
-  while a path in argv, or from the file system, is the bytes of the locale encoding (`sun.jnu.encoding`), surrogate-escaped by Python in UTF-8 mode.
-  Under a non-UTF-8 locale they are different paths, see `pythonPath`.
-  The only machine-wide locales here may be `C`, `C.utf8` and `POSIX`, but `localedef -i en_US -f ISO-8859-1 <dir>/en_US.ISO-8859-1` with `LOCPATH=<dir> LC_ALL=en_US.ISO-8859-1` gives a JVM an ISO-8859-1 `sun.jnu.encoding` without root.
+- Jep passes the `PyConfig` strings to CPython as JNI *modified* UTF-8 (`GetStringUTFChars`), not plain UTF-8 —
+  a character outside the BMP becomes a CESU-8 surrogate pair, which CPython does not decode as that character.
+  For a path under a non-UTF-8 locale, see `pythonPath`.
+- A machine may have only the `C`, `C.utf8` and `POSIX` locales,
+  but `localedef -i en_US -f ISO-8859-1 <dir>/en_US.ISO-8859-1` with `LOCPATH=<dir> LC_ALL=en_US.ISO-8859-1` gives a JVM an ISO-8859-1 `sun.jnu.encoding` without root (see `PythonLocaleTest`).
 
 ## Anti-patterns to avoid
 

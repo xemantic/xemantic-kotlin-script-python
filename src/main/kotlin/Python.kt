@@ -219,7 +219,10 @@ public class Python private constructor(
                 checkNotClosed()
                 val interpreter = interpreter ?: run {
                     PythonEnvironment.initialize()
-                    SharedInterpreter().also { interpreter = it }
+                    SharedInterpreter().also {
+                        interpreter = it
+                        PythonEnvironment.checkUtf8Mode(it)
+                    }
                 }
                 interpreter.block()
             }

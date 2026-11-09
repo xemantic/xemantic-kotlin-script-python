@@ -19,9 +19,19 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import org.junit.jupiter.api.Assumptions.assumeTrue
+import java.io.IOException
+import java.nio.file.Path
+import java.util.concurrent.TimeUnit
+import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectory
+import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.exists
+import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 
@@ -54,11 +64,65 @@ class PythonLocaleTest {
         }
     }
 
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should import from non-ASCII dependency directory in embedded Python under ISO-8859-1 locale`() {
+        // given
+        val directory = createTempDirectory("python-locale")
+        try {
+            val locales = directory.resolve("locales").createDirectory()
+            assumeTrue(createIso88591Locale(locales), "cannot create an ISO-8859-1 locale with localedef")
+            // the bytes of josé in UTF-8, which are josÃ© in ISO-8859-1, the encoding of the paths of the forked JVM
+            val dependencyDirectory = directory.resolve("josé").createDirectory()
+            dependencyDirectory.resolve("latin_module.py").writeText("VALUE = 'imported'\n")
+            // jep is installed in the environment, so nothing is installed, but the dependency directory is importable
+            val code = """
+                |# /// script
+                |# dependencies = ["jep"]
+                |# ///
+                |import locale, latin_module
+                |print(locale.nl_langinfo(locale.CODESET), latin_module.VALUE, flush=True)
+                |""".trimMargin()
+
+            // when
+            val (exitCode, output) = runInJvm(
+                EmbeddedPythonMain::class.java.name,
+                input = code,
+                environment = mapOf("LOCPATH" to locales.toString(), "LC_ALL" to "en_US.ISO-8859-1"),
+                jvmArguments = listOf("-Dxemantic.kotlin.script.python.dependencyDirectory=$dependencyDirectory")
+            )
+
+            // then
+            assert(output == "ISO-8859-1 imported")
+            assert(exitCode == 0)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     private fun String.pythonLiteral() = "'" + replace("\\", "\\\\").replace("'", "\\'") + "'"
 
     /**
-     * Runs the [mainClass] of the test classpath in a new JVM with the [environment] variables
-     * added to the inherited ones, unlike [runProcess], which would put Python in UTF-8 mode,
+     * Creates the `en_US.ISO-8859-1` locale in the [directory], for the `LOCPATH` environment variable,
+     * as the machine might have no locale of this encoding installed.
+     *
+     * @return `true` if created, `false` if `localedef` is not available, or fails.
+     */
+    private fun createIso88591Locale(directory: Path): Boolean {
+        val locale = directory.resolve("en_US.ISO-8859-1")
+        return try {
+            // the exit code is not checked, as localedef can warn about the definition, and still create the locale
+            runProcess(listOf("localedef", "-i", "en_US", "-f", "ISO-8859-1", locale.toString()))
+            locale.resolve("LC_CTYPE").exists()
+        } catch (_: IOException) {
+            false
+        }
+    }
+
+    /**
+     * Runs the [mainClass] of the test classpath in a new JVM, with the [jvmArguments],
+     * and with the [environment] variables added to the inherited ones,
+     * unlike [runProcess], which would put Python in UTF-8 mode,
      * writing the [input] to its standard input, as UTF-8.
      *
      * @return the exit code and the output, merged with the standard error, decoded as UTF-8.
@@ -66,20 +130,34 @@ class PythonLocaleTest {
     private fun runInJvm(
         mainClass: String,
         input: String,
-        environment: Map<String, String>
+        environment: Map<String, String>,
+        jvmArguments: List<String> = emptyList()
     ): Pair<Int, String> {
         val java = Path(System.getProperty("java.home"), "bin", "java").toString()
-        val builder = ProcessBuilder(
-            java,
-            "--enable-native-access=ALL-UNNAMED",
-            "-cp", System.getProperty("java.class.path"),
-            mainClass
-        ).redirectErrorStream(true)
-        builder.environment().putAll(environment)
-        val process = builder.start()
-        process.outputStream.use { it.write(input.toByteArray(Charsets.UTF_8)) }
-        val output = process.inputStream.readBytes().toString(Charsets.UTF_8).trim()
-        return process.waitFor() to output
+        // a file, unlike a pipe, does not block the JVM when nobody reads it, so that it can be awaited with a timeout
+        val outputFile = createTempFile("jvm-output", ".txt")
+        try {
+            val builder = ProcessBuilder(
+                listOf(java, "--enable-native-access=ALL-UNNAMED") + jvmArguments +
+                    listOf("-cp", System.getProperty("java.class.path"), mainClass)
+            ).redirectErrorStream(true).redirectOutput(outputFile.toFile())
+            builder.environment().putAll(environment)
+            val process = builder.start()
+            try {
+                process.outputStream.use { it.write(input.toByteArray(Charsets.UTF_8)) }
+                val ended = process.waitFor(5, TimeUnit.MINUTES)
+                val output = outputFile.readText(Charsets.UTF_8).trim()
+                check(ended) { "The JVM of $mainClass has not ended in 5 minutes, its output:\n$output" }
+                return process.exitValue() to output
+            } finally {
+                if (process.isAlive) {
+                    process.destroyForcibly()
+                    process.waitFor()
+                }
+            }
+        } finally {
+            outputFile.deleteIfExists()
+        }
     }
 
 }

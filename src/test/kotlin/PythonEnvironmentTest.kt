@@ -19,6 +19,7 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermissions
@@ -144,20 +145,41 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should probe Python whose paths are not valid UTF-8`() {
+    fun `should probe Python whose paths are non-ASCII`() {
         // given
         val expected = PythonEnvironment.probePython(venvPython)
         val directory = createTempDirectory("python-probe")
-        // a path of a non-UTF-8 locale, e.g. /home/josé in ISO-8859-1, is surrogate-escaped by Python in UTF-8 mode
-        val python = pythonWithSitecustomize(directory, "import os, sys\nsys.prefix = os.fsdecode(b'/jos\\xe9')\n")
+        val python = pythonWithSitecustomize(directory, "import sys\nsys.prefix = '/zażółć 日本'\n")
 
         try {
             // when
             val probe = PythonEnvironment.probePython(python)
 
             // then
-            val prefix = String(byteArrayOf(0x2f, 0x6a, 0x6f, 0x73, 0xe9.toByte()), filesystemCharset)
-            assert(probe == expected.copy(prefix = prefix))
+            assert(probe == expected.copy(prefix = "/zażółć 日本"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should fail clearly on probe of Python whose path is not valid in file system encoding of JVM`() {
+        // given
+        assumeTrue(filesystemCharset == Charsets.UTF_8, "the file system encoding of the JVM is not UTF-8")
+        val directory = createTempDirectory("python-probe")
+        // a path of another locale, e.g. /home/josé in ISO-8859-1, is surrogate-escaped by Python in UTF-8 mode
+        val python = pythonWithSitecustomize(directory, "import os, sys\nsys.prefix = os.fsdecode(b'/jos\\xe9')\n")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            assert(python in message && "UTF-8" in message)
         } finally {
             directory.deleteRecursively()
         }
@@ -314,11 +336,22 @@ class PythonEnvironmentTest {
         assert(probe == null)
     }
 
+    @Test
+    fun `should not parse probe output with values which are signed hex numbers`() {
+        // given
+        // each pair of digits, like 2f and -1, is a number, but -1 is not a byte of hex digits
+        val output = "${PythonEnvironment.PROBE_BEGIN}\n2f-1 2f 2f 2f\n${PythonEnvironment.PROBE_END}"
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == null)
+    }
+
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
     private fun probePayload(vararg values: String): String {
-        val hexValues = values.joinToString(" ") { value ->
-            value.toByteArray(filesystemCharset).joinToString("") { "%02x".format(it) }
-        }
+        val hexValues = values.joinToString(" ") { it.toByteArray(filesystemCharset).toHexString() }
         return "${PythonEnvironment.PROBE_BEGIN}\n$hexValues\n${PythonEnvironment.PROBE_END}"
     }
 
