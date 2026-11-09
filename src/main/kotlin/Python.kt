@@ -18,6 +18,7 @@
 
 package com.xemantic.kotlin.script.python
 
+import jep.JepException
 import jep.SharedInterpreter
 import jep.python.PyCallable
 import jep.python.PyObject
@@ -219,7 +220,15 @@ public class Python private constructor(
                 checkNotClosed()
                 val interpreter = interpreter ?: run {
                     PythonEnvironment.initialize()
-                    SharedInterpreter().also {
+                    // the first one initializes the embedded CPython, which might fail like its probe warned
+                    try {
+                        SharedInterpreter()
+                    } catch (e: JepException) {
+                        throw PythonEnvironment.embeddedPythonFailure(e)
+                    } catch (e: LinkageError) {
+                        // e.g. an UnsatisfiedLinkError of the native libraries
+                        throw PythonEnvironment.embeddedPythonFailure(e)
+                    }.also {
                         interpreter = it
                         PythonEnvironment.checkUtf8Mode(it)
                     }

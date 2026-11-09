@@ -44,7 +44,7 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should probe Python which writes to stderr`() {
+    fun `should probe Python which writes to stderr, keeping it`() {
         // given
         val expected = PythonEnvironment.probePython(venvPython)
         val directory = createTempDirectory("python-probe")
@@ -63,7 +63,8 @@ class PythonEnvironmentTest {
             val probe = PythonEnvironment.probePython(python.toString())
 
             // then
-            assert(probe == expected)
+            // the warning is kept, e.g. for a later failure of the embedded Python
+            assert(probe == expected.copy(error = "Could not find platform libraries"))
         } finally {
             directory.deleteRecursively()
         }
@@ -347,6 +348,105 @@ class PythonEnvironmentTest {
 
         // then
         assert(probe == null)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not blame jep for Python which fails to run`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        // like a pyenv shim of a Python version which is not installed
+        python.writeText(
+            """
+            |#!/bin/sh
+            |echo "pyenv: version '3.13.0' is not installed" >&2
+            |exit 1
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python.toString())
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                message.startsWith("Cannot run Python $python") &&
+                    "exit code 1" in message &&
+                    "version '3.13.0' is not installed" in message &&
+                    "jep" !in message
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report missing jep package of Python`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        // the venv Python, without its site-packages, where jep is installed
+        val python = pythonWithSitecustomize(
+            directory,
+            "import sys\nsys.path = [path for path in sys.path if 'site-packages' not in path]\n"
+        )
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            // the probe tells that jep is missing, instead of failing with a traceback
+            assert(
+                message.startsWith("Cannot find the jep package of $python") &&
+                    "pip install jep" in message &&
+                    "Traceback" !in message
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should report stderr of probe on failure of embedded Python`() {
+        // given
+        val cause = IllegalStateException("Jep could not initialize")
+
+        // when
+        val failure = PythonEnvironment.embeddedPythonFailure(
+            cause,
+            executable = "/venv/bin/python",
+            probeError = "Could not find platform libraries <exec_prefix>"
+        )
+
+        // then
+        val message = failure.message!!
+        assert(
+            failure.cause === cause &&
+                "/venv/bin/python" in message &&
+                "Jep could not initialize" in message &&
+                "Could not find platform libraries <exec_prefix>" in message
+        )
+    }
+
+    @Test
+    fun `should keep failure of embedded Python when probe wrote no stderr`() {
+        // given
+        val cause = IllegalStateException("Jep could not initialize")
+
+        // when
+        val failure = PythonEnvironment.embeddedPythonFailure(cause, executable = "/venv/bin/python", probeError = "")
+
+        // then
+        assert(failure === cause)
     }
 
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
