@@ -68,17 +68,29 @@ dependencies {
 Then:
 
 ```kotlin
-Python().use { python ->
-    ScriptSession {
-        "python" provides python
-    }.use { session ->
-        session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
-        session.execute("""python["factor"] = 3""")
-        val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
-        println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+import com.xemantic.kotlin.script.ScriptResult
+import com.xemantic.kotlin.script.ScriptSession
+import com.xemantic.kotlin.script.python.Python
+import kotlinx.coroutines.runBlocking
+
+fun main() = runBlocking {
+    Python().use { python ->
+        ScriptSession {
+            "python" provides python
+        }.use { session ->
+            session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
+            session.execute("""python["factor"] = 3""")
+            val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
+            println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+        }
     }
 }
 ```
+
+`ScriptSession.execute` is a suspending function which needs a coroutine `Job`,
+so it is called within `runBlocking`, or another coroutine builder,
+and not directly from a `suspend fun main()`, which has none.
+The `kotlinx-coroutines-core` library comes as a dependency of `xemantic-kotlin-script`.
 
 The examples assume `numpy` installed in the Python environment,
 otherwise the code can declare it as a dependency, see below.
