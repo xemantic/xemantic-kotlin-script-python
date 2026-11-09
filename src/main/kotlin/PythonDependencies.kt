@@ -126,16 +126,24 @@ internal object PythonDependencies {
 
     /**
      * Runs the [PLAN] for the [metadata], found by [scriptMetadata], the dependency [directory],
-     * and the [imported] top-level modules.
+     * and the [imported] top-level modules, with the [command], by default the [planCommand].
      *
      * @return the `install` and `constraint` entries of the plan, as pairs of the kind and the value.
      * @throws PythonDependencyException if the plan cannot be made.
      */
-    fun plan(metadata: String, directory: String, imported: List<String>): List<Pair<String, String>> {
+    fun plan(
+        metadata: String,
+        directory: String,
+        imported: List<String>,
+        command: List<String> = planCommand(directory)
+    ): List<Pair<String, String>> {
         // on the standard input, as the command line would exceed the OS limit after importing many modules
         val input = """{"metadata": ${metadata.toJson()}, "modules": [${imported.joinToString(", ") { it.toJson() }}]}"""
-        val (exitCode, output) = runProcess(planCommand(directory), input = input)
-        if (exitCode != 0) throw PythonDependencyException(output)
+        // the standard error separately, as a write to it, e.g. a warning, could split a line of the plan
+        val (exitCode, output, error) = runProcess(command, input = input, mergeErrorStream = false)
+        if (exitCode != 0) {
+            throw PythonDependencyException(listOf(error, output).filter { it.isNotEmpty() }.joinToString("\n"))
+        }
         return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
     }
 
