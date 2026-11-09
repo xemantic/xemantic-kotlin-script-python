@@ -19,6 +19,7 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import java.io.IOException
 import java.nio.file.attribute.PosixFilePermissions
 import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
@@ -182,6 +183,38 @@ class PythonEnvironmentTest {
 
         // then
         assert(result == ProcessResult(exitCode = 3, output = "failure before reading stdin", error = ""))
+    }
+
+    @Test
+    fun `should destroy process and rethrow when reading its output fails`() {
+        // given
+        val pidFile = createTempFile("python-pid", ".txt")
+        // the output is closed after the failure, so the process outlives it, to keep running, like a stuck one
+        val script = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid()))\n" +
+            "try:\n" +
+            "    while True: sys.stdout.write('x' * 65536)\n" +
+            "except BrokenPipeError:\n" +
+            "    time.sleep(600)"
+
+        try {
+            // when
+            val exception = assertFailsWith<IOException> {
+                runProcess(
+                    listOf(venvPython, "-c", script, pidFile.toString()),
+                    readOutput = { reader ->
+                        reader.read(CharArray(1024))
+                        throw IOException("reading output failed")
+                    }
+                )
+            }
+
+            // then
+            assert(exception.message == "reading output failed")
+            val pid = pidFile.readText().toLong()
+            assert(ProcessHandle.of(pid).map { it.isAlive }.orElse(false) == false)
+        } finally {
+            pidFile.deleteIfExists()
+        }
     }
 
     @Test
