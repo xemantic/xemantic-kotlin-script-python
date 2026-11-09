@@ -118,16 +118,16 @@ public object PythonEnvironment {
      * @throws IllegalStateException if it cannot be run, or has no `jep` package.
      */
     internal fun probePython(python: String): PythonProbe {
-        val (exitCode, output, error) = try {
+        val result = try {
             runProcess(probeCommand(python), mergeErrorStream = false)
         } catch (e: java.io.IOException) {
             throw IllegalStateException("Cannot run Python executable: $python", e)
         }
-        check(exitCode == 0) {
+        check(result.exitCode == 0) {
             "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
-                listOf(output, error).filter { it.isNotEmpty() }.joinToString("\n")
+                result.failureOutput
         }
-        val (executable, cacheTag, prefix, jepLocation) = output.lines()
+        val (executable, cacheTag, prefix, jepLocation) = result.output.lines()
         return PythonProbe(executable, cacheTag, prefix, jepLocation)
     }
 
@@ -204,7 +204,16 @@ internal data class ProcessResult(
     val exitCode: Int,
     val output: String,
     val error: String
-)
+) {
+
+    /**
+     * The standard error, followed by the standard output, without the empty ones,
+     * to tell why the process failed: the error, e.g. a traceback or the message of `sys.exit`,
+     * is what matters, and the output is likely partial then.
+     */
+    val failureOutput: String get() = listOf(error, output).filter { it.isNotEmpty() }.joinToString("\n")
+
+}
 
 /**
  * Runs the [command], writing the [input] to its standard input, and waits for it to end.

@@ -140,11 +140,9 @@ internal object PythonDependencies {
         // on the standard input, as the command line would exceed the OS limit after importing many modules
         val input = """{"metadata": ${metadata.toJson()}, "modules": [${imported.joinToString(", ") { it.toJson() }}]}"""
         // the standard error separately, as a write to it, e.g. a warning, could split a line of the plan
-        val (exitCode, output, error) = runProcess(command, input = input, mergeErrorStream = false)
-        if (exitCode != 0) {
-            throw PythonDependencyException(listOf(error, output).filter { it.isNotEmpty() }.joinToString("\n"))
-        }
-        return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+        val result = runProcess(command, input = input, mergeErrorStream = false)
+        if (result.exitCode != 0) throw PythonDependencyException(result.failureOutput)
+        return result.output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
     }
 
     /** The command running the [PLAN] for the dependency [directory]. */
