@@ -146,7 +146,9 @@ otherwise the code can declare it as a dependency, see below.
 ## Development
 
 The tests run in the `.venv` Python virtual environment of the project,
-created by Gradle with `python3`, with only the `jep` package of the version of the library installed,
+created by Gradle with `python3`, or another base Python set with the `basePython` Gradle property
+(see [DEVELOPMENT.md](DEVELOPMENT.md#the-python-of-the-tests)),
+with only the `jep` package of the version of the library installed,
 like a clean environment of an agent.
 The tests declare the Python packages they use, like `numpy`, as dependencies,
 installed from PyPI into `build/python-dependencies`, which Gradle cleans before every test run,

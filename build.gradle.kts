@@ -5,6 +5,7 @@ import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinVersion
 import org.jetbrains.kotlin.gradle.dsl.abi.ExperimentalAbiValidation
 import org.jreleaser.model.Active
+import java.io.ByteArrayOutputStream
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -93,37 +94,72 @@ configurations.all {
 val pythonVenv = layout.projectDirectory.dir(".venv")
 val venvPython = pythonVenv.file("bin/python")
 
-val createPythonVenv = tasks.register<Exec>("createPythonVenv") {
-    description = "Creates the Python virtual environment of the tests"
-    // a local value, as the configuration cache cannot serialize a reference to the build script
-    val python = venvPython.asFile
-    outputs.file(python)
-    onlyIf { !python.exists() }
+// the services which a task action can use, as the configuration cache cannot serialize the project
+interface InjectedServices {
+    @get:Inject
+    val exec: ExecOperations
+}
+
+val createPythonVenv = tasks.register("createPythonVenv") {
+    description = "Creates the Python virtual environment of the tests, again when it is incomplete or its base Python changed"
     // the PATH of the Gradle daemon can differ from the one of the shell, e.g. resolve to an old python3 of macOS,
     // so the base Python can be chosen with -PbasePython=..., or the ORG_GRADLE_PROJECT_basePython variable on CI
     val basePython = providers.gradleProperty("basePython").getOrElse("python3")
-    // checked before creating the environment, as a too old Python fails only later, when pip finds no jep
-    val minimumPythonVersion = listOf(3, 10)
-    val basePythonVersion = providers.exec {
-        commandLine(basePython, "-c", "import sys; print('%d.%d' % sys.version_info[:2])")
-        isIgnoreExitValue = true
-    }
-    doFirst {
-        val result = try {
-            basePythonVersion.result.get()
-        } catch (e: Exception) {
-            throw GradleException("Cannot run the base Python '$basePython', set another one with -PbasePython=<path>", e)
+    // local values, as the configuration cache cannot serialize a reference to the build script
+    val exec = objects.newInstance<InjectedServices>().exec
+    val venv = pythonVenv.asFile
+    // written only after the environment is created successfully, so a missing one means a half-made,
+    // or a pre-existing one, of a Python which was never checked
+    val marker = pythonVenv.file("base-python.txt").asFile
+    doLast {
+        fun run(vararg command: String): Triple<Int, String, String> {
+            val out = ByteArrayOutputStream()
+            val err = ByteArrayOutputStream()
+            val result = try {
+                exec.exec {
+                    commandLine(*command)
+                    standardOutput = out
+                    errorOutput = err
+                    isIgnoreExitValue = true
+                }
+            } catch (e: Exception) {
+                throw GradleException("Cannot run the base Python '$basePython', set another one with -PbasePython=<path>", e)
+            }
+            return Triple(result.exitValue, out.toString().trim(), err.toString().trim())
         }
-        val output = basePythonVersion.standardOutput.asText.get().trim()
-        val version = output.split('.').mapNotNull { it.toIntOrNull() }
-        if (result.exitValue != 0 || version.size != 2 || compareValuesBy(version, minimumPythonVersion, { it[0] }, { it[1] }) < 0) {
-            throw GradleException(
-                "The base Python '$basePython' is version '$output', but jep requires Python " +
-                    "${minimumPythonVersion.joinToString(".")} or newer, set another one with -PbasePython=<path>"
+        // checked before creating the environment, as a too old Python fails only later, when pip finds no jep;
+        // isolated (-I), so that no sitecustomize prints into the version, exit code 3 meaning too old
+        val (exitValue, output, error) = run(
+            basePython, "-I", "-c",
+            "import sys; print('%d.%d.%d' % sys.version_info[:3]); sys.exit(3 if sys.version_info < (3, 10) else 0)"
+        )
+        // the last line, as a .pth file of the site-packages can still print before
+        val version = output.lines().last()
+        when (exitValue) {
+            0 -> {}
+            3 -> throw GradleException(
+                "The base Python '$basePython' is version $version, but jep requires Python 3.10 or newer, " +
+                    "set another one with -PbasePython=<path>"
+            )
+            else -> throw GradleException(
+                "The base Python '$basePython' failed with exit value $exitValue, set another one with -PbasePython=<path>:\n$error"
             )
         }
+        val baseInfo = "$basePython\n$version"
+        if (marker.isFile && marker.readText() == baseInfo) return@doLast
+        logger.lifecycle("Creating the Python virtual environment $venv with $basePython ($version)")
+        venv.deleteRecursively()
+        val (venvExitValue, venvOutput, venvError) = run(basePython, "-m", "venv", venv.absolutePath)
+        if (venvExitValue != 0) {
+            // otherwise a half-made environment, e.g. without pip, would be taken for a complete one
+            venv.deleteRecursively()
+            throw GradleException(
+                "Cannot create the Python virtual environment with '$basePython', exit value $venvExitValue:\n" +
+                    listOf(venvOutput, venvError).filter { it.isNotEmpty() }.joinToString("\n")
+            )
+        }
+        marker.writeText(baseInfo)
     }
-    commandLine(basePython, "-m", "venv", pythonVenv.asFile.absolutePath)
 }
 
 val installPythonPackages = tasks.register<Exec>("installPythonPackages") {
