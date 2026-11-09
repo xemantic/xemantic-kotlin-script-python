@@ -636,6 +636,30 @@ class PythonCloseTest {
         assert(secondFailure === firstFailure)
     }
 
+    @Test
+    fun `should not deadlock when closing interpreter calls close from Kotlin callback`() {
+        // given
+        val python = Python()
+        python["stop"] = { python.close() }
+        // closing the interpreter drops the global c, whose __del__ calls close() on the Python thread
+        python.exec("class C:\n    def __del__(self):\n        stop()\nc = C()")
+        var failure: Throwable? = null
+
+        // when
+        // bounded, only to fail instead of hanging the JVM, if it deadlocks
+        val closer = thread(isDaemon = true, name = "closer") {
+            failure = runCatching { python.close() }.exceptionOrNull()
+        }
+        closer.join(DEADLOCK_TIMEOUT)
+
+        // then
+        assert(!closer.isAlive)
+        assert(failure == null)
+        val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
+        assert(laterFailure is IllegalStateException)
+        assert(laterFailure.message == "Python is closed")
+    }
+
     /**
      * Waits until this thread waits, e.g. in [Python.close] for the interpreter to be closed, or terminates,
      * bounded only to fail a broken test instead of hanging the JVM.

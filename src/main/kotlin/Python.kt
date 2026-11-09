@@ -236,6 +236,8 @@ public class Python private constructor(
      * Calling it again, also from another thread, or after the waiting is interrupted, waits for the same closing,
      * and throws the same exception, if closing the interpreter fails.
      * If the waiting is interrupted, it throws an [InterruptedException], while the interpreter is still closed.
+     * Called on the thread of this `Python`, e.g. by a Kotlin function called from a Python `__del__`
+     * while the interpreter is being closed, it never waits.
      *
      * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
@@ -258,7 +260,8 @@ public class Python private constructor(
                     try {
                         interpreter?.close()
                     } finally {
-                        // also when closing fails, not to hold a half-closed interpreter, which cannot be closed again
+                        // defensive, and not observable: when closing fails, the interpreter cannot be closed again anyway,
+                        // as closed is set and the executor shut down, so the reference can only be released
                         interpreter = null
                     }
                 }))
@@ -274,7 +277,9 @@ public class Python private constructor(
         // called by a Kotlin function, called from Python, or by a thread it waits for, so waiting here could deadlock;
         // read after setting closed, so that a call, which is not running yet, sees it closed before running any code,
         // and then the task of close() runs right after it
-        if (running) return
+        // nor on the Python thread itself, e.g. called by a Python __del__ while the task of close() closes the interpreter,
+        // which would wait for the very task this thread runs
+        if (running || Thread.currentThread() === thread) return
         // also a close() called again, e.g. after the first one is interrupted, waits until the interpreter is closed
         try {
             closing.get().get()
