@@ -148,6 +148,8 @@ public class Python private constructor(
      *
      * A value which Jep cannot convert, e.g. of `eval<Any>("len")`, or nested in a [Collection] or a [Map],
      * becomes its Python `repr`.
+     * So does a Python object requested as an interface which a [String] implements,
+     * e.g. `Comparable` or `java.io.Serializable`, so that the `repr` is returned instead of a proxy.
      *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
      * A value holding Python objects is copied to a [List], a [Set], a [Map] or an array, see [Python],
@@ -169,6 +171,8 @@ public class Python private constructor(
      *
      * A value which Jep cannot convert, e.g. of `eval("len", Any::class.java)`, or nested in a [Collection] or a [Map],
      * becomes its Python `repr`.
+     * So does a Python object requested as an interface which a [String] implements,
+     * e.g. `Comparable` or `java.io.Serializable`, so that the `repr` is returned instead of a proxy.
      *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
      * A value holding Python objects is copied to a [List], a [Set], a [Map] or an array, see [Python],
@@ -311,9 +315,10 @@ public class Python private constructor(
      * A value without any [PyObject] is returned as it is.
      * Otherwise each [Collection], [Map] and array reachable from it is copied, never changed,
      * a [Set] to a [LinkedHashSet], another [Collection] than a [List] to an [ArrayList],
-     * and an array to an array of the same component type, unless it cannot hold the copy of an element,
-     * like `PyObject[]`, or `Runnable[]` of proxies, which is widened to `Object[]`,
-     * so that the copy can be cast to the type requested from [eval],
+     * and an array to an array of the same component type, unless it cannot hold a `repr`, like `PyObject[]`,
+     * which is widened to `Object[]`, also each dimension of a nested array, like `PyObject[][]` to `Object[][]`,
+     * or unless it cannot hold the copy of an element, like `Runnable[]` of proxies,
+     * which is widened to `Object[]` as well, so that the copy can be cast to the type requested from [eval],
      * also when it contains itself, so that the copy contains itself as well.
      * The same Python object becomes the same `repr`.
      */
@@ -381,8 +386,10 @@ public class Python private constructor(
         private val arrayCopyClasses = IdentityHashMap<Array<*>, Class<*>>()
 
         /**
-         * Returns the class of the copy of the [array], which is its own class,
-         * if it can hold the copy of each element, or `Object[]` otherwise.
+         * Returns the class of the copy of the [array]:
+         * its own class, widened by [copyType], so that no array of a [PyObject] type is left, even an empty one,
+         * unless it cannot hold the copy of an element, like a `repr` of a proxy in `Runnable[]`,
+         * then an array of [Any] of the same dimensions, like `Object[][]`, or `Object[]` as the last resort.
          *
          * It is decided before copying the array, so that the copy can contain itself.
          * An array reached again while deciding, i.e. containing itself, is assumed to keep its class,
@@ -390,16 +397,40 @@ public class Python private constructor(
          */
         private fun arrayCopyClass(array: Array<*>): Class<*> {
             arrayCopyClasses[array]?.let { return it }
-            arrayCopyClasses[array] = array.javaClass
-            val componentType = array.javaClass.componentType
-            val copyClass = if (array.all { element -> copyClass(element)?.let { componentType.isAssignableFrom(it) } ?: true }) {
-                array.javaClass
-            } else {
-                Array<Any?>::class.java
+            val declared = copyType(array.javaClass)
+            arrayCopyClasses[array] = declared
+            val copyClass = when {
+                // the common case, which can hold anything, so that its elements are not checked
+                declared == Array<Any?>::class.java || canHoldCopies(declared, array) -> declared
+                else -> objectArrayClass(dimensions(declared)).takeIf { canHoldCopies(it, array) }
+                    ?: Array<Any?>::class.java
             }
             arrayCopyClasses[array] = copyClass
             return copyClass
         }
+
+        private fun canHoldCopies(arrayClass: Class<*>, array: Array<*>): Boolean = array.all { element ->
+            copyClass(element)?.let { arrayClass.componentType.isAssignableFrom(it) } ?: true
+        }
+
+        /**
+         * Widens a type which can hold a [PyObject], or its subtype, but not its `repr`, to [Any],
+         * also each dimension of an array.
+         */
+        private fun copyType(type: Class<*>): Class<*> = when {
+            type.isArray -> arrayClass(copyType(type.componentType))
+            type.isAssignableFrom(PyObject::class.java) && !type.isAssignableFrom(String::class.java) -> Any::class.java
+            PyObject::class.java.isAssignableFrom(type) -> Any::class.java
+            else -> type
+        }
+
+        private fun dimensions(type: Class<*>): Int = if (type.isArray) 1 + dimensions(type.componentType) else 0
+
+        private fun objectArrayClass(dimensions: Int): Class<*> =
+            (1..dimensions).fold(Any::class.java as Class<*>) { type, _ -> arrayClass(type) }
+
+        private fun arrayClass(componentType: Class<*>): Class<*> =
+            java.lang.reflect.Array.newInstance(componentType, 0).javaClass
 
         /** Returns the class of the [copy] of the [value], or `null` for `null`. */
         private fun copyClass(value: Any?): Class<*>? = when {

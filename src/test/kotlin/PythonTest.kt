@@ -425,6 +425,17 @@ class PythonTest {
     }
 
     @Test
+    fun `should evaluate Python object to repr for interface implemented by String`() {
+        // when
+        val comparable = python.eval("len", Comparable::class.java)
+        val serializable = python.eval("len", java.io.Serializable::class.java)
+
+        // then
+        assert(comparable == "<built-in function len>")
+        assert(serializable == "<built-in function len>")
+    }
+
+    @Test
     fun `should keep working after rejecting Python callable as functional interface`() {
         // given
         assertFailsWith<IllegalArgumentException> {
@@ -546,6 +557,50 @@ class PythonTest {
 
         // then
         assert(result is Array<*> && result.toList() == listOf("<built-in function len>"))
+    }
+
+    @Test
+    fun `should widen nested Kotlin array of Python objects holding repr by each dimension`() {
+        // given
+        python["a"] = arrayOf(arrayOfNulls<PyObject>(1))
+        python.exec("a[0][0] = len")
+
+        // when
+        val result = python["a"]
+        val evaluated = python.eval("a", Array<Array<Any>>::class.java)
+
+        // then
+        assert(result is Array<*> && result.javaClass == Array<Array<Any>>::class.java)
+        assert(evaluated.single().toList() == listOf("<built-in function len>"))
+    }
+
+    @Test
+    fun `should widen empty Kotlin array of Python objects next to one holding repr`() {
+        // given
+        python["a"] = arrayOf(arrayOfNulls<PyObject>(0), arrayOfNulls<PyObject>(1))
+        python.exec("a[1][0] = len")
+
+        // when
+        val result = python["a"]
+
+        // then
+        assert(result is Array<*> && result.javaClass == Array<Array<Any>>::class.java)
+        val empty = (result as Array<*>)[0]
+        assert(empty is Array<*> && empty.javaClass == Array<Any>::class.java && empty.isEmpty())
+    }
+
+    @Test
+    fun `should widen nested Kotlin array of proxies of Python objects holding repr by each dimension`() {
+        // given
+        python["a"] = arrayOf(arrayOfNulls<Runnable>(1))
+        python.exec("a[0][0] = len")
+
+        // when
+        val result = python["a"]
+
+        // then
+        assert(result is Array<*> && result.javaClass == Array<Array<Any>>::class.java)
+        assert((result as Array<*>).single().let { it is Array<*> && it.toList() == listOf("<built-in function len>") })
     }
 
     @Test
