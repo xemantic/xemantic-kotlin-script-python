@@ -4,6 +4,23 @@ Notes for working on this project itself:
 the conventions its documentation follows,
 and the tooling and dependency updates worth doing from time to time.
 
+## The Python of the tests
+
+The build creates the virtual environment of the tests in `.venv` with `python3` on the `PATH` of the Gradle daemon,
+which can differ from the one of your shell,
+e.g. resolve to the old Python of Xcode on macOS.
+To choose another base Python, set the `basePython` Gradle property,
+either on the command line, in `~/.gradle/gradle.properties`,
+or with the `ORG_GRADLE_PROJECT_basePython` environment variable, e.g. on CI:
+
+```shell
+./gradlew build -PbasePython=/opt/homebrew/bin/python3.13
+```
+
+It has to be Python 3.10 or newer, otherwise the build fails before creating the environment.
+An existing `.venv` is kept as it is,
+so delete it after changing the base Python.
+
 ## Update gradlew wrapper
 
 ```shell

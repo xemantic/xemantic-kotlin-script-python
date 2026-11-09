@@ -99,7 +99,31 @@ val createPythonVenv = tasks.register<Exec>("createPythonVenv") {
     val python = venvPython.asFile
     outputs.file(python)
     onlyIf { !python.exists() }
-    commandLine("python3", "-m", "venv", pythonVenv.asFile.absolutePath)
+    // the PATH of the Gradle daemon can differ from the one of the shell, e.g. resolve to an old python3 of macOS,
+    // so the base Python can be chosen with -PbasePython=..., or the ORG_GRADLE_PROJECT_basePython variable on CI
+    val basePython = providers.gradleProperty("basePython").getOrElse("python3")
+    // checked before creating the environment, as a too old Python fails only later, when pip finds no jep
+    val minimumPythonVersion = listOf(3, 10)
+    val basePythonVersion = providers.exec {
+        commandLine(basePython, "-c", "import sys; print('%d.%d' % sys.version_info[:2])")
+        isIgnoreExitValue = true
+    }
+    doFirst {
+        val result = try {
+            basePythonVersion.result.get()
+        } catch (e: Exception) {
+            throw GradleException("Cannot run the base Python '$basePython', set another one with -PbasePython=<path>", e)
+        }
+        val output = basePythonVersion.standardOutput.asText.get().trim()
+        val version = output.split('.').mapNotNull { it.toIntOrNull() }
+        if (result.exitValue != 0 || version.size != 2 || compareValuesBy(version, minimumPythonVersion, { it[0] }, { it[1] }) < 0) {
+            throw GradleException(
+                "The base Python '$basePython' is version '$output', but jep requires Python " +
+                    "${minimumPythonVersion.joinToString(".")} or newer, set another one with -PbasePython=<path>"
+            )
+        }
+    }
+    commandLine(basePython, "-m", "venv", pythonVenv.asFile.absolutePath)
 }
 
 val installPythonPackages = tasks.register<Exec>("installPythonPackages") {
