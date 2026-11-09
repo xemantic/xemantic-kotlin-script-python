@@ -100,9 +100,9 @@ class PythonEnvironmentTest {
     @Test
     fun `should probe Python in working directory with jep package shadowing it`() {
         // given
+        val expected = runProcess(PythonEnvironment.probeCommand(venvPython), mergeErrorStream = false)
         val workingDirectory = createTempDirectory("python-shadowing")
         workingDirectory.resolve("jep").createDirectory().resolve("__init__.py").writeText("")
-        val expected = runProcess(PythonEnvironment.probeCommand(venvPython), mergeErrorStream = false)
 
         try {
             // when

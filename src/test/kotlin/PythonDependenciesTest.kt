@@ -267,7 +267,7 @@ class PythonDependenciesTest {
 
         // when
         val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", code, directory),
+            pythonCommand(PythonEnvironment.executable, code, directory),
             input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
         )
 
@@ -285,7 +285,7 @@ class PythonDependenciesTest {
 
         // when
         val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", code, directory),
+            pythonCommand(PythonEnvironment.executable, code, directory),
             input = """{"metadata": "dependencies = \n", "modules": []}"""
         )
 
@@ -303,7 +303,7 @@ class PythonDependenciesTest {
 
         // when
         val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", code, directory),
+            pythonCommand(PythonEnvironment.executable, code, directory),
             input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
         )
 
