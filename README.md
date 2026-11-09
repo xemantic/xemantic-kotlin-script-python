@@ -137,11 +137,10 @@ otherwise the code can declare it as a dependency, see below.
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.
   The other distributions of the dependency directory can be upgraded,
   but only within the versions the installed distributions require of them,
-  unless the new dependencies upgrade these installed distributions as well:
   e.g. a dependency requiring `attrs>=24` cannot upgrade `attrs` 23,
   installed earlier for a distribution requiring `attrs<24`, which would break the next time it is imported.
-  To tell which installed distributions the new dependencies replace,
-  they are resolved once more before the installation, if any installed distribution requires another one.
+  Only the requirements of the distributions the code declares as its dependencies do not count, as they are replaced,
+  so to upgrade an installed distribution along with the ones it requires, the code declares it as well.
   A dependency conflicting with these requirements fails the call with `PythonDependencyException`,
   naming the installed distributions and their requirements,
   as there can be only one version of a distribution in the directory —

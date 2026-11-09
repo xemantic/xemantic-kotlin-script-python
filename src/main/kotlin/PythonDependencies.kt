@@ -44,7 +44,7 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  * The distributions of the environment itself, and the ones already imported from the dependency directory,
  * are kept in their versions, as a module cannot be replaced once imported,
  * and the other distributions of the dependency directory in the versions required by the installed ones,
- * unless the dependencies replace these as well,
+ * except the ones the code declares, which it replaces,
  * so that a new dependency does not break the installed ones.
  */
 internal object PythonDependencies {
@@ -167,16 +167,21 @@ internal object PythonDependencies {
 
     /**
      * Installs the `install` entries of the [plan], of the [PLAN], into the dependency [directory],
-     * with the [installerOptions] given to the installer, e.g. its index.
+     * with [uv], or pip, if `null`, with the [installerOptions], e.g. its index.
      *
-     * The `requirement` entries, of the distributions installed in the directory, become constraints,
-     * except the ones of the distributions which the dependencies resolve to,
-     * as the resolution of the installer replaces them, if needed, honoring the requirements of their new versions,
-     * so they are resolved first, but only when there are such requirements.
+     * The `requirement` entries, of the distributions installed in the directory, all become constraints,
+     * as only the declared dependencies are known to be replaced before the installation,
+     * while the installer can replace any other distribution in its resolution, or backtrack to one,
+     * and a constraint on a distribution the installation does not need has no effect.
      *
      * @throws PythonDependencyException if the dependencies cannot be installed.
      */
-    fun install(plan: List<Pair<String, String>>, directory: String, installerOptions: List<String> = emptyList()) {
+    fun install(
+        plan: List<Pair<String, String>>,
+        directory: String,
+        installerOptions: List<String> = emptyList(),
+        uv: String? = findOnPath("uv")
+    ) {
         val missing = plan.filter { it.first == "install" }.map { it.second }
         if (missing.isEmpty()) return
         val pinned = plan.filter { it.first == "constraint" }.map { it.second }
@@ -184,105 +189,49 @@ internal object PythonDependencies {
             val (dependent, version, name, specifier) = it.second.split(' ')
             InstalledRequirement(dependent, version, name, specifier)
         }
-        val uv = findOnPath("uv")
-        val protecting = if (requirements.isEmpty()) emptyList() else {
-            val resolved = resolve(missing, pinned, directory, uv, installerOptions)
-            requirements.filter { it.dependent !in resolved && it.name in resolved }
-        }
-        val constraints = pinned + protecting.groupBy { it.name }.map { (name, requirements) ->
+        val constraints = pinned + requirements.groupBy { it.name }.map { (name, requirements) ->
             name + requirements.joinToString(",") { it.specifier }
         }
-        val (exitCode, output) = withConstraints(constraints) { constraintsFile ->
-            runProcess(
-                if (uv != null) {
-                    listOf(
-                        uv, "pip", "install", "--quiet",
-                        "--python", PythonEnvironment.executable,
-                        "--target", directory,
-                        "--constraints", constraintsFile
-                    )
-                } else {
-                    listOf(
-                        PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
-                        "--disable-pip-version-check", "--no-input", "--upgrade",
-                        "--target", directory,
-                        "--constraint", constraintsFile
-                    )
-                } + installerOptions + missing
+        fun installCommand(constraintsFile: String, dryRun: Boolean = false) = if (uv != null) {
+            listOf(
+                uv, "pip", "install", "--quiet",
+                "--python", PythonEnvironment.executable,
+                "--target", directory,
+                "--constraints", constraintsFile
             )
-        }
-        if (exitCode != 0) {
-            val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
-            // resolved without the requirements of the installed distributions, so these are the conflict
-            throw PythonDependencyException(
-                if (protecting.isEmpty()) message else message + "\n" +
-                    "The dependencies conflict with the requirements of the distributions " +
-                    "installed in the dependency directory $directory:\n" +
-                    protecting.joinToString("") { "  $it\n" } +
-                    "Installing them would break these distributions, so they need another dependency directory, " +
-                    "see PythonEnvironment.dependencyDirectory, " +
-                    "or the dependency directory can be deleted, when no Python uses it, to start from scratch."
+        } else {
+            listOf(
+                PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
+                "--disable-pip-version-check", "--no-input", "--upgrade",
+                "--target", directory,
+                "--constraint", constraintsFile
             )
-        }
+        } + (if (dryRun) listOf("--dry-run") else emptyList()) + installerOptions + missing
+
+        val (exitCode, output) = withConstraints(constraints) { runProcess(installCommand(it)) }
+        if (exitCode == 0) return
+        val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
+        // the failure is a conflict with the requirements of the installed distributions,
+        // only if the dependencies can be installed without them, and not e.g. because of the network
+        val conflict = requirements.isNotEmpty() &&
+            withConstraints(pinned) { runProcess(installCommand(it, dryRun = true)) }.exitCode == 0
+        if (!conflict) throw PythonDependencyException(message)
+        val reported = output.lowercase().replace(separators, "-")
+        val conflicting = requirements.filter { it.name in reported }.ifEmpty { requirements }
+        throw PythonDependencyException(
+            message + "\n" +
+                "The dependencies conflict with the requirements of the distributions " +
+                "installed in the dependency directory $directory:\n" +
+                conflicting.joinToString("") { "  $it\n" } +
+                "To upgrade an installed distribution as well, declare it as a dependency too. " +
+                "Otherwise, installing the dependencies would break these distributions, " +
+                "so they need another dependency directory, see PythonEnvironment.dependencyDirectory, " +
+                "or the dependency directory can be deleted, when no Python uses it, to start from scratch."
+        )
     }
 
-    /**
-     * The canonical names of the distributions which the [missing] dependencies resolve to,
-     * with the [pinned] constraints,
-     * without installing them, or the dependency directory, which pip ignores with `--target` anyway.
-     */
-    private fun resolve(
-        missing: List<String>,
-        pinned: List<String>,
-        directory: String,
-        uv: String?,
-        installerOptions: List<String>
-    ): Set<String> {
-        val (exitCode, output, error) = withConstraints(pinned) { constraintsFile ->
-            if (uv != null) {
-                runProcess(
-                    listOf(
-                        uv, "pip", "compile", "-", "--quiet", "--no-header", "--no-annotate",
-                        "--python", PythonEnvironment.executable,
-                        "--constraints", constraintsFile
-                    ) + installerOptions,
-                    input = missing.joinToString("\n"),
-                    mergeErrorStream = false
-                )
-            } else {
-                val (exitCode, report, error) = runProcess(
-                    listOf(
-                        PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
-                        "--disable-pip-version-check", "--no-input", "--dry-run", "--report", "-",
-                        "--target", directory,
-                        "--constraint", constraintsFile
-                    ) + installerOptions + missing,
-                    mergeErrorStream = false
-                )
-                if (exitCode != 0) ProcessResult(exitCode, report, error) else runProcess(
-                    listOf(PythonEnvironment.executable, "-c", REPORTED_NAMES),
-                    input = report,
-                    mergeErrorStream = false
-                )
-            }
-        }
-        if (exitCode != 0) {
-            throw PythonDependencyException(
-                "Cannot install Python dependencies ${missing.joinToString(", ")}:\n" +
-                    listOf(output, error).filter { it.isNotEmpty() }.joinToString("\n")
-            )
-        }
-        // uv lists name==version, or name @ url, pip only the name
-        return output.lines()
-            .mapNotNull { Regex("^[A-Za-z0-9][A-Za-z0-9._-]*").find(it)?.value }
-            .map { it.lowercase().replace(Regex("[-_.]+"), "-") }
-            .toSet()
-    }
-
-    /** The names of the distributions to install, in the pip installation report on the standard input. */
-    @Language("python")
-    private const val REPORTED_NAMES =
-        "import json, sys; print(*(it['metadata']['name'] for it in json.load(sys.stdin)['install']), sep='\\n')"
+    /** The separators of the words of a distribution name, which a canonical name replaces with `-`. */
+    private val separators = Regex("[-_.]+")
 
     private fun <T> withConstraints(constraints: List<String>, block: (constraintsFile: String) -> T): T {
         val constraintsFile = createTempFile("python-constraints", ".txt")
@@ -294,7 +243,7 @@ internal object PythonDependencies {
         }
     }
 
-    private fun findOnPath(name: String): String? = System.getenv("PATH")
+    fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
         ?.flatMap { listOf(Path(it, name), Path(it, "$name.exe")) }
         ?.firstOrNull { it.isExecutable() }
@@ -309,10 +258,11 @@ internal object PythonDependencies {
      * the distributions to keep in their versions, as `constraint <name>==<version>`,
      * and the requirements of the distributions of the dependency directory,
      * as `requirement <dependent> <version> <name> <specifier>`, with canonical names,
-     * which [install] turns into constraints, or exits with the error.
-     * Without packaging, to read the requirements, there are none,
-     * and with several `dist-info` directories of a distribution, left behind by pip, there are none of it,
-     * as which of them describes the installed files is unknown.
+     * except the ones of the declared dependencies, which [install] turns into constraints,
+     * or exits with the error.
+     * Without packaging, to read the requirements, there are none.
+     * Of several `dist-info` directories of a distribution, left behind by `pip install --target`,
+     * the one whose `RECORD` hashes match the files on disk is read, and none if it is not the only one.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
@@ -324,7 +274,7 @@ internal object PythonDependencies {
         # before any import which can fail, so that the input is always read
         request = json.loads(sys.stdin.read())
 
-        import importlib, importlib.metadata as metadata, os, re
+        import base64, hashlib, importlib, importlib.metadata as metadata, os, re
 
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
@@ -385,6 +335,19 @@ internal object PythonDependencies {
                     # an invalid requirement, or marker, of an installed distribution cannot be honored anyway
                     pass
 
+        def is_installed(distribution):
+            # all the files with a hash in its RECORD are on disk, with that hash
+            hashed = [file for file in distribution.files or [] if file.hash]
+            for file in hashed:
+                try:
+                    content = file.locate().read_bytes()
+                except OSError:
+                    return False
+                digest = hashlib.new(file.hash.mode, content).digest()
+                if base64.urlsafe_b64encode(digest).rstrip(b"=").decode() != file.hash.value:
+                    return False
+            return bool(hashed)
+
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
             distributions_of = metadata.packages_distributions()
@@ -402,14 +365,18 @@ internal object PythonDependencies {
                 print("constraint", f"{name}=={version}")
             if Requirement is not None:
                 kept = {canonicalize_name(name) for name in constraints}
+                # replaced by the installation, so the requirements of their installed versions do not matter
+                declared = {canonicalize_name(Requirement(dependency).name) for dependency in missing}
                 installed = {}
                 for distribution in metadata.distributions(path=[directory]):
                     name = distribution.metadata["Name"]
-                    if name:
+                    if name and canonicalize_name(name) not in declared:
                         installed.setdefault(canonicalize_name(name), []).append(distribution)
                 for name, distributions in installed.items():
-                    # pip --target leaves the dist-info of a replaced version behind,
-                    # and which of them describes the installed files is unknown
+                    if len(distributions) > 1:
+                        # pip --target leaves the dist-info of a replaced version behind,
+                        # with the hashes of the files since overwritten by the installed version
+                        distributions = [it for it in distributions if is_installed(it)]
                     if len(distributions) == 1:
                         distribution = distributions[0]
                         for requirement in requirements_of(distribution):
