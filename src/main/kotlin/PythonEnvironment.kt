@@ -223,28 +223,30 @@ internal fun runProcess(
             // the input is written, and the output read, on their own threads, as either of them can block,
             // when the process writes more than the pipe buffer to its output before consuming all its input;
             // the calling thread waits for the process, so that it can be interrupted
-            val writer = thread(name = "process-stdin", isDaemon = true) {
+            val writer = if (input == null) {
+                process.outputStream.close()
+                null
+            } else thread(name = "process-stdin", isDaemon = true) {
                 try {
-                    process.outputStream.bufferedWriter().use { writer ->
-                        if (input != null) writer.write(input)
-                    }
+                    process.outputStream.bufferedWriter().use { it.write(input) }
                 } catch (_: IOException) {
                     // a broken pipe, when the process ends, or closes its input, without reading all of it,
                     // e.g. on a failure, which its exit code and output tell, not the broken pipe
                 }
             }
             var output: String? = null
-            var outputFailure: IOException? = null
+            var outputFailure: Throwable? = null
             val reader = thread(name = "process-stdout", isDaemon = true) {
                 try {
                     output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-                } catch (e: IOException) {
+                } catch (e: Throwable) {
+                    // e.g. an OutOfMemoryError, rethrown on the calling thread
                     outputFailure = e
                 }
             }
             val exitCode = process.waitFor()
             reader.join()
-            writer.join()
+            writer?.join()
             outputFailure?.let { throw it }
             return ProcessResult(exitCode, output!!, errorFile?.readText()?.trim() ?: "")
         } finally {

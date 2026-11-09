@@ -157,17 +157,19 @@ class PythonEnvironmentTest {
     @Test
     fun `should run process writing much to stdout before consuming its stdin`() {
         // given
-        val input = "x".repeat(10_000_000)
+        val size = 10_000_000
 
         // when
-        val result = runProcess(
+        val (exitCode, output) = runProcess(
             listOf(venvPython, "-c", "import shutil, sys; shutil.copyfileobj(sys.stdin, sys.stdout)"),
-            input = input
+            input = "x".repeat(size)
         )
 
         // then
-        assert(result.exitCode == 0)
-        assert(result.output == input)
+        // counted, as power-assert would render the whole output on failure
+        val length = output.length
+        val notEchoed = output.count { it != 'x' }
+        assert(exitCode == 0 && length == size && notEchoed == 0)
     }
 
     @Test
@@ -199,7 +201,9 @@ class PythonEnvironmentTest {
         }
 
         try {
-            while (!pidFile.exists()) Thread.sleep(10)
+            // the runner checked, so that the test fails, instead of waiting forever, when it fails to start Python
+            while (!pidFile.exists() && runner.isAlive) Thread.sleep(10)
+            assert(pidFile.exists())
             val pid = pidFile.readText().toLong()
 
             // when
