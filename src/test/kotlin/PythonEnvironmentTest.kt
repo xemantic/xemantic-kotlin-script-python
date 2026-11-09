@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import java.io.IOException
+import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermissions
 import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
@@ -65,6 +66,99 @@ class PythonEnvironmentTest {
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe Python whose sitecustomize writes lines to stdout`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(
+            directory,
+            "print('sitecustomize noise')\nprint('more noise')\n"
+        )
+        val expected = PythonEnvironment.probePython(venvPython)
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe == expected)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe Python whose sitecustomize writes to stdout without trailing newline`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(
+            directory,
+            "import sys\nsys.stdout.write('noise without newline')\n"
+        )
+        val expected = PythonEnvironment.probePython(venvPython)
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe == expected)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe Python with empty executable`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        // Python sets an empty sys.executable when it cannot tell the path of its executable
+        val python = pythonWithSitecustomize(directory, "import sys\nsys.executable = ''\n")
+        val expected = PythonEnvironment.probePython(venvPython)
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe == expected.copy(executable = ""))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should fail clearly on probe output without values`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.parseProbeOutput("unexpected output")
+        }
+
+        // then
+        assert("unexpected output" in exception.message!!)
+    }
+
+    /**
+     * A shim of the venv Python in the [directory], with a `sitecustomize` module of the [code] on its `PYTHONPATH`,
+     * which Python imports at startup, before the code it runs.
+     */
+    private fun pythonWithSitecustomize(directory: Path, code: String): String {
+        val sitePath = directory.resolve("site").createDirectory()
+        sitePath.resolve("sitecustomize.py").writeText(code)
+        val python = directory.resolve("python")
+        python.writeText(
+            """
+            |#!/bin/sh
+            |PYTHONPATH="$sitePath" exec "$venvPython" "${'$'}@"
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+        return python.toString()
     }
 
     @OptIn(ExperimentalPathApi::class)

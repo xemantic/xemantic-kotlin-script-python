@@ -128,16 +128,58 @@ public object PythonEnvironment {
             "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
                 result.failureOutput
         }
-        val (executable, cacheTag, prefix, jepLocation) = result.output.lines()
+        return parseProbeOutput(result.output)
+    }
+
+    /**
+     * The [PythonProbe] of the standard [output] of [probeCommand].
+     *
+     * The values are taken only from between the last [PROBE_BEGIN] and the following [PROBE_END] line,
+     * as anything else run by Python, e.g. a `sitecustomize` module or a `.pth` file,
+     * can write to the standard output as well, before or after them.
+     *
+     * @throws IllegalStateException if the [output] has no such values.
+     */
+    internal fun parseProbeOutput(output: String): PythonProbe {
+        // the output is trimmed, also of the newline before the first line
+        val lines = "\n$output"
+        val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
+        val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
+        val values = if (begin == null || end == null) null else lines.substring(begin, end).split('\u0000')
+        check(values != null && values.size == 4) {
+            "Cannot read the values of the Python environment probe from its output:\n$output"
+        }
+        val (executable, cacheTag, prefix, jepLocation) = values
         return PythonProbe(executable, cacheTag, prefix, jepLocation)
     }
 
-    /** The command of [probePython]. */
+    /**
+     * The command of [probePython].
+     *
+     * It writes its values, separated by NUL, which no path can contain, between the [PROBE_BEGIN] and [PROBE_END] lines,
+     * with an empty line before them, in case the standard output written before does not end with a newline,
+     * and as bytes, without the newline translation of the text mode, e.g. on Windows.
+     */
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
-        "import importlib.util, sys; print(sys.executable, sys.implementation.cache_tag, sys.prefix, " +
-            "importlib.util.find_spec('jep').submodule_search_locations[0], sep='\\n')"
+        """
+        |import importlib.util, sys
+        |values = [
+        |    sys.executable,
+        |    sys.implementation.cache_tag,
+        |    sys.prefix,
+        |    importlib.util.find_spec('jep').submodule_search_locations[0],
+        |]
+        |payload = '\0'.join('' if value is None else str(value) for value in values)
+        |sys.stdout.flush()
+        |sys.stdout.buffer.write(('\n$PROBE_BEGIN\n' + payload + '\n$PROBE_END\n').encode('utf-8'))
+        |sys.stdout.flush()
+        |""".trimMargin()
     )
+
+    private const val PROBE_BEGIN = "--- xemantic-kotlin-script-python probe begin ---"
+
+    private const val PROBE_END = "--- xemantic-kotlin-script-python probe end ---"
 
     private const val DEPENDENCY_DIRECTORY_PROPERTY = "xemantic.kotlin.script.python.dependencyDirectory"
 
