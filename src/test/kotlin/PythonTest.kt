@@ -501,6 +501,33 @@ class PythonTest {
     }
 
     @Test
+    fun `should widen arrays in cycle holding repr of proxy`() {
+        // given
+        val b = arrayOfNulls<Cloneable>(2)
+        val a = arrayOfNulls<Array<Cloneable?>>(1)
+        b[0] = a
+        a[0] = b
+        python["b"] = b
+        python.exec(
+            """
+            from jep import jproxy
+            class C:
+                def __repr__(self):
+                    return 'C'
+            b[1] = jproxy(C(), ['java.lang.Cloneable'])
+            """.trimIndent()
+        )
+
+        // when
+        val result = python["b"]
+
+        // then
+        assert(result is Array<*> && result[1] == "C")
+        val nested = (result as Array<*>)[0]
+        assert(nested is Array<*> && nested.single() === result)
+    }
+
+    @Test
     fun `should widen array holding arrays of collections copied to another collection type`() {
         // given
         python["a"] = arrayOf<Any?>(arrayOf(java.util.TreeSet(listOf("t"))), arrayOf(java.util.ArrayDeque(listOf("d"))))
@@ -550,7 +577,8 @@ class PythonTest {
         // then
         assert(runnables is List<*> && runnables.single().toString().startsWith("<function <lambda> at "))
         assert(map is Map<*, *> && (map["runnables"] as List<*>).single().toString().startsWith("<function <lambda> at "))
-        // the holder is returned as it is, as Jep passes a Java object through
+        // the holder is returned as it is, as Jep passes a Java object through,
+        // still holding the proxies bound to the thread of Python, which is not intended, see #38
         assert(got === holder)
     }
 

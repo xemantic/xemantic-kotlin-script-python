@@ -161,6 +161,7 @@ public class Python private constructor(
      * like a Python callable of `eval<Runnable>("lambda: 1")`, as its `repr` is not a [T].
      * Such a proxy is not returned, as calling it from another thread fails,
      * and dispatching its calls to the thread of this `Python` would fail once it is closed.
+     * It is rejected also when called by a Kotlin function, which is called from Python, on the thread of this `Python`.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
@@ -184,6 +185,7 @@ public class Python private constructor(
      * like a Python callable of `eval("lambda: 1", Runnable::class.java)`, as its `repr` is not of the [type].
      * Such a proxy is not returned, as calling it from another thread fails,
      * and dispatching its calls to the thread of this `Python` would fail once it is closed.
+     * It is rejected also when called by a Kotlin function, which is called from Python, on the thread of this `Python`.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T = call {
@@ -386,6 +388,9 @@ public class Python private constructor(
         /** The class of the copy of each array, by its identity, decided before copying it. */
         private val arrayCopyClasses = IdentityHashMap<Array<*>, Class<*>>()
 
+        /** The arrays whose class of the copy is being decided, to detect a cycle. */
+        private val deciding = Collections.newSetFromMap(IdentityHashMap<Array<*>, Boolean>())
+
         /**
          * Returns the class of the copy of the [array]:
          * its own class, widened by [copyType], so that no array of a [PyObject] type is left, even an empty one,
@@ -393,22 +398,33 @@ public class Python private constructor(
          * then an array of [Any] of the same dimensions, like `Object[][]`, or `Object[]` as the last resort.
          *
          * It is decided before copying the array, so that the copy can contain itself.
-         * An array reached again while deciding, i.e. containing itself, is assumed to keep its class,
-         * which is safe, as its component type can hold an array, so also `Object[]`.
+         * An array reached again while deciding, i.e. in a cycle, gets a class not depending on its elements,
+         * as the arrays deciding in the meantime rely on it: its own one, if it can hold a copy of any element,
+         * like `Object[]` or `Serializable[]`, or `Object[]` otherwise.
          */
         private fun arrayCopyClass(array: Array<*>): Class<*> {
             arrayCopyClasses[array]?.let { return it }
             val declared = copyType(array.javaClass)
-            arrayCopyClasses[array] = declared
-            val copyClass = when {
+            if (!deciding.add(array)) {
+                return (if (canHoldAnyCopy(declared.componentType)) declared else Array<Any?>::class.java)
+                    .also { arrayCopyClasses[array] = it }
+            }
+            val decided = when {
                 // the common case, which can hold anything, so that its elements are not checked
                 declared == Array<Any?>::class.java || canHoldCopies(declared, array) -> declared
                 else -> objectArrayClass(dimensions(declared)).takeIf { canHoldCopies(it, array) }
                     ?: Array<Any?>::class.java
             }
-            arrayCopyClasses[array] = copyClass
-            return copyClass
+            deciding.remove(array)
+            // already decided, if reached again in a cycle
+            return arrayCopyClasses.getOrPut(array) { decided }
         }
+
+        /** Whether the [type] can hold any copy of an element, which is not copied as it is. */
+        private fun canHoldAnyCopy(type: Class<*>): Boolean = listOf(
+            String::class.java, ArrayList::class.java, LinkedHashSet::class.java,
+            LinkedHashMap::class.java, Array<Any?>::class.java
+        ).all { type.isAssignableFrom(it) }
 
         private fun canHoldCopies(arrayClass: Class<*>, array: Array<*>): Boolean = array.all { element ->
             copyClass(element)?.let { arrayClass.componentType.isAssignableFrom(it) } ?: true
