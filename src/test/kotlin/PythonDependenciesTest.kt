@@ -22,6 +22,11 @@ import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import java.lang.reflect.Proxy
 import kotlin.concurrent.thread
+import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.createDirectory
+import kotlin.io.path.createTempDirectory
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 
@@ -304,6 +309,56 @@ class PythonDependenciesTest {
 
         // then
         assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should plan in working directory with modules shadowing the ones it imports`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val workingDirectory = createTempDirectory("python-shadowing")
+        for (module in listOf("json", "tomllib", "tomli", "importlib", "re")) {
+            workingDirectory.resolve("$module.py").writeText("raise SystemExit('shadowing $module imported')\n")
+        }
+
+        try {
+            // when
+            val (exitCode, output) = runProcess(
+                PythonDependencies.planCommand(directory),
+                input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}""",
+                directory = workingDirectory
+            )
+
+            // then
+            assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+        } finally {
+            workingDirectory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should run pip in working directory with pip package shadowing it`() {
+        // given
+        PythonEnvironment.initialize()
+        val workingDirectory = createTempDirectory("python-shadowing")
+        val pip = workingDirectory.resolve("pip").createDirectory()
+        pip.resolve("__init__.py").writeText("raise SystemExit('shadowing pip imported')\n")
+        pip.resolve("__main__.py").writeText("raise SystemExit('shadowing pip run')\n")
+
+        try {
+            // when
+            val (exitCode, output) = runProcess(
+                PythonDependencies.pipCommand("--version"),
+                directory = workingDirectory
+            )
+
+            // then
+            assert(exitCode == 0 && output.startsWith("pip "))
+        } finally {
+            workingDirectory.deleteRecursively()
+        }
     }
 
 }

@@ -23,6 +23,7 @@ import java.nio.file.attribute.PosixFilePermissions
 import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectory
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
@@ -92,6 +93,29 @@ class PythonEnvironmentTest {
             assert("shim failure on stdout" in message && "shim failure on stderr" in message)
         } finally {
             directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe Python in working directory with jep package shadowing it`() {
+        // given
+        val workingDirectory = createTempDirectory("python-shadowing")
+        workingDirectory.resolve("jep").createDirectory().resolve("__init__.py").writeText("")
+        val expected = runProcess(PythonEnvironment.probeCommand(venvPython), mergeErrorStream = false)
+
+        try {
+            // when
+            val probe = runProcess(
+                PythonEnvironment.probeCommand(venvPython),
+                mergeErrorStream = false,
+                directory = workingDirectory
+            )
+
+            // then
+            assert(probe == expected)
+        } finally {
+            workingDirectory.deleteRecursively()
         }
     }
 

@@ -134,13 +134,23 @@ internal object PythonDependencies {
     fun plan(metadata: String, directory: String, imported: List<String>): List<Pair<String, String>> {
         // on the standard input, as the command line would exceed the OS limit after importing many modules
         val input = """{"metadata": ${metadata.toJson()}, "modules": [${imported.joinToString(", ") { it.toJson() }}]}"""
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", PLAN, directory),
-            input = input
-        )
+        val (exitCode, output) = runProcess(planCommand(directory), input = input)
         if (exitCode != 0) throw PythonDependencyException(output)
         return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
     }
+
+    /** The command running the [PLAN] for the dependency [directory]. */
+    fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
+
+    /**
+     * The command running `pip` of the environment with the [arguments],
+     * like `python -m pip`, which would import from the working directory, also `pip` itself.
+     */
+    fun pipCommand(vararg arguments: String): List<String> = pythonCommand(
+        PythonEnvironment.executable,
+        "import runpy\nrunpy.run_module('pip', run_name='__main__', alter_sys=True)",
+        *arguments
+    )
 
     /** This string as a JSON string, with every character outside printable ASCII escaped, so it is ASCII only. */
     private fun String.toJson(): String = buildString(length + 2) {
@@ -169,8 +179,8 @@ internal object PythonDependencies {
                     "--constraints", constraintsFile.toString()
                 )
             } else {
-                listOf(
-                    PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
+                pipCommand(
+                    "install", "--quiet",
                     "--disable-pip-version-check", "--no-input", "--upgrade",
                     "--target", directory,
                     "--constraint", constraintsFile.toString()
