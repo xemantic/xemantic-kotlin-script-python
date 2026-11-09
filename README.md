@@ -36,14 +36,22 @@ An environment without `pip`, like the one of `uv venv`, can get `tomli` with `p
 
 Jep is a native CPython extension:
 the Java library comes from Maven Central,
-but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use:
+but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use.
+An externally managed Python ([PEP 668](https://peps.python.org/pep-0668/)),
+like the one of Homebrew or of most Linux distributions,
+refuses `pip install`, so install it into a virtual environment:
 
 ```shell
-pip install jep==4.3.2
+python3 -m venv ~/.venvs/jep
+~/.venvs/jep/bin/python -m pip install jep==4.3.2
 ```
 
+and point to it with `VIRTUAL_ENV=~/.venvs/jep`, or with `PythonEnvironment.pythonExecutable`.
+On Windows, its Python is `Scripts\python.exe` of the virtual environment.
+
 The version of the `jep` Python package must match the version of the `org.ninia:jep` Java library.
-Building it requires a JDK, found through `JAVA_HOME`.
+Without a wheel matching the Python, pip builds it from its source,
+which requires a C compiler and a JDK, found through `JAVA_HOME`.
 
 The Python executable is, in this order:
 1. `PythonEnvironment.pythonExecutable`, if set before the first use of `Python`,

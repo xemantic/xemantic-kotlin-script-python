@@ -29,6 +29,7 @@ import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.Properties
 import kotlin.concurrent.thread
 import kotlin.io.path.Path
 import kotlin.io.path.createTempFile
@@ -47,8 +48,8 @@ import kotlin.io.path.readText
  * 2. the virtual environment of the `VIRTUAL_ENV` environment variable,
  * 3. `python3` on the `PATH`.
  *
- * The `jep` package must be installed in it, with `pip install jep`,
- * in the version of the `org.ninia:jep` library,
+ * The `jep` package must be installed in it, in the version of the `org.ninia:jep` library,
+ * e.g. with `pip install jep==4.3.2`, into a virtual environment, if the Python is externally managed,
  * and the Python code imports the modules from the same paths as this executable,
  * e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
  */
@@ -96,12 +97,7 @@ public object PythonEnvironment {
         if (initialized) return
         val python = (pythonExecutable ?: defaultPythonExecutable()).toString()
         val (executable, cacheTag, prefix, jepLocation, probeError) = probePython(python)
-        val jepDir = Path(jepLocation)
-        val library = jepDir.listDirectoryEntries().firstOrNull {
-            it.name.startsWith("libjep.") || it.name == "jep.dll"
-        } ?: throw IllegalStateException(
-            "No native Jep library in $jepDir, reinstall jep with: $python -m pip install jep"
-        )
+        val library = findJepLibrary(Path(jepLocation), python)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         this.executable = executable
@@ -120,6 +116,32 @@ public object PythonEnvironment {
         }
         initialized = true
     }
+
+    /**
+     * The version of the `org.ninia:jep` library, which the `jep` package must match,
+     * read from the `pom.properties` of its jar, as its manifest has no version,
+     * or `null` if the jar does not have it, e.g. repackaged.
+     */
+    internal val jepVersion: String? = try {
+        MainInterpreter::class.java.getResourceAsStream("/META-INF/maven/org.ninia/jep/pom.properties")
+            ?.use { Properties().apply { load(it) } }
+            ?.getProperty("version")
+    } catch (_: IOException) {
+        null
+    }
+
+    /**
+     * The native library of Jep in the [jepDirectory], the one of the `jep` package of the [python] executable.
+     *
+     * @throws IllegalStateException if there is none.
+     */
+    internal fun findJepLibrary(jepDirectory: Path, python: String): Path =
+        jepDirectory.listDirectoryEntries().firstOrNull {
+            it.name.startsWith("libjep.") || it.name == "jep.dll"
+        } ?: throw IllegalStateException(
+            "No native Jep library in $jepDirectory, the jep package of $python is broken.\n" +
+                jepInstallAdvice(python)
+        )
 
     /**
      * The configuration of the embedded CPython of the Python [executable].
@@ -172,10 +194,8 @@ public object PythonEnvironment {
         // only the probe's own check blames jep, any other failure is the one of Python itself,
         // e.g. of a pyenv shim of a version which is not installed
         check(result.exitCode != PROBE_JEP_MISSING_EXIT_CODE) {
-            withOutput(
-                "Cannot find the jep package of $python, install it with: $python -m pip install jep",
-                result.failureOutput
-            )
+            withOutput("Cannot find the jep package of $python.", result.failureOutput) +
+                "\n" + jepInstallAdvice(python)
         }
         check(result.exitCode == 0) {
             withOutput("Cannot run Python $python, it failed with exit code ${result.exitCode}", result.failureOutput)
@@ -320,6 +340,33 @@ internal fun pythonCommand(python: String, code: String, vararg arguments: Strin
     "import sys\nif sys.path[:1] == ['']: del sys.path[0]\n$code",
     *arguments
 )
+
+/**
+ * How to install the `jep` package of the [jepVersion], for the [python] executable,
+ * into a virtual environment, as pip refuses to install into an externally managed Python (PEP 668),
+ * e.g. the one of Homebrew or of most Linux distributions,
+ * telling what building it from its source needs, when no wheel of jep matches the Python.
+ */
+internal fun jepInstallAdvice(
+    python: String,
+    jepVersion: String? = PythonEnvironment.jepVersion,
+    javaHome: String? = System.getenv("JAVA_HOME"),
+    windows: Boolean = System.getProperty("os.name").startsWith("Windows")
+): String {
+    val venv = if (windows) "%USERPROFILE%\\.venvs\\jep" else "~/.venvs/jep"
+    val venvPython = if (windows) "$venv\\Scripts\\python.exe" else "$venv/bin/python"
+    val quotedPython = if (' ' in python) "\"$python\"" else python
+    val jep = if (jepVersion == null) "jep" else "jep==$jepVersion"
+    return listOf(
+        if (jepVersion == null) "Install jep, in the version of the org.ninia:jep library, into a virtual environment:"
+        else "Install jep $jepVersion, the version of the org.ninia:jep library, into a virtual environment:",
+        "  $quotedPython -m venv $venv",
+        "  $venvPython -m pip install $jep",
+        "then point to it with VIRTUAL_ENV=$venv, or with PythonEnvironment.pythonExecutable.",
+        "Without a wheel matching the Python, jep is built from its source, " +
+            "needing a C compiler and a JDK (JAVA_HOME: ${javaHome ?: "not set"})."
+    ).joinToString("\n")
+}
 
 /**
  * The encoding of the file paths of the JVM, the one of the locale on POSIX, `sun.jnu.encoding`,

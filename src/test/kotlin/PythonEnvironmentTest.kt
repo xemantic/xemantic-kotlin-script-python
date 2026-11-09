@@ -43,6 +43,9 @@ class PythonEnvironmentTest {
 
     private val venvPython = Path(System.getenv("VIRTUAL_ENV"), "bin", "python").toString()
 
+    /** The version of `org.ninia:jep` in the version catalog, passed by the build. */
+    private val catalogJepVersion = System.getProperty("xemantic.kotlin.script.python.test.jepVersion")
+
     @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should probe Python which writes to stderr, keeping it`() {
@@ -406,14 +409,84 @@ class PythonEnvironmentTest {
             // then
             val message = exception.message!!
             // the probe tells that jep is missing, instead of failing with a traceback
+            // and how to install it where pip is allowed to, pinned to the version of the org.ninia:jep library
             assert(
                 message.startsWith("Cannot find the jep package of $python") &&
-                    "pip install jep" in message &&
+                    "pip install jep==$catalogJepVersion" in message &&
+                    "$python -m venv" in message &&
+                    "VIRTUAL_ENV=" in message &&
+                    "PythonEnvironment.pythonExecutable" in message &&
+                    "JAVA_HOME" in message &&
                     "Traceback" !in message &&
                     !message.endsWith("\n")
             )
         } finally {
             directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should read version of org ninia jep library matching version catalog`() {
+        // when
+        val version = PythonEnvironment.jepVersion
+
+        // then
+        assert(version == catalogJepVersion)
+    }
+
+    @Test
+    fun `should advise installing jep into virtual environment on Windows`() {
+        // when
+        val advice = jepInstallAdvice(
+            python = "C:\\Python313\\python.exe",
+            jepVersion = "4.3.2",
+            javaHome = "C:\\Program Files\\Java\\jdk-21",
+            windows = true
+        )
+
+        // then
+        assert(
+            "C:\\Python313\\python.exe -m venv %USERPROFILE%\\.venvs\\jep" in advice &&
+                "%USERPROFILE%\\.venvs\\jep\\Scripts\\python.exe -m pip install jep==4.3.2" in advice &&
+                "VIRTUAL_ENV=%USERPROFILE%\\.venvs\\jep" in advice &&
+                "JAVA_HOME: C:\\Program Files\\Java\\jdk-21" in advice
+        )
+    }
+
+    @Test
+    fun `should advise installing jep without version when version of library is unknown`() {
+        // when
+        val advice = jepInstallAdvice(python = "python3", jepVersion = null, javaHome = null, windows = false)
+
+        // then
+        assert(
+            "~/.venvs/jep/bin/python -m pip install jep\n" in advice &&
+                "the version of the org.ninia:jep library" in advice &&
+                "JAVA_HOME: not set" in advice
+        )
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should advise installing jep when its native library is missing`() {
+        // given
+        val jepDirectory = createTempDirectory("jep")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.findJepLibrary(jepDirectory, "python3")
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                message.startsWith("No native Jep library in $jepDirectory") &&
+                    "pip install jep==$catalogJepVersion" in message &&
+                    "python3 -m venv" in message
+            )
+        } finally {
+            jepDirectory.deleteRecursively()
         }
     }
 
