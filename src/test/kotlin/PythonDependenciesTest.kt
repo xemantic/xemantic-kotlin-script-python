@@ -57,30 +57,17 @@ class PythonDependenciesTest {
         sources.deleteRecursively()
     }
 
-    private fun run(
-        command: List<String>,
-        environment: Map<String, String> = emptyMap()
-    ): Pair<Int, String> {
-        val process = ProcessBuilder(command)
-            .redirectErrorStream(true)
-            .apply { environment().putAll(environment) }
-            .start()
-        process.outputStream.close()
-        val output = process.inputStream.bufferedReader().use { it.readText() }.trim()
-        return process.waitFor() to output
-    }
-
     private fun pipInstall(
         vararg requirements: String,
         environment: Map<String, String> = emptyMap()
-    ): Pair<Int, String> = run(
+    ): ProcessResult = runProcess(
         PythonDependencies.pipInstallCommand(python, directory.toString(), constraints.toString(), requirements.toList()),
-        environment
+        environment = environment
     )
 
     /** Runs the [code] with the dependency directory, as `directory`, first on `sys.path`. */
     private fun pythonOfDirectory(@Language("python") code: String): String {
-        val (exitCode, output) = run(
+        val (exitCode, output) = runProcess(
             listOf(
                 python, "-c",
                 "import sys; directory = sys.argv[1]; sys.path.insert(0, directory)\n$code",
@@ -403,7 +390,7 @@ class PythonDependenciesTest {
         val (exitCode, output) = pipInstall("requests")
 
         // then
-        assert(installed.first == 0)
+        assert(installed.exitCode == 0)
         assert(exitCode == 0, output)
         assert(directory.resolve("requests").exists())
         assert(idnaModule.fileKey() == idnaKey)
@@ -422,7 +409,7 @@ class PythonDependenciesTest {
         val (exitCode, output) = pipInstall("idna>=3.7")
 
         // then
-        assert(installed.first == 0)
+        assert(installed.exitCode == 0)
         assert(exitCode == 0, output)
         val versions = pythonOfDirectory(
             """
@@ -448,7 +435,7 @@ class PythonDependenciesTest {
         val (exitCode, output) = pipInstall("jaraco.context")
 
         // then
-        assert(installed.first == 0)
+        assert(installed.exitCode == 0)
         assert(exitCode == 0, output)
         assert(directory.resolve("jaraco").resolve("functools").exists())
         assert(directory.resolve("jaraco").resolve("context").exists())
@@ -479,7 +466,7 @@ class PythonDependenciesTest {
             listOf("add", "."),
             listOf("commit", "--quiet", "-m", "subpkg")
         ).forEach { command ->
-            val (gitExitCode, gitOutput) = run(git + command)
+            val (gitExitCode, gitOutput) = runProcess(git + command)
             assert(gitExitCode == 0, gitOutput)
         }
 
@@ -500,7 +487,7 @@ class PythonDependenciesTest {
         // given
         val wheels = sources.resolve("wheels").createDirectories()
         val wheel = wheels.resolve("authpkg-1.0-py3-none-any.whl")
-        val (wheelExitCode, wheelOutput) = run(listOf(python, "-c", BUILD_WHEEL, wheel.toString()))
+        val (wheelExitCode, wheelOutput) = runProcess(listOf(python, "-c", BUILD_WHEEL, wheel.toString()))
         assert(wheelExitCode == 0, wheelOutput)
         val server = ProcessBuilder(python, "-c", AUTHENTICATING_SERVER, wheels.toString(), "user:secret")
             .redirectErrorStream(true)
