@@ -27,7 +27,8 @@ so that an IDE with another `python3` keeps the environment created in a shell.
 With `basePython` set, `.venv` is also created again when it is of another base Python,
 compared by the prefix and version of the interpreter, not by the path given.
 The previous `.venv` is moved aside to `.venv.previous` meanwhile,
-and restored when creating the new one fails.
+and restored when creating the new one fails or is interrupted.
+An empty `basePython` counts as not set.
 The base Python of `.venv` is recorded in `.venv/base-python.txt`,
 an input of the tests, so that they run again after it changes.
 

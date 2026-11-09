@@ -10,6 +10,8 @@ import java.nio.file.LinkOption
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
+import kotlin.io.path.isDirectory
+import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.moveTo
 
 plugins {
@@ -111,7 +113,8 @@ val createPythonVenv = tasks.register("createPythonVenv") {
     // so the base Python can be chosen with -PbasePython=..., or the ORG_GRADLE_PROJECT_basePython variable on CI;
     // only when chosen, it can replace a complete environment, so that a daemon of an IDE with another python3
     // on its PATH keeps the environment created in a shell
-    val chosenBasePython = providers.gradleProperty("basePython").orNull
+    // blank like unset, as a CI matrix can pass an empty ORG_GRADLE_PROJECT_basePython
+    val chosenBasePython = providers.gradleProperty("basePython").orNull?.takeIf { it.isNotBlank() }
     val basePython = chosenBasePython ?: "python3"
     // local values, as the configuration cache cannot serialize a reference to the build script
     val exec = objects.newInstance<InjectedServices>().exec
@@ -124,7 +127,7 @@ val createPythonVenv = tasks.register("createPythonVenv") {
     outputs.file(identityFile)
     outputs.upToDateWhen { false }
     doLast {
-        // isolated (-I), so that no sitecustomize prints into the output, prints the identity of the base Python:
+        // isolated (-I) from the environment variables and the user site-packages, prints the identity of the base Python:
         // its prefix and version, same for python3 and /usr/bin/python3, but not for python3.12 and python3.13;
         // exits with 3 when too old for jep, 4 without pip, which only a virtual environment needs
         fun probe(python: String): Triple<Int, List<String>, String>? {
@@ -144,11 +147,18 @@ val createPythonVenv = tasks.register("createPythonVenv") {
             } catch (e: Exception) {
                 return null
             }
-            // the last lines, as a .pth file of the site-packages can still print before
+            // the last lines, as a sitecustomize or a .pth file of the site-packages can still print before
             return Triple(result.exitValue, out.toString().trim().lines(), err.toString().trim())
         }
         fun identity(lines: List<String>) = lines.takeLast(2).joinToString("\n")
 
+        // a creation interrupted before, e.g. by killing the build, left the previous environment aside
+        if (previousVenv.exists(LinkOption.NOFOLLOW_LINKS)) {
+            venv.deleteRecursively()
+            previousVenv.moveTo(venv)
+        }
+        // not just the empty directory which Gradle creates for the identity file
+        val venvPresent = venv.isDirectory() && venv.listDirectoryEntries().isNotEmpty()
         val venvProbe = if (python.exists()) probe(python.absolutePath) else null
         val venvIdentity = venvProbe?.takeIf { it.first == 0 && it.second.size >= 2 }?.let { identity(it.second) }
         val identity = if (venvIdentity != null && chosenBasePython == null) {
@@ -172,7 +182,7 @@ val createPythonVenv = tasks.register("createPythonVenv") {
                 val version = lines.last()
                 logger.lifecycle(
                     when {
-                        venvProbe == null -> "Creating the Python virtual environment $venv with $basePython ($version)"
+                        !venvPresent -> "Creating the Python virtual environment $venv with $basePython ($version)"
                         venvIdentity == null -> "The Python virtual environment $venv is too old or incomplete, " +
                             "creating it again with $basePython ($version)"
                         else -> "The Python virtual environment $venv is of another base Python, " +
@@ -182,24 +192,28 @@ val createPythonVenv = tasks.register("createPythonVenv") {
                 // moved aside instead of deleted, to be restored when the new one fails, unless without its python,
                 // like the empty directory which Gradle creates for the identity file;
                 // not created elsewhere and moved, as the scripts of a virtual environment contain its absolute path
-                previousVenv.deleteRecursively()
-                if (python.toPath().exists(LinkOption.NOFOLLOW_LINKS)) venv.moveTo(previousVenv) else venv.deleteRecursively()
-                val out = ByteArrayOutputStream()
-                val result = exec.exec {
-                    commandLine(basePython, "-m", "venv", venv.toString())
-                    standardOutput = out
-                    errorOutput = out
-                    isIgnoreExitValue = true
-                }
-                if (result.exitValue != 0) {
-                    // otherwise a half-made environment, e.g. without pip, would be taken for a complete one
-                    venv.deleteRecursively()
-                    val restored = previousVenv.exists(LinkOption.NOFOLLOW_LINKS)
-                    if (restored) previousVenv.moveTo(venv)
-                    throw GradleException(
+                val hasPrevious = python.toPath().exists(LinkOption.NOFOLLOW_LINKS)
+                if (hasPrevious) venv.moveTo(previousVenv) else venv.deleteRecursively()
+                var created = false
+                try {
+                    val out = ByteArrayOutputStream()
+                    val result = exec.exec {
+                        commandLine(basePython, "-m", "venv", venv.toString())
+                        standardOutput = out
+                        errorOutput = out
+                        isIgnoreExitValue = true
+                    }
+                    if (result.exitValue != 0) throw GradleException(
                         "Cannot create the Python virtual environment with '$basePython', exit value ${result.exitValue}" +
-                            (if (restored) ", the previous one is kept" else "") + ":\n" + out.toString().trim()
+                            (if (hasPrevious) ", the previous one is kept" else "") + ":\n" + out.toString().trim()
                     )
+                    created = true
+                } finally {
+                    // on any failure, as a half-made environment, e.g. without pip, would be taken for a complete one
+                    if (!created) {
+                        venv.deleteRecursively()
+                        if (hasPrevious) previousVenv.moveTo(venv)
+                    }
                 }
                 previousVenv.deleteRecursively()
             }
