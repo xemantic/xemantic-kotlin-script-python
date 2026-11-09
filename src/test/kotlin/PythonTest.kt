@@ -460,8 +460,62 @@ class PythonTest {
         val nested = python.eval("[[len], [abs]]", arrayOfArraysOfComparables)
 
         // then
+        assert(comparables.javaClass == arrayOfComparables)
         assert(comparables.toList() == listOf("<built-in function len>"))
+        assert(nested.javaClass == arrayOfArraysOfComparables)
+        assert(nested.all { it.javaClass == arrayOfComparables })
         assert(nested.map { it.toList() } == listOf(listOf("<built-in function len>"), listOf("<built-in function abs>")))
+    }
+
+    @Test
+    fun `should not close Java proxy held by Python variable when reading it`() {
+        // given
+        python.exec(
+            """
+            from jep import jproxy
+            class R:
+                def __init__(self):
+                    self.runs = 0
+                def run(self):
+                    self.runs += 1
+                def __repr__(self):
+                    return 'R'
+            r = R()
+            x = jproxy(r, ['java.lang.Runnable'])
+            xs = [x]
+            """.trimIndent()
+        )
+
+        // when
+        val first = python["x"]
+        python.exec("x.run()")
+        val second = python["x"]
+        val list = python["xs"]
+        python.exec("xs[0].run()")
+
+        // then
+        assert(first == "R")
+        assert(second == "R")
+        assert(list == listOf("R"))
+        assert(python.eval<Long>("r.runs") == 2L)
+    }
+
+    @Test
+    fun `should widen array holding arrays of collections copied to another collection type`() {
+        // given
+        python["a"] = arrayOf<Any?>(arrayOf(java.util.TreeSet(listOf("t"))), arrayOf(java.util.ArrayDeque(listOf("d"))))
+        python.exec("a[0][0].add('u')")
+        python.exec("a[1][0].add(len)")
+
+        // when
+        val result = python["a"]
+
+        // then
+        assert(result is Array<*> && result.javaClass == Array<Any?>::class.java)
+        val (sets, deques) = (result as Array<*>).toList()
+        assert(sets is Array<*> && sets.javaClass == Array<Any?>::class.java && sets.single() == setOf("t", "u"))
+        assert(deques is Array<*> && deques.javaClass == Array<Any?>::class.java)
+        assert((deques as Array<*>).single() == listOf("d", "<built-in function len>"))
     }
 
     @Test

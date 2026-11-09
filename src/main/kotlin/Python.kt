@@ -295,24 +295,25 @@ public class Python private constructor(
      * as it is bound to the thread of this interpreter.
      * A Python object is a [PyObject], or a proxy of a Java interface, which Jep creates for it, see [toPyObject].
      *
-     * Only a top-level Python object is closed, as it is created by Jep for this value.
+     * Only a top-level [PyObject] is closed, as it is created by Jep for this value.
      * A nested one can be held by a Java collection, which Python can still use, e.g. set with `python["k"] = list`,
      * so it is only left out of the returned copy, and Jep releases it once it is garbage collected.
+     * Neither is the [PyObject] of a proxy closed, also of a top-level one,
+     * as the proxy can be held by Python, e.g. created with `jep.jproxy`, which Jep returns as it is.
      */
-    private fun SharedInterpreter.toJava(value: Any?): Any? {
-        val pyObject = value.toPyObject()
-        return when {
-            pyObject != null -> pyObject.use { PyObjectConverter(this).use { converter -> converter.convert(value) } }
-            value is Collection<*> || value is Map<*, *> || value is Array<*> ->
-                PyObjectConverter(this).use { it.convert(value) }
-            else -> value
+    private fun SharedInterpreter.toJava(value: Any?): Any? = when (value) {
+        is PyObject -> value.use { PyObjectConverter(this).use { converter -> converter.convert(it) } }
+        else -> if (value.toPyObject() != null || value is Collection<*> || value is Map<*, *> || value is Array<*>) {
+            PyObjectConverter(this).use { it.convert(value) }
+        } else {
+            value
         }
     }
 
     /**
      * Converts a value returned by Jep, see [toJava].
      *
-     * A value without any [PyObject] is returned as it is.
+     * A value without any Python object, a [PyObject] or a proxy of one, is returned as it is.
      * Otherwise each [Collection], [Map] and array reachable from it is copied, never changed,
      * a [Set] to a [LinkedHashSet], another [Collection] than a [List] to an [ArrayList],
      * and an array to an array of the same component type, unless it cannot hold a `repr`, like `PyObject[]`,
