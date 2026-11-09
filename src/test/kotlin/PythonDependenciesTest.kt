@@ -21,8 +21,16 @@ package com.xemantic.kotlin.script.python
 import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import java.lang.reflect.Proxy
+import java.nio.file.Path
+import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
+import kotlin.io.path.createDirectories
+import kotlin.io.path.deleteRecursively
 import kotlin.test.Test
+import kotlin.io.path.ExperimentalPathApi
 import kotlin.test.assertFailsWith
 
 class PythonDependenciesTest {
@@ -95,10 +103,10 @@ class PythonDependenciesTest {
         ) { _, method, _ -> error("Unexpected call of Interpreter.${method.name}") } as Interpreter
 
         // when
-        val state = synchronized(PythonDependencies) {
+        val state = PythonDependencies.installLock.withLock {
             // as if another thread was installing dependencies
             val installer = thread { PythonDependencies.install("x = 1", interpreter) }
-            while (installer.state != Thread.State.BLOCKED && installer.state != Thread.State.TERMINATED) {
+            while (installer.state != Thread.State.WAITING && installer.state != Thread.State.TERMINATED) {
                 Thread.onSpinWait()
             }
             installer.state
@@ -107,6 +115,88 @@ class PythonDependenciesTest {
         // then
         assert(state == Thread.State.TERMINATED)
     }
+
+    @Test
+    fun `should wait for installation of other process into dependency directory`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory!!
+        val distribution = "lock-marker-${UUID.randomUUID()}"
+        // the other process "installs" the distribution only after this JVM tries to lock the directory,
+        // so an installation not waiting for it would not find it, and fail to install it from the index
+        val otherInstallation = startOtherInstallation(directory, distribution)
+        try {
+            Python().use { python ->
+                val installation = CompletableFuture.runAsync {
+                    python.exec("# /// script\n# dependencies = [\"$distribution\"]\n# ///\nx = 1\n")
+                }
+
+                // when
+                val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(5)
+                while (!installation.isDone && !isAnyThreadLockingFile() && System.nanoTime() < deadline) {
+                    Thread.onSpinWait()
+                }
+                otherInstallation.finish()
+                val failure = runCatching { installation.get(5, TimeUnit.MINUTES) }.exceptionOrNull()
+
+                // then
+                assert(failure == null)
+            }
+        } finally {
+            otherInstallation.destroy()
+            directory.resolve("${distribution.replace('-', '_')}-1.0.dist-info").deleteRecursivelyIfExists()
+        }
+    }
+
+    @Test
+    fun `should not wait for installation of other process when code has no metadata`() {
+        // given
+        PythonEnvironment.initialize()
+        val otherInstallation = startOtherInstallation(PythonEnvironment.dependencyDirectory!!, distribution = null)
+        try {
+            Python().use { python ->
+                // when
+                val installation = CompletableFuture.runAsync { python.exec("x = 1") }
+                val failure = runCatching { installation.get(5, TimeUnit.MINUTES) }.exceptionOrNull()
+
+                // then
+                assert(failure == null)
+            }
+        } finally {
+            otherInstallation.destroy()
+        }
+    }
+
+    /**
+     * Starts a Python process locking the dependency [directory], like an installation of another JVM,
+     * which, on [finish], "installs" the [distribution], if any, and unlocks the directory.
+     *
+     * It locks with POSIX `fcntl.lockf`, like `FileChannel.lock` on Linux and macOS.
+     */
+    private fun startOtherInstallation(directory: Path, distribution: String?): Process {
+        directory.createDirectories()
+        val process = ProcessBuilder(
+            PythonEnvironment.executable, "-c", OTHER_INSTALLATION,
+            directory.resolve(PythonDependencies.LOCK_FILE_NAME).toString(),
+            distribution ?: ""
+        ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
+        val line = process.inputStream.bufferedReader().readLine()
+        check(line == "locked") { "The other installation did not lock the directory: $line" }
+        return process
+    }
+
+    private fun Process.finish() {
+        outputStream.use { it.write('\n'.code) }
+        check(waitFor(5, TimeUnit.MINUTES) && exitValue() == 0) { "The other installation did not finish" }
+    }
+
+    private fun isAnyThreadLockingFile() = Thread.getAllStackTraces().values.any { stackTrace ->
+        stackTrace.any { it.className == "sun.nio.ch.FileChannelImpl" && it.methodName == "lock" }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    private fun Path.deleteRecursivelyIfExists() = deleteRecursively()
+
 
     @Test
     fun `should find no metadata for lone script marker line`() {
@@ -304,6 +394,28 @@ class PythonDependenciesTest {
 
         // then
         assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+    }
+
+    private companion object {
+
+        val OTHER_INSTALLATION = """
+            import fcntl, os, sys
+
+            lock_file, distribution = sys.argv[1], sys.argv[2]
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o666)
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            print("locked", flush=True)
+            sys.stdin.read()
+            if distribution:
+                info = os.path.join(
+                    os.path.dirname(lock_file), distribution.replace("-", "_") + "-1.0.dist-info"
+                )
+                os.makedirs(info)
+                with open(os.path.join(info, "METADATA"), "w") as metadata:
+                    metadata.write(f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0\n")
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        """.trimIndent()
+
     }
 
 }

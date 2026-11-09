@@ -22,6 +22,10 @@ import jep.Interpreter
 import jep.python.PyCallable
 import org.intellij.lang.annotations.Language
 import java.io.File
+import java.nio.channels.FileChannel
+import java.nio.file.StandardOpenOption.CREATE
+import java.nio.file.StandardOpenOption.WRITE
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempFile
@@ -45,6 +49,11 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  * are kept in their versions, as a module cannot be replaced once imported.
  */
 internal object PythonDependencies {
+
+    /**
+     * The file in the dependency directory, locked by every JVM while it installs into the directory.
+     */
+    internal const val LOCK_FILE_NAME = ".lock"
 
     private val blockStart = Regex("# /// [a-zA-Z0-9-]+")
 
@@ -97,31 +106,56 @@ internal object PythonDependencies {
 
     private fun String.isComment() = this == "#" || startsWith("# ")
 
+    /**
+     * Serializes the installations of this JVM,
+     * before the [LOCK_FILE_NAME] serializes them with the ones of other processes,
+     * as a JVM cannot lock a file it already holds a lock on.
+     */
+    internal val installLock = ReentrantLock()
+
     /** Installs the missing dependencies declared by the [code], if any, on the thread of the [interpreter]. */
     fun install(code: String, interpreter: Interpreter) {
-        // outside the lock, so that code without metadata does not wait for an installation of another thread
+        // before locking, so that code without metadata does not wait for an installation of another thread
         val metadata = scriptMetadata(code) ?: return
-        installMetadata(metadata, interpreter)
+        // interruptible, unlike a monitor, as the installation of another process can take long
+        installLock.lockInterruptibly()
+        try {
+            installMetadata(metadata, interpreter)
+        } finally {
+            installLock.unlock()
+        }
     }
 
-    @Synchronized
     private fun installMetadata(metadata: String, interpreter: Interpreter) {
-        val directory = PythonEnvironment.dependencyDirectory!!.createDirectories().toString()
+        val directory = PythonEnvironment.dependencyDirectory!!.createDirectories()
         val imported = interpreter.getValue(
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
             List::class.java
         ).map { it.toString() }
+        // locked by another JVM installing into the same directory, e.g. a shared one of the user cache,
+        // which would otherwise delete or overwrite the files being installed;
+        // the lock file is never deleted, as another process could have opened it before, and lock a deleted file
+        FileChannel.open(directory.resolve(LOCK_FILE_NAME), CREATE, WRITE).use { channel ->
+            channel.lock().use {
+                planAndInstall(metadata, directory.toString(), imported)
+            }
+        }
+        @Suppress("UNCHECKED_CAST")
+        val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
+        if (directory.toString() !in path) {
+            interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use {
+                it.call(directory.toString())
+            }
+        }
+        interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
+    }
+
+    private fun planAndInstall(metadata: String, directory: String, imported: List<String>) {
         val plan = plan(metadata, directory, imported)
         val missing = plan.filter { it.first == "install" }.map { it.second }
         if (missing.isNotEmpty()) {
             installMissing(missing, plan.filter { it.first == "constraint" }.map { it.second }, directory)
         }
-        @Suppress("UNCHECKED_CAST")
-        val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
-        if (directory !in path) {
-            interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use { it.call(directory) }
-        }
-        interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
     }
 
     /**
