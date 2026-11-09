@@ -614,6 +614,49 @@ class PythonCloseTest {
     }
 
     @Test
+    fun `should wait in first close for interpreter to be closed when closing starts before it decides to wait`() {
+        // given
+        val closeEntered = CountDownLatch(1)
+        val releaseClose = CountDownLatch(1)
+        val interpreterClosed = CountDownLatch(1)
+        val python = Python.withInterpreterFactory(
+            interceptingExecutor(
+                // the task of close() is closing the interpreter before close() decides whether to wait
+                beforeShutdown = {
+                    if (Thread.currentThread().name == "closer") {
+                        assert(closeEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+                    }
+                }
+            )
+        ) {
+            object : SharedInterpreter() {
+                override fun close() {
+                    closeEntered.countDown()
+                    assert(releaseClose.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+                    super.close()
+                    interpreterClosed.countDown()
+                }
+            }
+        }
+        python.exec("x = 1")
+
+        // when
+        var closedWhenCloserReturned: Boolean? = null
+        val closer = thread(isDaemon = true, name = "closer") {
+            python.close()
+            closedWhenCloserReturned = interpreterClosed.count == 0L
+        }
+        assert(closeEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+        closer.awaitWaitingOrTerminated()
+        releaseClose.countDown()
+        closer.join(DEADLOCK_TIMEOUT)
+
+        // then
+        assert(!closer.isAlive)
+        assert(closedWhenCloserReturned == true)
+    }
+
+    @Test
     fun `should throw failure of closing interpreter from every close`() {
         // given
         val python = Python.withInterpreterFactory {
@@ -633,16 +676,45 @@ class PythonCloseTest {
         // then
         assert(firstFailure is JepException)
         assert(firstFailure.message == "close failed")
-        assert(secondFailure === firstFailure)
+        // a new exception, so that it can be suppressed by the first one, like by try-with-resources
+        assert(secondFailure is IllegalStateException)
+        assert(secondFailure.cause === firstFailure)
+    }
+
+    @Test
+    fun `should throw failure of closing interpreter closed explicitly within use`() {
+        // given
+        val python = Python.withInterpreterFactory {
+            object : SharedInterpreter() {
+                override fun close() {
+                    super.close()
+                    throw JepException("close failed")
+                }
+            }
+        }
+        python.exec("x = 1")
+
+        // when
+        // like try-with-resources, use suppresses the failure of its implicit close() by the one thrown in its block
+        val failure = runCatching { python.use { it.close() } }.exceptionOrNull()
+
+        // then
+        assert(failure is JepException)
+        assert(failure.message == "close failed")
+        assert(failure.suppressed.single().cause === failure)
     }
 
     @Test
     fun `should not deadlock when closing interpreter calls close from Kotlin callback`() {
         // given
         val python = Python()
-        python["stop"] = { python.close() }
-        // closing the interpreter drops the global c, whose __del__ calls close() on the Python thread
-        python.exec("class C:\n    def __del__(self):\n        stop()\nc = C()")
+        var stopCalled = false
+        python["stop"] = {
+            stopCalled = true
+            python.close()
+        }
+        // closing the interpreter drops the global c, whose __del__, with stop bound when defined, calls close() on the Python thread
+        python.exec("class C:\n    def __del__(self, stop=stop):\n        stop()\nc = C()")
         var failure: Throwable? = null
 
         // when
@@ -655,9 +727,62 @@ class PythonCloseTest {
         // then
         assert(!closer.isAlive)
         assert(failure == null)
+        assert(stopCalled)
         val laterFailure = runCatching { python.eval<Long>("1 + 1") }.exceptionOrNull()
         assert(laterFailure is IllegalStateException)
         assert(laterFailure.message == "Python is closed")
+    }
+
+    @Test
+    fun `should not deadlock when closing interpreter waits for another thread calling close`() {
+        // given
+        val python = Python()
+        var stopCalled = false
+        python["stop"] = {
+            stopCalled = true
+            thread(isDaemon = true, name = "helper") { python.close() }.join()
+        }
+        // closing the interpreter drops the global c, whose __del__, with stop bound when defined, waits for close() on another thread
+        python.exec("class C:\n    def __del__(self, stop=stop):\n        stop()\nc = C()")
+        var failure: Throwable? = null
+
+        // when
+        // bounded, only to fail instead of hanging the JVM, if it deadlocks
+        val closer = thread(isDaemon = true, name = "closer") {
+            failure = runCatching { python.close() }.exceptionOrNull()
+        }
+        closer.join(DEADLOCK_TIMEOUT)
+
+        // then
+        assert(!closer.isAlive)
+        assert(failure == null)
+        assert(stopCalled)
+    }
+
+    @Test
+    fun `should not deadlock when closing interpreter blocks on coroutine calling close on another dispatcher`() {
+        // given
+        val python = Python()
+        var stopCalled = false
+        python["stop"] = {
+            stopCalled = true
+            runBlocking(Dispatchers.IO) { python.close() }
+        }
+        // closing the interpreter drops the global c, whose __del__, with stop bound when defined, blocks on close() on another thread
+        python.exec("class C:\n    def __del__(self, stop=stop):\n        stop()\nc = C()")
+        var failure: Throwable? = null
+
+        // when
+        // bounded, only to fail instead of hanging the JVM, if it deadlocks
+        val closer = thread(isDaemon = true, name = "closer") {
+            failure = runCatching { python.close() }.exceptionOrNull()
+        }
+        closer.join(DEADLOCK_TIMEOUT)
+
+        // then
+        assert(!closer.isAlive)
+        assert(failure == null)
+        assert(stopCalled)
     }
 
     /**

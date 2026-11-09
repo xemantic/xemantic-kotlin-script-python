@@ -109,7 +109,13 @@ public class Python private constructor(
      */
     private val closing = CompletableFuture<Future<*>>()
 
-    /** Whether a call is running on the thread of this `Python`, written only by this thread, see [close]. */
+    /** Whether the failure of [closing] is thrown already, so that another `close()` wraps it, see [close]. */
+    private val closingFailureThrown = AtomicBoolean(false)
+
+    /**
+     * Whether a call, or the task of [close], is running on the thread of this `Python`,
+     * written only by this thread, see [close].
+     */
     @Volatile
     private var running = false
 
@@ -233,11 +239,15 @@ public class Python private constructor(
      * it closes the interpreter on its thread, and waits for it,
      * so that the interpreter is closed when it returns.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
-     * Calling it again, also from another thread, or after the waiting is interrupted, waits for the same closing,
-     * and throws the same exception, if closing the interpreter fails.
-     * If the waiting is interrupted, it throws an [InterruptedException], while the interpreter is still closed.
-     * Called on the thread of this `Python`, e.g. by a Kotlin function called from a Python `__del__`
-     * while the interpreter is being closed, it never waits.
+     * Calling it again, also from another thread, or after the waiting is interrupted, waits for the same closing.
+     * If closing the interpreter fails, the first `close()` reporting it throws its exception,
+     * and each other one an [IllegalStateException] caused by it,
+     * so that it can be suppressed by the first one, e.g. by `use` or try-with-resources.
+     * If the waiting is interrupted, it throws an [InterruptedException], and the interpreter is still closed afterward.
+     *
+     * While the interpreter is being closed, it does not wait, like with a call running,
+     * as closing it can run Python code, e.g. `__del__` of a global variable,
+     * which can call a Kotlin function calling `close()`, or waiting for another thread calling it.
      *
      * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
@@ -251,40 +261,52 @@ public class Python private constructor(
      * or the Python code, waits for, and it cannot be told apart from a `close()` which the running call does not wait for.
      */
     override fun close() {
+        // the task of close() can run only after the running call, which might wait for this close(),
+        // called by a Kotlin function, called from Python, or by a thread it waits for, so waiting here could deadlock;
+        // read after setting closed, so that a call, which is not running yet, sees it closed before running any code,
+        // and then the task of close() runs right after it
+        val wait: Boolean
         if (closed.compareAndSet(false, true)) {
+            // read before submitting the task of close(), which sets it while closing the interpreter
+            wait = !running
             // the calls submitted before, and still waiting for their turn, see it closed when it comes,
             // and the ones submitted afterward are rejected, so that this task is the last one to touch the interpreter
             // explicitly a Runnable, unlike the calls, which tests rely on to intercept only this task
             try {
                 closing.complete(executor.submit(Runnable {
+                    // closing the interpreter can run Python code, which might wait for a close(), like a running call
+                    running = true
                     try {
                         interpreter?.close()
                     } finally {
                         // defensive, and not observable: when closing fails, the interpreter cannot be closed again anyway,
                         // as closed is set and the executor shut down, so the reference can only be released
                         interpreter = null
+                        running = false
                     }
                 }))
             } catch (e: Throwable) {
                 // not to leave another close() waiting forever
                 closing.completeExceptionally(e)
+                closingFailureThrown.set(true)
                 throw e
             } finally {
                 executor.shutdown()
             }
+        } else {
+            // neither while the task of close() runs Python code, e.g. __del__, which might wait for this close() as well
+            wait = !running
         }
-        // the task of close() can run only after the running call, which might wait for this close(),
-        // called by a Kotlin function, called from Python, or by a thread it waits for, so waiting here could deadlock;
-        // read after setting closed, so that a call, which is not running yet, sees it closed before running any code,
-        // and then the task of close() runs right after it
-        // nor on the Python thread itself, e.g. called by a Python __del__ while the task of close() closes the interpreter,
-        // which would wait for the very task this thread runs
-        if (running || Thread.currentThread() === thread) return
+        // nor on the Python thread itself, which would wait for the very task it runs
+        if (!wait || Thread.currentThread() === thread) return
         // also a close() called again, e.g. after the first one is interrupted, waits until the interpreter is closed
         try {
             closing.get().get()
         } catch (e: ExecutionException) {
-            throw e.cause ?: e
+            val failure = e.cause ?: e
+            // a new exception for each other close(), as an exception cannot suppress itself, e.g. in try-with-resources
+            if (closingFailureThrown.compareAndSet(false, true)) throw failure
+            throw IllegalStateException("Closing the interpreter failed", failure)
         }
     }
 
@@ -455,11 +477,13 @@ public class Python private constructor(
 
         /**
          * Creates a `Python`, whose interpreter is created by [createInterpreter], on the thread of this `Python`,
-         * so that a test can make the interpreter fail.
+         * so that a test can make the interpreter fail, or block it, and whose executor is decorated by [decorateExecutor],
+         * see [withDecoratedExecutor].
          */
         internal fun withInterpreterFactory(
+            decorateExecutor: (ExecutorService) -> ExecutorService = { it },
             createInterpreter: () -> SharedInterpreter
-        ): Python = Python({ it }, createInterpreter)
+        ): Python = Python(decorateExecutor, createInterpreter)
 
         private val threadCounter = AtomicInteger()
 
