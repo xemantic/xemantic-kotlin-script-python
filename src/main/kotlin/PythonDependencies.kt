@@ -193,6 +193,10 @@ internal object PythonDependencies {
         ?.firstOrNull { it.isExecutable() }
         ?.toString()
 
+    /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
+    internal const val NO_TOML_PARSER_MESSAGE =
+        "Cannot read '# /// script' metadata: Python 3.11+ is required, or the tomli or pip package before 3.11"
+
     /**
      * Prints the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
@@ -202,12 +206,25 @@ internal object PythonDependencies {
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
     @Language("python")
-    private val PLAN = """
-        import importlib.metadata as metadata, json, os, re, sys, tomllib
+    internal val PLAN = """
+        import json, sys
 
+        # before any import which can fail, so that the input is always read
         request = json.loads(sys.stdin.read())
+
+        import importlib, importlib.metadata as metadata, os, re
+
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
+        # tomllib is new in Python 3.11, tomli is its original, also vendored by pip
+        for toml_module in ("tomllib", "tomli", "pip._vendor.tomli"):
+            try:
+                tomllib = importlib.import_module(toml_module)
+                break
+            except ImportError:
+                pass
+        else:
+            sys.exit(${NO_TOML_PARSER_MESSAGE.toJson()})
         try:
             dependencies = tomllib.loads(request["metadata"]).get("dependencies", [])
         except tomllib.TOMLDecodeError as e:
