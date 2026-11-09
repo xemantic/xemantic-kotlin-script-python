@@ -60,12 +60,6 @@ java {
 
 repositories {
     mavenCentral()
-    // TODO remove once xemantic-kotlin-script is released, a SNAPSHOT published with publishToMavenLocal for now
-    mavenLocal {
-        content {
-            includeModule("com.xemantic.kotlin", "xemantic-kotlin-script")
-        }
-    }
 }
 
 dependencies {
