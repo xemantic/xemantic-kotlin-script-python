@@ -25,7 +25,6 @@ import java.nio.file.attribute.BasicFileAttributes
 import jep.Interpreter
 import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
-import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
@@ -42,7 +41,10 @@ import org.intellij.lang.annotations.Language
 @OptIn(ExperimentalPathApi::class)
 class PythonDependenciesTest {
 
-    private val python = Path(System.getenv("VIRTUAL_ENV"), "bin", "python").toString()
+    private val python by lazy {
+        PythonEnvironment.initialize()
+        PythonEnvironment.executable
+    }
 
     private val tempPaths = mutableListOf<Path>()
 
@@ -576,6 +578,29 @@ class PythonDependenciesTest {
 
         // then
         assert(requirement == "b @ https://user:tok@host/b-1.0-py3-none-any.whl")
+    }
+
+    /**
+     * pip before 26 removes the credentials from the URL in its installation report only up to the first `@`,
+     * leaving the rest of a password with `@` as the user.
+     */
+    @Test
+    fun `should pin distribution from URL with password tail left by pip as user with credentials of requirement`() {
+        // when
+        val requirement = pinnedRequirement(
+            """
+            {
+              "metadata": {"name": "x", "version": "1.0"},
+              "is_direct": true,
+              "requested": true,
+              "download_info": {"url": "http://ss@127.0.0.1:8765/x-1.0-py3-none-any.whl", "archive_info": {}}
+            }
+            """.trimIndent(),
+            "x @ http://user:p@ss@127.0.0.1:8765/x-1.0-py3-none-any.whl"
+        )
+
+        // then
+        assert(requirement == "x @ http://user:p@ss@127.0.0.1:8765/x-1.0-py3-none-any.whl")
     }
 
     @Test

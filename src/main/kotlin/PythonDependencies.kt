@@ -225,9 +225,11 @@ internal object PythonDependencies {
         def with_credentials(url, credentials):
             from urllib.parse import urlsplit, urlunsplit
             parts = urlsplit(url)
-            if "@" in parts.netloc or parts.netloc not in credentials:
+            # pip before 26 removes the credentials only up to the first "@", leaving the rest of the password
+            host = parts.netloc.rpartition("@")[2]
+            if host not in credentials:
                 return url
-            return urlunsplit(parts._replace(netloc=f"{credentials[parts.netloc]}@{parts.netloc}"))
+            return urlunsplit(parts._replace(netloc=f"{credentials[host]}@{host}"))
 
         def pinned_requirement(distribution, credentials):
             name, download = distribution["metadata"]["name"], distribution["download_info"]
