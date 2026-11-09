@@ -53,6 +53,16 @@ The Python executable is, in this order:
 The Python code imports the modules from the same paths as this executable,
 e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
 
+The embedded Python, like every Python process it starts, e.g. `pip`, runs in the [UTF-8 mode](https://peps.python.org/pep-0540/),
+whatever the locale, e.g. cp1252 on Windows, or `C` on Linux:
+the standard streams, and `open` without an `encoding`, use UTF-8.
+On Linux or macOS with a non-UTF-8 locale, e.g. ISO-8859-1,
+the path of the Python executable, e.g. of the virtual environment, must be ASCII:
+Jep passes it to the embedded Python as UTF-8, which is then another path,
+so that the embedded Python would not find the virtual environment,
+and fail with `ModuleNotFoundError: No module named 'jep'`.
+Other paths, like the one of the dependency directory in a home directory like `/home/josé`, can be non-ASCII.
+
 ## Usage
 
 In `build.gradle.kts` add:

@@ -144,6 +144,27 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
+    fun `should probe Python whose paths are not valid UTF-8`() {
+        // given
+        val expected = PythonEnvironment.probePython(venvPython)
+        val directory = createTempDirectory("python-probe")
+        // a path of a non-UTF-8 locale, e.g. /home/josé in ISO-8859-1, is surrogate-escaped by Python in UTF-8 mode
+        val python = pythonWithSitecustomize(directory, "import os, sys\nsys.prefix = os.fsdecode(b'/jos\\xe9')\n")
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            val prefix = String(byteArrayOf(0x2f, 0x6a, 0x6f, 0x73, 0xe9.toByte()), filesystemCharset)
+            assert(probe == expected.copy(prefix = prefix))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
     fun `should fail clearly on probe of Python with empty executable`() {
         // given
         val directory = createTempDirectory("python-probe")
@@ -257,7 +278,8 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = "${PythonEnvironment.PROBE_BEGIN}\n/venv/bin/python\u0000cpython-313\u0000/venv\u0000/venv/jep"
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
+            .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -279,9 +301,26 @@ class PythonEnvironmentTest {
         assert(probes == listOf(null, null))
     }
 
+    @Test
+    fun `should not parse probe output with values which are not hex digits`() {
+        // given
+        val output = "${PythonEnvironment.PROBE_BEGIN}\n/venv/bin/python cpython-313 /venv /venv/jep\n" +
+            PythonEnvironment.PROBE_END
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == null)
+    }
+
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
-    private fun probePayload(vararg values: String): String =
-        "${PythonEnvironment.PROBE_BEGIN}\n${values.joinToString("\u0000")}\n${PythonEnvironment.PROBE_END}"
+    private fun probePayload(vararg values: String): String {
+        val hexValues = values.joinToString(" ") { value ->
+            value.toByteArray(filesystemCharset).joinToString("") { "%02x".format(it) }
+        }
+        return "${PythonEnvironment.PROBE_BEGIN}\n$hexValues\n${PythonEnvironment.PROBE_END}"
+    }
 
     /**
      * A shim of the venv Python in the [directory], with a `sitecustomize` module of the [code] on its `PYTHONPATH`,

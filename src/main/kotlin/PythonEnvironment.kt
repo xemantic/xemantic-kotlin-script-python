@@ -22,6 +22,7 @@ import jep.MainInterpreter
 import jep.PyConfig
 import java.io.IOException
 import java.io.Reader
+import java.nio.charset.Charset
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.concurrent.thread
@@ -94,9 +95,7 @@ public object PythonEnvironment {
             "No native Jep library in $jepDir, reinstall jep with: $python -m pip install jep"
         )
         MainInterpreter.setJepLibraryPath(library.toString())
-        // the embedded CPython finds the pyvenv.cfg of a virtual environment next to its program,
-        // otherwise it would search the site-packages of the base Python as well
-        MainInterpreter.setInitParams(PyConfig.python().setProgramName(executable))
+        MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         this.executable = executable
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -112,6 +111,24 @@ public object PythonEnvironment {
         }
         initialized = true
     }
+
+    /**
+     * The configuration of the embedded CPython of the Python [executable].
+     *
+     * Its program name is the [executable], as the embedded CPython finds the `pyvenv.cfg` of a virtual environment
+     * next to its program, otherwise it would search the `site-packages` of the base Python as well.
+     *
+     * It runs in the UTF-8 mode, like the Python subprocesses, see [runProcess],
+     * as otherwise it would use the encoding of the locale of the JVM, e.g. cp1252 on Windows, or ASCII in the C locale,
+     * for its standard streams and as the default encoding of `open`,
+     * and fail with a `UnicodeEncodeError` printing, or a `UnicodeDecodeError` reading a UTF-8 file, non-ASCII text.
+     * Jep has no setter of the UTF-8 mode, but its command line option `-X utf8`,
+     * parsed by CPython before decoding the other values, enables it, also over a `PYTHONUTF8=0` environment variable.
+     */
+    internal fun embeddedPythonConfig(executable: String): PyConfig = PyConfig.python()
+        .setParseArgv(true)
+        .setArgv(executable, "-X", "utf8")
+        .setProgramName(executable)
 
     /**
      * Asks the [python] executable about itself.
@@ -154,17 +171,22 @@ public object PythonEnvironment {
         val lines = "\n$output"
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
-        val values = if (begin == null || end == null) null else lines.substring(begin, end).split('\u0000')
+        val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
         if (values == null || values.size != 4) return null
-        val (executable, cacheTag, prefix, jepLocation) = values
+        val (executable, cacheTag, prefix, jepLocation) = values.map { it.hexToPath() ?: return null }
         return PythonProbe(executable, cacheTag, prefix, jepLocation)
     }
 
     /**
      * The command of [probePython].
      *
-     * It writes its values, separated by NUL, which no path can contain, between the [PROBE_BEGIN] and [PROBE_END] lines,
-     * with an empty line before them, in case the standard output written before does not end with a newline,
+     * It writes its values, separated by a space, between the [PROBE_BEGIN] and [PROBE_END] lines,
+     * each as the hex digits of its bytes, of `os.fsencode`, the bytes of a path in the file system,
+     * to be decoded with the [filesystemCharset] to the same path in the JVM:
+     * as text, a path which is not valid UTF-8, e.g. `/home/josé` in ISO-8859-1,
+     * would be surrogate-escaped by Python in UTF-8 mode, and could not be encoded to UTF-8,
+     * while the JVM would decode a path of UTF-8 bytes to another one, in another encoding of its locale.
+     * The lines are written with an empty line before them, in case the standard output written before does not end with a newline,
      * and as bytes, without the newline translation of the text mode, e.g. on Windows,
      * to the original standard output, as `sys.stdout` might be replaced, e.g. by a `sitecustomize` module,
      * with a stream which has no `buffer`, or which does not write to the standard output at all.
@@ -172,14 +194,14 @@ public object PythonEnvironment {
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
         """
-        |import importlib.util, sys
+        |import importlib.util, os, sys
         |values = [
         |    sys.executable,
         |    sys.implementation.cache_tag,
         |    sys.prefix,
         |    importlib.util.find_spec('jep').submodule_search_locations[0],
         |]
-        |payload = '\0'.join('' if value is None else str(value) for value in values)
+        |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
         |sys.stdout.flush()
         |sys.__stdout__.flush()
         |sys.__stdout__.buffer.write(('\n$PROBE_BEGIN\n' + payload + '\n$PROBE_END\n').encode('utf-8'))
@@ -230,6 +252,39 @@ internal fun pythonCommand(python: String, code: String, vararg arguments: Strin
     "import sys\nif sys.path[:1] == ['']: del sys.path[0]\n$code",
     *arguments
 )
+
+/**
+ * The encoding of the file paths of the JVM, the one of the locale on POSIX, `sun.jnu.encoding`,
+ * with which the JVM passes a path, also in the command line of a process, to the OS,
+ * or UTF-8 on Windows, where the paths are UTF-16, and Python encodes them in UTF-8 with `os.fsencode`.
+ */
+internal val filesystemCharset: Charset =
+    if (System.getProperty("os.name").startsWith("Windows")) Charsets.UTF_8
+    else System.getProperty("sun.jnu.encoding")?.let { Charset.forName(it) } ?: Charset.defaultCharset()
+
+/**
+ * The Python expression of the [path] of the JVM, as the `str` of the same path in Python,
+ * decoded by `os.fsdecode` from its bytes in the [filesystemCharset].
+ *
+ * Python in UTF-8 mode decodes a path of the file system from UTF-8, surrogate-escaping the bytes which are not,
+ * so under a non-UTF-8 locale, e.g. `/home/josé` in ISO-8859-1,
+ * the `str` of the path of the JVM, as passed by Jep, would be another path, encoded in UTF-8.
+ * A path in the command line of a Python process is decoded by Python the same way, and needs no such conversion.
+ */
+internal fun pythonPath(path: String): String =
+    "__import__('os').fsdecode(bytes.fromhex('${path.toByteArray(filesystemCharset).toHex()}'))"
+
+private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
+
+/** The path of the hex digits of its bytes in the [filesystemCharset], or `null` if they are not hex digits. */
+private fun String.hexToPath(): String? {
+    if (length % 2 != 0) return null
+    val bytes = ByteArray(length / 2)
+    for (i in bytes.indices) {
+        bytes[i] = substring(i * 2, i * 2 + 2).toIntOrNull(16)?.toByte() ?: return null
+    }
+    return String(bytes, filesystemCharset)
+}
 
 /**
  * What a Python executable tells about itself.
