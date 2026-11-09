@@ -395,6 +395,120 @@ class PythonTest {
     }
 
     @Test
+    fun `should reject evaluating Python callable to functional interface`() {
+        // when
+        val runnable = assertFailsWith<IllegalArgumentException> {
+            python.eval("lambda: 1", Runnable::class.java)
+        }
+        val function = assertFailsWith<IllegalArgumentException> {
+            python.eval("str.upper", java.util.function.Function::class.java)
+        }
+
+        // then
+        assert(
+            runnable.message == "A Python object is converted to its repr, which is not a java.lang.Runnable"
+        )
+        assert(
+            function.message == "A Python object is converted to its repr, which is not a java.util.function.Function"
+        )
+    }
+
+    @Test
+    fun `should reject evaluating Python object to AutoCloseable`() {
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            python.eval("len", AutoCloseable::class.java)
+        }
+
+        // then
+        assert(exception.message == "A Python object is converted to its repr, which is not a java.lang.AutoCloseable")
+    }
+
+    @Test
+    fun `should keep working after rejecting Python callable as functional interface`() {
+        // given
+        assertFailsWith<IllegalArgumentException> {
+            python.eval("lambda: 1", Runnable::class.java)
+        }
+
+        // when
+        val result = python.eval<Long>("1 + 1")
+
+        // then
+        assert(result == 2L)
+    }
+
+    @Test
+    fun `should evaluate to repr of Python callables in array of functional interface`() {
+        // given
+        val arrayOfComparables = arrayOf<Comparable<*>>().javaClass
+        val arrayOfArraysOfComparables = arrayOf<Array<Comparable<*>>>().javaClass
+
+        // when
+        val comparables = python.eval("[len]", arrayOfComparables)
+        val nested = python.eval("[[len], [abs]]", arrayOfArraysOfComparables)
+
+        // then
+        assert(comparables.toList() == listOf("<built-in function len>"))
+        assert(nested.map { it.toList() } == listOf(listOf("<built-in function len>"), listOf("<built-in function abs>")))
+    }
+
+    @Test
+    fun `should reject evaluating Python callables to array of functional interface not holding repr`() {
+        // given
+        val arrayOfRunnables = arrayOf<Runnable>().javaClass
+
+        // when
+        val exception = assertFailsWith<IllegalArgumentException> {
+            python.eval("[len]", arrayOfRunnables)
+        }
+
+        // then
+        assert(
+            exception.message == "A value holding Python objects is copied to a List, a Set, a Map or an array, " +
+                    "which is not a java.lang.Runnable[]"
+        )
+    }
+
+    @Test
+    fun `should return repr of Python callable passed to Kotlin as functional interface`() {
+        // given
+        val holder = RunnableHolder()
+        python["holder"] = holder
+        python.exec("holder.add(lambda: None)")
+
+        // when
+        val runnables = python("holder.getRunnables()")
+        val map = python("{'runnables': holder.getRunnables()}")
+        val got = python["holder"]
+
+        // then
+        assert(runnables is List<*> && runnables.single().toString().startsWith("<function <lambda> at "))
+        assert(map is Map<*, *> && (map["runnables"] as List<*>).single().toString().startsWith("<function <lambda> at "))
+        // the holder is returned as it is, as Jep passes a Java object through
+        assert(got === holder)
+    }
+
+    @Test
+    fun `should evaluate to interface type implemented by converted value`() {
+        // when
+        val list = python.eval("[1, 2]", List::class.java)
+        val collection = python.eval("[1, 2]", Collection::class.java)
+        val map = python.eval("{'a': 1}", Map::class.java)
+        val charSequence = python.eval("'foo'", CharSequence::class.java)
+        val comparableString = python.eval("'foo'", Comparable::class.java)
+        val comparableNumber = python.eval("42", Comparable::class.java)
+
+        // then
+        assert(list == listOf(1L, 2L))
+        assert(collection.toList() == listOf(1L, 2L))
+        assert(map == mapOf("a" to 1L))
+        assert(charSequence == "foo")
+        assert(comparableString == "foo")
+        assert(comparableNumber == 42L)
+    }
+
+    @Test
     fun `should evaluate to typed nested array holding repr of value not convertible to Java`() {
         // given
         val arrayOfLists = arrayOf<List<*>>().javaClass
@@ -747,5 +861,18 @@ class PythonTest {
         val dependencyDirectory = PythonEnvironment.dependencyDirectory.toString()
         assert(path.filter { it != dependencyDirectory } == executablePath)
     }
+
+}
+
+/** Holds the [Runnable]s added from Python, which Jep converts to proxies of Python callables. */
+class RunnableHolder {
+
+    private val runnables = ArrayList<Runnable>()
+
+    fun add(runnable: Runnable) {
+        runnables.add(runnable)
+    }
+
+    fun getRunnables(): List<Runnable> = runnables
 
 }

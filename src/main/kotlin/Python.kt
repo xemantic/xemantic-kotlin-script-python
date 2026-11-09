@@ -19,9 +19,11 @@
 package com.xemantic.kotlin.script.python
 
 import jep.SharedInterpreter
+import jep.python.InvocationHandler
 import jep.python.PyCallable
 import jep.python.PyObject
 import org.intellij.lang.annotations.Language
+import java.lang.reflect.Proxy
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.concurrent.ExecutionException
@@ -63,6 +65,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * a `str` a [String], and a `list` a [List].
  * A returned value which Jep cannot convert, also when nested in a [Collection], a [Map] or an array,
  * becomes its Python `repr`, as a Python object cannot be used outside the thread of this `Python`.
+ * So does a Python object, which Jep converts to a proxy of a Java interface, as calling the proxy calls Python,
+ * e.g. a Python function passed to a Kotlin function taking a [Runnable], or an element of `eval("[len]", Comparable[]::class.java)`.
  * If different keys of a `dict`, or elements of a [Set], have the same `repr`, e.g. `{'Point': 1, Point(): 2}`,
  * an [IllegalStateException] is thrown, not to drop an entry silently.
  *
@@ -150,7 +154,11 @@ public class Python private constructor(
      * so it cannot be of another collection type, like `ArrayDeque`.
      *
      * @throws IllegalArgumentException if [T] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`,
-     * or if [T] is another collection type, and the value holds Python objects.
+     * or if [T] is another collection type, and the value holds Python objects,
+     * or if the value is a Python object, which Jep converts to a proxy of the interface [T],
+     * like a Python callable of `eval<Runnable>("lambda: 1")`, as its `repr` is not a [T].
+     * Such a proxy is not returned, as calling it from another thread fails,
+     * and dispatching its calls to the thread of this `Python` would fail once it is closed.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
@@ -167,7 +175,11 @@ public class Python private constructor(
      * so it cannot be of another collection type, like `ArrayDeque`.
      *
      * @throws IllegalArgumentException if the [type] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`,
-     * or if the [type] is another collection type, and the value holds Python objects.
+     * or if the [type] is another collection type, and the value holds Python objects,
+     * or if the value is a Python object, which Jep converts to a proxy of the interface [type],
+     * like a Python callable of `eval("lambda: 1", Runnable::class.java)`, as its `repr` is not of the [type].
+     * Such a proxy is not returned, as calling it from another thread fails,
+     * and dispatching its calls to the thread of this `Python` would fail once it is closed.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T = call {
@@ -175,9 +187,10 @@ public class Python private constructor(
         require(!type.holdsPyObject()) { "A PyObject cannot leave the thread of Python" }
         val raw = getValue(expression, type)
         val value = toJava(raw)
-        // a copy is a List, a Set, a Map, or an array, which might not be the type requested
+        // a repr is a String, and a copy a List, a Set, a Map, or an array, which might not be the type requested
         require(value === raw || type.isInstance(value)) {
-            "A value holding Python objects is copied to a List, a Set, a Map or an array, which is not a ${type.name}"
+            if (raw.toPyObject() != null) "A Python object is converted to its repr, which is not a ${type.typeName}"
+            else "A value holding Python objects is copied to a List, a Set, a Map or an array, which is not a ${type.typeName}"
         }
         type.cast(value)
     }
@@ -274,17 +287,22 @@ public class Python private constructor(
     }
 
     /**
-     * Replaces each [PyObject] of the [value], also nested in a [Collection], a [Map] or an array, with its `repr`,
+     * Replaces each Python object of the [value], also nested in a [Collection], a [Map] or an array, with its `repr`,
      * as it is bound to the thread of this interpreter.
+     * A Python object is a [PyObject], or a proxy of a Java interface, which Jep creates for it, see [toPyObject].
      *
-     * Only a top-level [PyObject] is closed, as it is created by Jep for this value.
+     * Only a top-level Python object is closed, as it is created by Jep for this value.
      * A nested one can be held by a Java collection, which Python can still use, e.g. set with `python["k"] = list`,
      * so it is only left out of the returned copy, and Jep releases it once it is garbage collected.
      */
-    private fun SharedInterpreter.toJava(value: Any?): Any? = when (value) {
-        is PyObject -> value.use { PyObjectConverter(this).use { converter -> converter.convert(it) } }
-        is Collection<*>, is Map<*, *>, is Array<*> -> PyObjectConverter(this).use { it.convert(value) }
-        else -> value
+    private fun SharedInterpreter.toJava(value: Any?): Any? {
+        val pyObject = value.toPyObject()
+        return when {
+            pyObject != null -> pyObject.use { PyObjectConverter(this).use { converter -> converter.convert(value) } }
+            value is Collection<*> || value is Map<*, *> || value is Array<*> ->
+                PyObjectConverter(this).use { it.convert(value) }
+            else -> value
+        }
     }
 
     /**
@@ -293,10 +311,11 @@ public class Python private constructor(
      * A value without any [PyObject] is returned as it is.
      * Otherwise each [Collection], [Map] and array reachable from it is copied, never changed,
      * a [Set] to a [LinkedHashSet], another [Collection] than a [List] to an [ArrayList],
-     * and an array to an array of the same component type, unless it cannot hold a `repr`, like `PyObject[]`,
-     * which is widened to `Object[]`, so that the copy can be cast to the type requested from [eval],
+     * and an array to an array of the same component type, unless it cannot hold the copy of an element,
+     * like `PyObject[]`, or `Runnable[]` of proxies, which is widened to `Object[]`,
+     * so that the copy can be cast to the type requested from [eval],
      * also when it contains itself, so that the copy contains itself as well.
-     * The same [PyObject] becomes the same `repr`.
+     * The same Python object becomes the same `repr`.
      */
     private class PyObjectConverter(private val interpreter: SharedInterpreter) : AutoCloseable {
 
@@ -309,8 +328,11 @@ public class Python private constructor(
             if (containsPyObject(value, Collections.newSetFromMap(IdentityHashMap()))) copy(value) else value
 
         // only the containers are tracked, which can form a cycle, not to track each element of a large list
-        private fun containsPyObject(value: Any?, visited: MutableSet<Any>): Boolean = when (value) {
-            is PyObject -> true
+        // a Python object first, as a proxy can also implement a Collection or a Map, and must not be copied as one
+        private fun containsPyObject(value: Any?, visited: MutableSet<Any>): Boolean =
+            value.toPyObject() != null || containsPyObjectElement(value, visited)
+
+        private fun containsPyObjectElement(value: Any?, visited: MutableSet<Any>): Boolean = when (value) {
             is Collection<*> -> visited.add(value) && value.any { containsPyObject(it, visited) }
             is Map<*, *> -> visited.add(value) && value.any { (key, element) ->
                 containsPyObject(key, visited) || containsPyObject(element, visited)
@@ -322,8 +344,8 @@ public class Python private constructor(
         private fun copy(value: Any?): Any? {
             if (value == null) return null
             copies[value]?.let { return it }
+            value.toPyObject()?.let { pyObject -> return repr(pyObject).also { copies[value] = it } }
             return when (value) {
-                is PyObject -> repr(value).also { copies[value] = it }
                 is Set<*> -> LinkedHashSet<Any?>().also { copy ->
                     copies[value] = copy
                     value.forEach { element ->
@@ -343,7 +365,7 @@ public class Python private constructor(
                         copy[copiedKey] = copy(element)
                     }
                 }
-                is Array<*> -> newArray(value.javaClass.componentType, value.size).also { copy ->
+                is Array<*> -> newArray(arrayCopyClass(value), value.size).also { copy ->
                     copies[value] = copy
                     value.forEachIndexed { index, element -> copy[index] = copy(element) }
                 }
@@ -351,21 +373,43 @@ public class Python private constructor(
             }
         }
 
+        @Suppress("UNCHECKED_CAST")
+        private fun newArray(arrayClass: Class<*>, size: Int): Array<Any?> =
+            java.lang.reflect.Array.newInstance(arrayClass.componentType, size) as Array<Any?>
+
+        /** The class of the copy of each array, by its identity, decided before copying it. */
+        private val arrayCopyClasses = IdentityHashMap<Array<*>, Class<*>>()
+
         /**
-         * Creates an array, which can hold the copy of each element of an array of the [componentType]:
-         * a type which can hold a [PyObject], or its subtype, but not its `repr`, is widened to [Any],
-         * also of a nested array.
+         * Returns the class of the copy of the [array], which is its own class,
+         * if it can hold the copy of each element, or `Object[]` otherwise.
+         *
+         * It is decided before copying the array, so that the copy can contain itself.
+         * An array reached again while deciding, i.e. containing itself, is assumed to keep its class,
+         * which is safe, as its component type can hold an array, so also `Object[]`.
          */
-        private fun newArray(componentType: Class<*>, size: Int): Array<Any?> {
-            @Suppress("UNCHECKED_CAST")
-            return java.lang.reflect.Array.newInstance(copyType(componentType), size) as Array<Any?>
+        private fun arrayCopyClass(array: Array<*>): Class<*> {
+            arrayCopyClasses[array]?.let { return it }
+            arrayCopyClasses[array] = array.javaClass
+            val componentType = array.javaClass.componentType
+            val copyClass = if (array.all { element -> copyClass(element)?.let { componentType.isAssignableFrom(it) } ?: true }) {
+                array.javaClass
+            } else {
+                Array<Any?>::class.java
+            }
+            arrayCopyClasses[array] = copyClass
+            return copyClass
         }
 
-        private fun copyType(type: Class<*>): Class<*> = when {
-            type.isArray -> java.lang.reflect.Array.newInstance(copyType(type.componentType), 0).javaClass
-            type.isAssignableFrom(PyObject::class.java) && !type.isAssignableFrom(String::class.java) -> Any::class.java
-            PyObject::class.java.isAssignableFrom(type) -> Any::class.java
-            else -> type
+        /** Returns the class of the [copy] of the [value], or `null` for `null`. */
+        private fun copyClass(value: Any?): Class<*>? = when {
+            value == null -> null
+            value.toPyObject() != null -> String::class.java
+            value is Set<*> -> LinkedHashSet::class.java
+            value is Collection<*> -> ArrayList::class.java
+            value is Map<*, *> -> LinkedHashMap::class.java
+            value is Array<*> -> arrayCopyClass(value)
+            else -> value.javaClass
         }
 
         private fun repr(value: PyObject): String {
@@ -393,6 +437,18 @@ public class Python private constructor(
         ): Python = Python(decorateExecutor)
 
         private val threadCounter = AtomicInteger()
+
+        /**
+         * Returns this value as a [PyObject], also when it is a proxy of a Java interface,
+         * which Jep creates for a Python object converted to an interface,
+         * or `null` if it is not a Python object.
+         */
+        private fun Any?.toPyObject(): PyObject? = when {
+            this is PyObject -> this
+            this != null && Proxy.isProxyClass(javaClass) ->
+                (Proxy.getInvocationHandler(this) as? InvocationHandler)?.pyObject
+            else -> null
+        }
 
         /**
          * Splits the code into the statements before its last expression, and this expression,
