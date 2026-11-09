@@ -72,8 +72,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The embedded CPython does not detect a virtual environment by itself —
   without the venv's `python` as its program name (`PyConfig.setProgramName`), it ignores `pyvenv.cfg` and also imports from the global and user `site-packages` of the base Python.
   When a module is unexpectedly importable, check `sys.path` of the embedded interpreter, not of `.venv/bin/python`.
-- `libjep.so` finds `libpython3.*.so` only through the dynamic linker, so a `-PbasePython` outside the system library directories needs `LD_LIBRARY_PATH` set —
-  and a running Gradle daemon does not pass a changed `LD_LIBRARY_PATH` on to the test JVM, so use `--no-daemon` when trying such a Python locally.
+- A running Gradle daemon does not pass a changed `LD_LIBRARY_PATH` on to the test JVM,
+  so use `--no-daemon` when trying a `-PbasePython` which needs it (see [DEVELOPMENT.md](DEVELOPMENT.md#the-python-of-the-tests)).
 
 ## Anti-patterns to avoid
 

@@ -18,10 +18,12 @@ or with the `ORG_GRADLE_PROJECT_basePython` environment variable, e.g. on CI:
 ```
 
 It has to be Python 3.10 or newer, otherwise the build fails before creating the environment.
-On Linux, a Python outside the system library directories, e.g. installed by `uv` or `pyenv`,
-also needs its `lib` directory in `LD_LIBRARY_PATH`,
-otherwise the tests fail to load `libjep.so`, which cannot find `libpython3.*.so`
-(`actions/setup-python` sets it on CI).
+On Linux, the tests fail to load `libjep.so` when it cannot find `libpython3.*.so` ([#54](https://github.com/xemantic/xemantic-kotlin-script-python/issues/54)).
+A Python outside the system library directories, e.g. installed by `uv`,
+needs its `lib` directory in `LD_LIBRARY_PATH`,
+which `actions/setup-python` sets on CI.
+`pyenv` builds Python without a shared `libpython` by default,
+build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"` (and then set `LD_LIBRARY_PATH` as well).
 
 An existing `.venv` is judged by its own Python:
 it is kept when this Python runs, is 3.10 or newer, and has `pip`,
@@ -37,10 +39,11 @@ The base Python of `.venv` is recorded in `.venv/base-python.txt`,
 an input of the tests, so that they run again after it changes.
 
 Besides the build with the `python3` of the runner,
-CI builds with the minimum and the latest supported Python,
+CI runs the tests with the minimum supported Python, and the newest one verified with the pinned jep,
 set up by `actions/setup-python` and passed as `ORG_GRADLE_PROJECT_basePython`,
 see [build-python.yml](.github/workflows/build-python.yml).
-Update its matrix when the minimum is raised, or a new Python is released.
+Update its matrix when the minimum is raised,
+and bump the newest one after the tests pass with it locally (`-PbasePython`), usually together with a jep update.
 
 ## Update gradlew wrapper
 

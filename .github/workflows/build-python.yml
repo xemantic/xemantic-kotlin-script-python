@@ -1,4 +1,5 @@
-# Builds with the minimum and the latest supported Python, the test venv created from it
+# Tests with the minimum supported Python and the newest one verified with the pinned jep,
+# the test venv created from it
 name: Build Python versions
 
 on:
@@ -7,9 +8,15 @@ on:
       - main
   pull_request:
 
+# a new push to a pull request cancels its previous run, a push to main gets a group of its own,
+# so that it is neither cancelled nor replaced while pending
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build with Python ${{ matrix.python }}
+    name: Test with Python ${{ matrix.python }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -36,7 +43,8 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
 
-      - name: Build
-        run: ./gradlew build
+      # only the tests depend on the Python, the rest is built by the shared workflow
+      - name: Test
+        run: ./gradlew test
         env:
           ORG_GRADLE_PROJECT_basePython: ${{ steps.python.outputs.python-path }}
