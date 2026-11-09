@@ -22,7 +22,10 @@ import jep.Interpreter
 import jep.python.PyCallable
 import org.intellij.lang.annotations.Language
 import java.io.File
+import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.channels.FileLockInterruptionException
+import java.nio.file.Path
 import java.nio.file.StandardOpenOption.CREATE
 import java.nio.file.StandardOpenOption.WRITE
 import java.util.concurrent.locks.ReentrantLock
@@ -52,8 +55,12 @@ internal object PythonDependencies {
 
     /**
      * The file in the dependency directory, locked by every JVM while it installs into the directory.
+     *
+     * Not `.lock`, which `uv pip install --target` locks itself while this JVM waits for it,
+     * where the locks of both interact, e.g. on Windows, macOS, or NFS,
+     * so uv would wait for its timeout, and then install without locking.
      */
-    internal const val LOCK_FILE_NAME = ".lock"
+    internal const val LOCK_FILE_NAME = ".xemantic-kotlin-script-python.lock"
 
     private val blockStart = Regex("# /// [a-zA-Z0-9-]+")
 
@@ -117,7 +124,7 @@ internal object PythonDependencies {
     fun install(code: String, interpreter: Interpreter) {
         // before locking, so that code without metadata does not wait for an installation of another thread
         val metadata = scriptMetadata(code) ?: return
-        // interruptible, unlike a monitor, as the installation of another process can take long
+        // unlike a monitor, a thread waiting here for a long installation can be interrupted
         installLock.lockInterruptibly()
         try {
             installMetadata(metadata, interpreter)
@@ -127,17 +134,22 @@ internal object PythonDependencies {
     }
 
     private fun installMetadata(metadata: String, interpreter: Interpreter) {
-        val directory = PythonEnvironment.dependencyDirectory!!.createDirectories()
+        val directory = PythonEnvironment.dependencyDirectory!!
         val imported = interpreter.getValue(
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
             List::class.java
         ).map { it.toString() }
-        // locked by another JVM installing into the same directory, e.g. a shared one of the user cache,
-        // which would otherwise delete or overwrite the files being installed;
-        // the lock file is never deleted, as another process could have opened it before, and lock a deleted file
-        FileChannel.open(directory.resolve(LOCK_FILE_NAME), CREATE, WRITE).use { channel ->
-            channel.lock().use {
-                planAndInstall(metadata, directory.toString(), imported)
+        // without locking, as the plan only reads the directory, which can be read-only when nothing is missing,
+        // and so that the installed dependencies do not wait for an installation of another process
+        if (plan(metadata, directory.toString(), imported).missing().isNotEmpty()) {
+            withDirectoryLock(directory) {
+                // again, as another process could have installed them meanwhile
+                val plan = plan(metadata, directory.toString(), imported)
+                val missing = plan.missing()
+                if (missing.isNotEmpty()) {
+                    val constraints = plan.filter { it.first == "constraint" }.map { it.second }
+                    installMissing(missing, constraints, directory.toString())
+                }
             }
         }
         @Suppress("UNCHECKED_CAST")
@@ -150,11 +162,37 @@ internal object PythonDependencies {
         interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
     }
 
-    private fun planAndInstall(metadata: String, directory: String, imported: List<String>) {
-        val plan = plan(metadata, directory, imported)
-        val missing = plan.filter { it.first == "install" }.map { it.second }
-        if (missing.isNotEmpty()) {
-            installMissing(missing, plan.filter { it.first == "constraint" }.map { it.second }, directory)
+    private fun List<Pair<String, String>>.missing() = filter { it.first == "install" }.map { it.second }
+
+    /**
+     * Runs the [block] with the [LOCK_FILE_NAME] of the dependency [directory] locked,
+     * against another JVM installing into the same directory, e.g. a shared one of the user cache,
+     * which would otherwise delete or overwrite the files being installed.
+     *
+     * The lock file is never deleted, as another process could have opened it already, and would lock a deleted file.
+     *
+     * @throws PythonDependencyException if the directory cannot be locked, e.g. when it is not writable.
+     */
+    private fun withDirectoryLock(directory: Path, block: () -> Unit) {
+        val lockFile = directory.resolve(LOCK_FILE_NAME)
+        fun cannotLock(e: IOException) =
+            PythonDependencyException("Cannot lock the dependency directory with $lockFile: $e")
+        val channel = try {
+            directory.createDirectories()
+            FileChannel.open(lockFile, CREATE, WRITE)
+        } catch (e: IOException) {
+            throw cannotLock(e)
+        }
+        channel.use {
+            val lock = try {
+                channel.lock()
+            } catch (e: FileLockInterruptionException) {
+                throw e
+            } catch (e: IOException) {
+                // e.g. ENOLCK of a network file system without locking
+                throw cannotLock(e)
+            }
+            lock.use { block() }
         }
     }
 
