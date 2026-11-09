@@ -1,0 +1,42 @@
+# Builds with the minimum and the latest supported Python, the test venv created from it
+name: Build Python versions
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    name: Build with Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: [ '3.10', '3.14' ]
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v7
+
+      # also exports JAVA_HOME, which pip needs to build jep, published only as a source distribution
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: ${{ vars.DEFAULT_JAVA_DISTRIBUTION }}
+          java-version: ${{ vars.DEFAULT_JAVA_VERSION }}
+
+      - name: Setup Python
+        id: python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build
+        run: ./gradlew build
+        env:
+          ORG_GRADLE_PROJECT_basePython: ${{ steps.python.outputs.python-path }}
