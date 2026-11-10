@@ -475,7 +475,7 @@ class PythonEnvironmentTest {
         try {
             // when
             val exception = assertFailsWith<IllegalStateException> {
-                PythonEnvironment.findJepLibrary(jepDirectory, "python3")
+                PythonEnvironment.jepLibrary(jepDirectory, "python3")
             }
 
             // then
@@ -539,7 +539,82 @@ class PythonEnvironmentTest {
             val length = probe.error.length
             val startsWithWarning = probe.error.startsWith("Could not find platform libraries")
             val truncated = probe.error.endsWith("[truncated]")
-            assert(length <= 9000 && startsWithWarning && truncated)
+            assert(length <= PythonEnvironment.PROBE_ERROR_LIMIT && startsWithWarning && truncated)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should limit stderr kept of successful probe without splitting surrogate pair`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        // an odd character before the surrogate pairs of 😀, so that the even limit falls within one of them
+        python.writeText(
+            """
+            |#!/bin/sh
+            |"$venvPython" -c "import sys; sys.stderr.write('x' + '\U0001F600' * 100000)"
+            |exec "$venvPython" "${'$'}@"
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python.toString())
+
+            // then
+            // measured, as power-assert would render the whole error on failure
+            val length = probe.error.length
+            val wellFormed = probe.error.toByteArray(Charsets.UTF_8).toString(Charsets.UTF_8) == probe.error
+            val truncated = probe.error.endsWith("[truncated]")
+            assert(wellFormed)
+            assert(length <= PythonEnvironment.PROBE_ERROR_LIMIT && truncated)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report probe output without values and without output in one line`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        python.writeText("#!/bin/sh\n")
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python.toString())
+            }
+
+            // then
+            val message = exception.message!!
+            assert(python.toString() in message && "\n" !in message)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report jep package directory which cannot be listed`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val jepDirectory = directory.resolve("missing-jep")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.jepLibrary(jepDirectory, "/venv/bin/python")
+            }
+
+            // then
+            assert(jepDirectory.toString() in exception.message!!)
         } finally {
             directory.deleteRecursively()
         }
@@ -559,28 +634,32 @@ class PythonEnvironmentTest {
 
         // then
         val message = exception.message!!
+        // the message of the Error is the class and message of its cause, which the headline does not repeat
         assert(
             exception.cause === error &&
-                message.startsWith("Cannot initialize the embedded Python /venv/bin/python") &&
-                "failed to get the Python codec of the filesystem encoding" in message &&
+                message.startsWith(
+                    "Cannot initialize the embedded Python /venv/bin/python: " +
+                        "failed to get the Python codec of the filesystem encoding\n"
+                ) &&
                 "Could not find platform libraries <exec_prefix>" in message
         )
     }
 
     @Test
-    fun `should report Error of embedded Python which previously failed to start after another started`() {
+    fun `should not report stderr of probe on Error after embedded Python started`() {
         // given
         val starter = EmbeddedPythonStarter("/venv/bin/python", "a warning")
         starter.createInterpreter(create = { FakeInterpreter() }, check = {}).close()
-        val error = Error("The main Python interpreter previously failed to initialize.")
+        // the embedded CPython starts once per JVM, so an Error afterward is not a failure of its startup
+        val error = NoClassDefFoundError("some/Class")
 
         // when
-        val exception = assertFailsWith<IllegalStateException> {
+        val exception = assertFailsWith<NoClassDefFoundError> {
             starter.createInterpreter(create = { throw error }, check = {})
         }
 
         // then
-        assert(exception.cause === error && "a warning" in exception.message!!)
+        assert(exception === error)
     }
 
     @Test

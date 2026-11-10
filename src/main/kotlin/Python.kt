@@ -61,9 +61,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * a `str` a [String], and a `list` a [List].
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
- * If it cannot be resolved, or the embedded CPython fails to start, the call fails with an [IllegalStateException],
- * with the original failure, e.g. of Jep, as its cause.
- * Its message includes what the probe of the Python executable wrote to the standard error, if anything,
+ * If it cannot be resolved, or the embedded CPython fails to start, the call fails with an [IllegalStateException].
+ * When the embedded CPython fails to start, its cause is the original failure, e.g. of Jep,
+ * and its message includes what the probe of the Python executable wrote to the standard error, if anything,
  * e.g. the `Could not find platform libraries` warning of a wrong `PYTHONHOME`, which might tell why.
  * Once the embedded CPython fails to start, every `Python` fails, as it can be started only once per JVM.
  */
