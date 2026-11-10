@@ -56,10 +56,20 @@ import java.util.concurrent.atomic.AtomicInteger
  * Only the running call completes, also when a Kotlin function it calls calls back this `Python`,
  * and the interpreter is closed after it,
  * exactly once, on the thread of this `Python`.
- * Also such a Kotlin function can call `close()`, which then closes this `Python` after the running call.
+ * Also such a Kotlin function can call `close()`, directly or from another thread it waits for,
+ * which then closes this `Python` after the running call.
  *
  * A Kotlin function can be set as a global variable and called from Python, like `python["f"] = { n: Long -> n * 2 }`.
- * It runs on the thread of this `Python`, and can call it back.
+ * It runs on the thread which calls it from Python: the thread of this `Python`,
+ * unless the Python code calls it from a thread of its own, like a `threading.Thread`.
+ * On the thread of this `Python` it can call this `Python` back directly, as a part of the running call,
+ * while on another thread, its call waits for its turn, like any call from another thread.
+ * The running call must not wait for another thread calling this `Python`, e.g. a Kotlin function
+ * with `thread { python.eval<Long>("x") }.join()`, or `runBlocking(Dispatchers.IO) { python["x"] }`,
+ * or Python code joining a `threading.Thread` which calls a Kotlin function calling this `Python`:
+ * such a call waits for its turn behind the running call, which waits for it, so both wait forever.
+ * It cannot be detected, as a call from another thread, made during the running call, can as well just wait for its turn.
+ * Call this `Python` directly from a Kotlin function running on the thread of this `Python` instead.
  *
  * The values are converted between Java and Python by Jep, e.g. a Python `int` becomes a [Long],
  * a `str` a [String], and a `list` a [List].
@@ -90,6 +100,10 @@ public class Python private constructor(
     })
 
     private val closed = AtomicBoolean(false)
+
+    /** Whether a call is running on the thread of this `Python`, written only by this thread, see [close]. */
+    @Volatile
+    private var running = false
 
     private var interpreter: SharedInterpreter? = null
 
@@ -222,16 +236,21 @@ public class Python private constructor(
     /**
      * Closes the interpreter and releases its thread.
      *
-     * It waits for the running call, if any, to complete, also calling back this `Python` from a Kotlin function,
-     * and then closes the interpreter on its thread.
+     * Unless a call is running, or starting or ending on the thread of this `Python`,
+     * it closes the interpreter on its thread, and waits for it,
+     * so that the interpreter is closed when it returns.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
      * Calling it again has no effect, and returns immediately.
      *
-     * Called by a Kotlin function, which is called from Python, it does not wait,
-     * as the running call is the one which called it:
+     * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
      * still able to call back this `Python`, and the interpreter is closed after it returns.
-     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is lost.
+     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is not reported,
+     * and if the JVM exits before the running call returns, e.g. at the end of `main`,
+     * the interpreter is never closed, as its thread is a daemon one.
+     * Waiting would deadlock, when the running call waits for `close()`:
+     * when it is called by a Kotlin function called from Python, or by another thread, which this function,
+     * or the Python code, waits for, and it cannot be told apart from a `close()` which the running call does not wait for.
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -246,9 +265,11 @@ public class Python private constructor(
         } finally {
             executor.shutdown()
         }
-        // called by a Kotlin function, called from Python, the running call is still on the stack of this thread,
-        // and the task of close() can run only after it, so waiting for it here would deadlock
-        if (Thread.currentThread() === thread) return
+        // the task of close() can run only after the running call, which might wait for this close(),
+        // called by a Kotlin function, called from Python, or by a thread it waits for, so waiting here could deadlock;
+        // read after setting closed, so that a call, which is not running yet, sees it closed before running any code,
+        // and then the task of close() runs right after it
+        if (running) return
         try {
             closing.get()
         } catch (e: ExecutionException) {
@@ -259,19 +280,25 @@ public class Python private constructor(
     private fun <T> call(block: SharedInterpreter.() -> T): T {
         // a Kotlin function called from Python, calling back this Python, runs already on its thread,
         // where waiting for the executor would deadlock; it belongs to the running call, which completes
-        // even if close() is already waiting for it, as the task of close() cannot run before
+        // even if close() is already called, as the task of close() cannot run before
         if (Thread.currentThread() === thread) return interpreter!!.block()
         checkNotClosed()
         val future = try {
             executor.submit<T> {
-                // close() might have been called after this call was submitted, and if its task has run already,
-                // creating a new interpreter here would leak it, never to be closed
-                checkNotClosed()
-                val interpreter = interpreter ?: run {
-                    PythonEnvironment.initialize()
-                    SharedInterpreter().also { interpreter = it }
+                // set before checking if closed, see close()
+                running = true
+                try {
+                    // close() might have been called after this call was submitted, and if its task has run already,
+                    // creating a new interpreter here would leak it, never to be closed
+                    checkNotClosed()
+                    val interpreter = interpreter ?: run {
+                        PythonEnvironment.initialize()
+                        SharedInterpreter().also { interpreter = it }
+                    }
+                    interpreter.block()
+                } finally {
+                    running = false
                 }
-                interpreter.block()
             }
         } catch (_: RejectedExecutionException) {
             // close() has shut down the executor after the check above
