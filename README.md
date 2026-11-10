@@ -61,24 +61,34 @@ In `build.gradle.kts` add:
 dependencies {
     implementation("com.xemantic.kotlin:xemantic-kotlin-script-python:0.1.0")
     // only for running Python in a ScriptSession, like below, as Python does not depend on it
-    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.0")
+    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.1")
 }
 ```
 
 Then:
 
 ```kotlin
-Python().use { python ->
-    ScriptSession {
-        "python" provides python
-    }.use { session ->
-        session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
-        session.execute("""python["factor"] = 3""")
-        val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
-        println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+import com.xemantic.kotlin.script.ScriptResult
+import com.xemantic.kotlin.script.ScriptSession
+import com.xemantic.kotlin.script.python.Python
+
+suspend fun main() {
+    Python().use { python ->
+        ScriptSession {
+            "python" provides python
+        }.use { session ->
+            session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
+            session.execute("""python["factor"] = 3""")
+            val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
+            println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+        }
     }
 }
 ```
+
+`ScriptSession.execute` is a suspending function,
+called here from a `suspend fun main()`,
+and otherwise from any coroutine, e.g. within `runBlocking`.
 
 The examples assume `numpy` installed in the Python environment,
 otherwise the code can declare it as a dependency, see below.
