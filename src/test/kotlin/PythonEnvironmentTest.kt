@@ -39,12 +39,18 @@ import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 
+/** The code of a `sitecustomize` module removing the `site-packages`, where jep is installed, from `sys.path`. */
+private const val WITHOUT_SITE_PACKAGES =
+    "import sys\nsys.path = [path for path in sys.path if 'site-packages' not in path]\n"
+
 class PythonEnvironmentTest {
 
     private val venvPython = Path(System.getenv("VIRTUAL_ENV"), "bin", "python").toString()
 
-    /** The version of `org.ninia:jep` in the version catalog, passed by the build. */
-    private val catalogJepVersion = System.getProperty("xemantic.kotlin.script.python.test.jepVersion")
+    /** The version of `org.ninia:jep` in the version catalog of the project, the working directory of the tests. */
+    private val catalogJepVersion = Regex("""(?m)^jep = "(.+)"$""")
+        .find(Path("gradle", "libs.versions.toml").readText())!!
+        .groupValues[1]
 
     @OptIn(ExperimentalPathApi::class)
     @Test
@@ -246,7 +252,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with output before and after values`() {
         // given
-        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")}\nmore noise"
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "")}\nmore noise"
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -260,7 +266,7 @@ class PythonEnvironmentTest {
         // given
         val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
             "${PythonEnvironment.PROBE_BEGIN}\n" +
-            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -272,7 +278,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with empty first value`() {
         // given
-        val output = probePayload("", "cpython-313", "/venv", "/venv/jep")
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -284,7 +290,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with values containing spaces and non-ASCII`() {
         // given
-        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep")
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -305,7 +311,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "")
             .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
@@ -316,10 +322,10 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should not parse probe output without exactly four values`() {
+    fun `should not parse probe output without exactly five values`() {
         // given
-        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv")
-        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "extra")
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "extra")
 
         // when
         val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
@@ -395,10 +401,7 @@ class PythonEnvironmentTest {
         // given
         val directory = createTempDirectory("python-probe")
         // the venv Python, without its site-packages, where jep is installed
-        val python = pythonWithSitecustomize(
-            directory,
-            "import sys\nsys.path = [path for path in sys.path if 'site-packages' not in path]\n"
-        )
+        val python = pythonWithSitecustomize(directory, WITHOUT_SITE_PACKAGES)
 
         try {
             // when
@@ -408,18 +411,65 @@ class PythonEnvironmentTest {
 
             // then
             val message = exception.message!!
-            // the probe tells that jep is missing, instead of failing with a traceback
-            // and how to install it where pip is allowed to, pinned to the version of the org.ninia:jep library
+            // the probe tells that jep is missing, instead of failing with a traceback,
+            // and how to install it, pinned to the version of the org.ninia:jep library,
+            // into this virtual environment, which might hold the other packages of the user
             assert(
                 message.startsWith("Cannot find the jep package of $python") &&
-                    "pip install jep==$catalogJepVersion" in message &&
-                    "$python -m venv" in message &&
-                    "VIRTUAL_ENV=" in message &&
-                    "PythonEnvironment.pythonExecutable" in message &&
-                    "JAVA_HOME" in message &&
+                    "$python -m pip install jep==$catalogJepVersion" in message &&
+                    "-m venv" !in message &&
                     "Traceback" !in message &&
                     !message.endsWith("\n")
             )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report missing jep package of externally managed Python`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, WITHOUT_SITE_PACKAGES + externallyManaged(directory))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            // pip refuses to install into it, only into a virtual environment
+            assert(
+                message.startsWith("Cannot find the jep package of $python") &&
+                    "$python -m venv" in message &&
+                    "-m pip install jep==$catalogJepVersion" in message &&
+                    "$python -m pip install" !in message &&
+                    "VIRTUAL_ENV" in message &&
+                    "PythonEnvironment.pythonExecutable" in message
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe whether Python is externally managed`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val managedPython = pythonWithSitecustomize(directory, externallyManaged(directory))
+
+        try {
+            // when
+            val venvProbe = PythonEnvironment.probePython(venvPython)
+            val managedProbe = PythonEnvironment.probePython(managedPython)
+
+            // then
+            // a virtual environment is never externally managed, even if its base Python is
+            assert(!venvProbe.externallyManaged && managedProbe.externallyManaged)
         } finally {
             directory.deleteRecursively()
         }
@@ -435,55 +485,120 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should advise installing jep into virtual environment on Windows`() {
+    fun `should not read version of jep library from malformed properties`() {
+        // given
+        val properties = "version=\\u12".byteInputStream()
+
+        // when
+        val version = readJepVersion(properties)
+
+        // then
+        assert(version == null)
+    }
+
+    @Test
+    fun `should advise installing jep with pip of Python which is not externally managed`() {
         // when
         val advice = jepInstallAdvice(
-            python = "C:\\Python313\\python.exe",
+            python = "/venv/bin/python",
+            externallyManaged = false,
             jepVersion = "4.3.2",
-            javaHome = "C:\\Program Files\\Java\\jdk-21",
+            javaHome = null,
+            userHome = "/home/jane",
+            windows = false
+        )
+
+        // then
+        assert(
+            "  /venv/bin/python -m pip install jep==4.3.2\n" in advice &&
+                "-m venv" !in advice &&
+                "jep is built from its source" in advice &&
+                "python3-dev" in advice &&
+                "javac on the PATH" in advice
+        )
+    }
+
+    @Test
+    fun `should advise installing jep into virtual environment of externally managed Python`() {
+        // when
+        val advice = jepInstallAdvice(
+            python = "/usr/bin/python3",
+            externallyManaged = true,
+            jepVersion = "4.3.2",
+            javaHome = null,
+            userHome = "/home/jane",
+            windows = false
+        )
+
+        // then
+        // the absolute path, also for VIRTUAL_ENV, which is not expanded outside a shell, e.g. in an IDE
+        assert(
+            "  /usr/bin/python3 -m venv /home/jane/.venvs/jep\n" in advice &&
+                "  /home/jane/.venvs/jep/bin/python -m pip install jep==4.3.2\n" in advice &&
+                "VIRTUAL_ENV to /home/jane/.venvs/jep" in advice &&
+                "PythonEnvironment.pythonExecutable" in advice &&
+                "~" !in advice
+        )
+    }
+
+    @Test
+    fun `should advise installing jep into virtual environment on Windows quoting paths with spaces`() {
+        // when
+        val advice = jepInstallAdvice(
+            python = "C:\\Program Files\\Python313\\python.exe",
+            externallyManaged = true,
+            jepVersion = "4.3.2",
+            javaHome = null,
+            userHome = "C:\\Users\\Jane Doe",
             windows = true
         )
 
         // then
         assert(
-            "C:\\Python313\\python.exe -m venv %USERPROFILE%\\.venvs\\jep" in advice &&
-                "%USERPROFILE%\\.venvs\\jep\\Scripts\\python.exe -m pip install jep==4.3.2" in advice &&
-                "VIRTUAL_ENV=%USERPROFILE%\\.venvs\\jep" in advice &&
-                "JAVA_HOME: C:\\Program Files\\Java\\jdk-21" in advice
+            "  \"C:\\Program Files\\Python313\\python.exe\" -m venv \"C:\\Users\\Jane Doe\\.venvs\\jep\"\n" in advice &&
+                "  \"C:\\Users\\Jane Doe\\.venvs\\jep\\Scripts\\python.exe\" -m pip install jep==4.3.2\n" in advice &&
+                "%" !in advice &&
+                "JAVA_HOME (not set)" in advice
         )
     }
 
     @Test
     fun `should advise installing jep without version when version of library is unknown`() {
         // when
-        val advice = jepInstallAdvice(python = "python3", jepVersion = null, javaHome = null, windows = false)
+        val advice = jepInstallAdvice(
+            python = "python3",
+            externallyManaged = false,
+            jepVersion = null,
+            javaHome = null,
+            userHome = "/home/jane",
+            windows = false
+        )
 
         // then
         assert(
-            "~/.venvs/jep/bin/python -m pip install jep\n" in advice &&
-                "the version of the org.ninia:jep library" in advice &&
-                "JAVA_HOME: not set" in advice
+            "  python3 -m pip install jep\n" in advice &&
+                "the version of the org.ninia:jep library" in advice
         )
     }
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should advise installing jep when its native library is missing`() {
+    fun `should advise reinstalling jep when its native library is missing`() {
         // given
         val jepDirectory = createTempDirectory("jep")
 
         try {
             // when
             val exception = assertFailsWith<IllegalStateException> {
-                PythonEnvironment.jepLibrary(jepDirectory, "python3")
+                PythonEnvironment.jepLibrary(jepDirectory, "/venv/bin/python", externallyManaged = false)
             }
 
             // then
+            // a plain pip install would tell that the requirement is already satisfied, and change nothing
             val message = exception.message!!
             assert(
                 message.startsWith("No native Jep library in $jepDirectory") &&
-                    "pip install jep==$catalogJepVersion" in message &&
-                    "python3 -m venv" in message
+                    "/venv/bin/python -m pip install --force-reinstall --no-cache-dir jep==$catalogJepVersion" in message
             )
         } finally {
             jepDirectory.deleteRecursively()
@@ -610,7 +725,7 @@ class PythonEnvironmentTest {
         try {
             // when
             val exception = assertFailsWith<IllegalStateException> {
-                PythonEnvironment.jepLibrary(jepDirectory, "/venv/bin/python")
+                PythonEnvironment.jepLibrary(jepDirectory, "/venv/bin/python", externallyManaged = false)
             }
 
             // then
@@ -723,6 +838,23 @@ class PythonEnvironmentTest {
     private fun probePayload(vararg values: String): String {
         val hexValues = values.joinToString(" ") { it.toByteArray(filesystemCharset).toHexString() }
         return "${PythonEnvironment.PROBE_BEGIN}\n$hexValues\n${PythonEnvironment.PROBE_END}"
+    }
+
+    /**
+     * The code of a `sitecustomize` module making the venv Python look like an externally managed base Python,
+     * with an `EXTERNALLY-MANAGED` file in its standard library directory, created in the [directory].
+     */
+    private fun externallyManaged(directory: Path): String {
+        val stdlib = directory.resolve("stdlib").createDirectory()
+        stdlib.resolve("EXTERNALLY-MANAGED").writeText("[externally-managed]\n")
+        return """
+            |import sys, sysconfig
+            |sys.base_prefix = sys.prefix
+            |get_path = sysconfig.get_path
+            |sysconfig.get_path = lambda name, *args, **kwargs: (
+            |    ${pythonPath(stdlib.toString())} if name == 'stdlib' else get_path(name, *args, **kwargs)
+            |)
+            |""".trimMargin()
     }
 
     /**

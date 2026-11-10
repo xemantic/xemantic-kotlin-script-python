@@ -125,8 +125,6 @@ tasks.test {
     // so that a test can check that a dependency is not installed yet
     val dependencyDirectory = layout.buildDirectory.dir("python-dependencies").get().asFile
     systemProperty("xemantic.kotlin.script.python.dependencyDirectory", dependencyDirectory.absolutePath)
-    // the version of the jep package, which the advice of installing it pins to the one of the org.ninia:jep library
-    systemProperty("xemantic.kotlin.script.python.test.jepVersion", libs.versions.jep.get())
     doFirst {
         dependencyDirectory.deleteRecursively()
     }
