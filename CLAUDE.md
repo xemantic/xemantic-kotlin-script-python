@@ -72,6 +72,11 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
   When a module is unexpectedly importable, check `sys.path` of the embedded interpreter, not of `.venv/bin/python`.
 - A running Gradle daemon does not pass a changed `LD_LIBRARY_PATH` on to the test JVM,
   so use `--no-daemon` when trying a `-PbasePython` which needs it (see [DEVELOPMENT.md](DEVELOPMENT.md#the-python-of-the-tests)).
+- Jep passes the `PyConfig` strings to CPython as JNI *modified* UTF-8 (`GetStringUTFChars`), not plain UTF-8 —
+  a character outside the BMP becomes a CESU-8 surrogate pair, which CPython does not decode as that character.
+  For a path under a non-UTF-8 locale, see `pythonPath`.
+- A machine may have only the `C`, `C.utf8` and `POSIX` locales,
+  but `localedef -i en_US -f ISO-8859-1 <dir>/en_US.ISO-8859-1` with `LOCPATH=<dir> LC_ALL=en_US.ISO-8859-1` gives a JVM an ISO-8859-1 `sun.jnu.encoding` without root (see `PythonLocaleTest`).
 
 ## Anti-patterns to avoid
 
