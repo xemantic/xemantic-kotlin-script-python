@@ -19,6 +19,8 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import jep.JepException
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.nio.file.Path
 import java.nio.file.attribute.PosixFilePermissions
@@ -43,7 +45,7 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should probe Python which writes to stderr`() {
+    fun `should probe Python which writes to stderr, keeping it`() {
         // given
         val expected = PythonEnvironment.probePython(venvPython)
         val directory = createTempDirectory("python-probe")
@@ -62,7 +64,8 @@ class PythonEnvironmentTest {
             val probe = PythonEnvironment.probePython(python.toString())
 
             // then
-            assert(probe == expected)
+            // the warning is kept, e.g. for a later failure of the embedded Python
+            assert(probe == expected.copy(error = "Could not find platform libraries"))
         } finally {
             directory.deleteRecursively()
         }
@@ -137,6 +140,48 @@ class PythonEnvironmentTest {
 
             // then
             assert(probe == expected)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe Python whose paths are non-ASCII`() {
+        // given
+        val expected = PythonEnvironment.probePython(venvPython)
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, "import sys\nsys.prefix = '/zażółć 日本'\n")
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe == expected.copy(prefix = "/zażółć 日本"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should fail clearly on probe of Python whose path is not valid in file system encoding of JVM`() {
+        // given
+        assumeTrue(filesystemCharset == Charsets.UTF_8, "the file system encoding of the JVM is not UTF-8")
+        val directory = createTempDirectory("python-probe")
+        // a path of another locale, e.g. /home/josé in ISO-8859-1, is surrogate-escaped by Python in UTF-8 mode
+        val python = pythonWithSitecustomize(directory, "import os, sys\nsys.prefix = os.fsdecode(b'/jos\\xe9')\n")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            assert(python in message && "UTF-8" in message)
         } finally {
             directory.deleteRecursively()
         }
@@ -257,7 +302,8 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = "${PythonEnvironment.PROBE_BEGIN}\n/venv/bin/python\u0000cpython-313\u0000/venv\u0000/venv/jep"
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
+            .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -279,9 +325,332 @@ class PythonEnvironmentTest {
         assert(probes == listOf(null, null))
     }
 
+    @Test
+    fun `should not parse probe output with values which are not hex digits`() {
+        // given
+        val output = "${PythonEnvironment.PROBE_BEGIN}\n/venv/bin/python cpython-313 /venv /venv/jep\n" +
+            PythonEnvironment.PROBE_END
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == null)
+    }
+
+    @Test
+    fun `should not parse probe output with values which are signed hex numbers`() {
+        // given
+        // each pair of digits, like 2f and -1, is a number, but -1 is not a byte of hex digits
+        val output = "${PythonEnvironment.PROBE_BEGIN}\n2f-1 2f 2f 2f\n${PythonEnvironment.PROBE_END}"
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == null)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not blame jep for Python which fails to run`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        // like a pyenv shim of a Python version which is not installed
+        python.writeText(
+            """
+            |#!/bin/sh
+            |echo "pyenv: version '3.13.0' is not installed" >&2
+            |exit 1
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python.toString())
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                message.startsWith("Cannot run Python $python") &&
+                    "exit code 1" in message &&
+                    "version '3.13.0' is not installed" in message &&
+                    "jep" !in message
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report missing jep package of Python`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        // the venv Python, without its site-packages, where jep is installed
+        val python = pythonWithSitecustomize(
+            directory,
+            "import sys\nsys.path = [path for path in sys.path if 'site-packages' not in path]\n"
+        )
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            // the probe tells that jep is missing, instead of failing with a traceback
+            assert(
+                message.startsWith("Cannot find the jep package of $python") &&
+                    "pip install jep" in message &&
+                    "Traceback" !in message &&
+                    !message.endsWith("\n")
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should name module shadowing jep package of Python`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, "")
+        // a module on PYTHONPATH, before the site-packages, where the jep package is installed
+        val module = directory.resolve("site").resolve("jep.py")
+        module.writeText("")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            assert(message.startsWith("Cannot find the jep package of $python") && module.toString() in message)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should limit stderr kept of successful probe`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        python.writeText(
+            """
+            |#!/bin/sh
+            |echo "Could not find platform libraries" >&2
+            |head -c 1000000 /dev/zero | tr '\0' 'w' >&2
+            |exec "$venvPython" "${'$'}@"
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python.toString())
+
+            // then
+            // measured, as power-assert would render the whole error on failure
+            val length = probe.error.length
+            val startsWithWarning = probe.error.startsWith("Could not find platform libraries")
+            val truncated = probe.error.endsWith("[truncated]")
+            assert(length <= PythonEnvironment.PROBE_ERROR_LIMIT && startsWithWarning && truncated)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should limit stderr kept of successful probe without splitting surrogate pair`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        // an odd character before the surrogate pairs of 😀, so that the even limit falls within one of them
+        python.writeText(
+            """
+            |#!/bin/sh
+            |"$venvPython" -c "import sys; sys.stderr.write('x' + '\U0001F600' * 100000)"
+            |exec "$venvPython" "${'$'}@"
+            |""".trimMargin()
+        )
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python.toString())
+
+            // then
+            // measured, as power-assert would render the whole error on failure
+            val length = probe.error.length
+            val wellFormed = probe.error.toByteArray(Charsets.UTF_8).toString(Charsets.UTF_8) == probe.error
+            val truncated = probe.error.endsWith("[truncated]")
+            assert(wellFormed)
+            assert(length <= PythonEnvironment.PROBE_ERROR_LIMIT && truncated)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report probe output without values and without output in one line`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = directory.resolve("python")
+        python.writeText("#!/bin/sh\n")
+        python.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python.toString())
+            }
+
+            // then
+            val message = exception.message!!
+            assert(python.toString() in message && "\n" !in message)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should report jep package directory which cannot be listed`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val jepDirectory = directory.resolve("missing-jep")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.jepLibrary(jepDirectory, "/venv/bin/python")
+            }
+
+            // then
+            assert(jepDirectory.toString() in exception.message!!)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should report stderr of probe on Error of embedded Python startup`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "Could not find platform libraries <exec_prefix>")
+        // like jep's MainInterpreter, rethrowing the failure of initializing CPython
+        val error = Error(IllegalStateException("failed to get the Python codec of the filesystem encoding"))
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw error }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        // the message of the Error is the class and message of its cause, which the headline does not repeat
+        assert(
+            exception.cause === error &&
+                message.startsWith(
+                    "Cannot initialize the embedded Python /venv/bin/python: " +
+                        "failed to get the Python codec of the filesystem encoding\n"
+                ) &&
+                "Could not find platform libraries <exec_prefix>" in message
+        )
+    }
+
+    @Test
+    fun `should not report stderr of probe on Error after embedded Python started`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "a warning")
+        starter.createInterpreter(create = { FakeInterpreter() }, check = {}).close()
+        // the embedded CPython starts once per JVM, so an Error afterward is not a failure of its startup
+        val error = NoClassDefFoundError("some/Class")
+
+        // when
+        val exception = assertFailsWith<NoClassDefFoundError> {
+            starter.createInterpreter(create = { throw error }, check = {})
+        }
+
+        // then
+        assert(exception === error)
+    }
+
+    @Test
+    fun `should report failure of first embedded Python startup the same way without stderr of probe`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "")
+        val cause = JepException("Error importing shared module")
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            exception.cause === cause &&
+                message == "Cannot initialize the embedded Python /venv/bin/python: Error importing shared module"
+        )
+    }
+
+    @Test
+    fun `should not report stderr of probe on failure of interpreter after embedded Python started`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "a warning")
+        starter.createInterpreter(create = { FakeInterpreter() }, check = {}).close()
+        val cause = JepException("unrelated failure")
+
+        // when
+        val exception = assertFailsWith<JepException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        assert(exception === cause)
+    }
+
+    @Test
+    fun `should close interpreter failing its check`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "")
+        val interpreter = FakeInterpreter()
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { interpreter }, check = { error("not in UTF-8 mode") })
+        }
+
+        // then
+        assert(exception.message == "not in UTF-8 mode" && interpreter.closed)
+    }
+
+    private class FakeInterpreter : AutoCloseable {
+        var closed = false
+        override fun close() {
+            closed = true
+        }
+    }
+
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
-    private fun probePayload(vararg values: String): String =
-        "${PythonEnvironment.PROBE_BEGIN}\n${values.joinToString("\u0000")}\n${PythonEnvironment.PROBE_END}"
+    private fun probePayload(vararg values: String): String {
+        val hexValues = values.joinToString(" ") { it.toByteArray(filesystemCharset).toHexString() }
+        return "${PythonEnvironment.PROBE_BEGIN}\n$hexValues\n${PythonEnvironment.PROBE_END}"
+    }
 
     /**
      * A shim of the venv Python in the [directory], with a `sitecustomize` module of the [code] on its `PYTHONPATH`,
