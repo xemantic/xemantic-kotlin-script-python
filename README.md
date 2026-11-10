@@ -61,7 +61,7 @@ In `build.gradle.kts` add:
 dependencies {
     implementation("com.xemantic.kotlin:xemantic-kotlin-script-python:0.1.0")
     // only for running Python in a ScriptSession, like below, as Python does not depend on it
-    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.0")
+    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.1")
 }
 ```
 
@@ -71,9 +71,8 @@ Then:
 import com.xemantic.kotlin.script.ScriptResult
 import com.xemantic.kotlin.script.ScriptSession
 import com.xemantic.kotlin.script.python.Python
-import kotlinx.coroutines.runBlocking
 
-fun main() = runBlocking {
+suspend fun main() {
     Python().use { python ->
         ScriptSession {
             "python" provides python
@@ -87,10 +86,9 @@ fun main() = runBlocking {
 }
 ```
 
-`ScriptSession.execute` is a suspending function to call from a coroutine,
-e.g. within `runBlocking`, as above
-(with `xemantic-kotlin-script` 0.2.0, a `suspend fun main()` is not enough, as `execute` also needs a coroutine `Job`).
-The `kotlinx-coroutines-core` library comes as a dependency of `xemantic-kotlin-script`.
+`ScriptSession.execute` is a suspending function,
+called here from a `suspend fun main()`,
+and otherwise from any coroutine, e.g. within `runBlocking`.
 
 The examples assume `numpy` installed in the Python environment,
 otherwise the code can declare it as a dependency, see below.
