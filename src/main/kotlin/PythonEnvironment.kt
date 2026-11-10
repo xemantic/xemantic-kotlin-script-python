@@ -22,6 +22,7 @@ import jep.Interpreter
 import jep.MainInterpreter
 import jep.PyConfig
 import java.io.IOException
+import java.io.InputStream
 import java.io.Reader
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -29,6 +30,7 @@ import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.nio.file.Path
 import java.security.MessageDigest
+import java.util.Properties
 import kotlin.concurrent.thread
 import kotlin.io.path.Path
 import kotlin.io.path.createTempFile
@@ -47,8 +49,8 @@ import kotlin.io.path.readText
  * 2. the virtual environment of the `VIRTUAL_ENV` environment variable,
  * 3. `python3` on the `PATH`.
  *
- * The `jep` package must be installed in it, with `pip install jep`,
- * in the version of the `org.ninia:jep` library,
+ * The `jep` package must be installed in it, in the version of the `org.ninia:jep` library,
+ * into a virtual environment, if the Python is externally managed,
  * and the Python code imports the modules from the same paths as this executable,
  * e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
  */
@@ -95,12 +97,13 @@ public object PythonEnvironment {
     internal fun initialize() {
         if (initialized) return
         val python = (pythonExecutable ?: defaultPythonExecutable()).toString()
-        val (executable, cacheTag, prefix, jepLocation, probeError) = probePython(python)
-        val library = jepLibrary(Path(jepLocation), python)
+        val probe = probePython(python)
+        val (executable, cacheTag, prefix, jepLocation) = probe
+        val library = jepLibrary(Path(jepLocation), python, probe.externallyManaged)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         this.executable = executable
-        starter = EmbeddedPythonStarter(executable, probeError)
+        starter = EmbeddedPythonStarter(executable, probe.error)
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
         }
@@ -117,24 +120,36 @@ public object PythonEnvironment {
     }
 
     /**
-     * The native library of Jep in the [jepDirectory], the directory of the `jep` package of the [python].
+     * The version of the `org.ninia:jep` library, which the `jep` package must match,
+     * read from the `pom.properties` of its jar, as its manifest has no version,
+     * or `null` if the jar does not have it, e.g. repackaged.
+     */
+    internal val jepVersion: String? by lazy {
+        MainInterpreter::class.java.getResourceAsStream("/META-INF/maven/org.ninia/jep/pom.properties")
+            ?.let { readJepVersion(it) }
+    }
+
+    /**
+     * The native library of Jep in the [jepDirectory], the directory of the `jep` package of the [python],
+     * which is [externallyManaged] or not.
      *
      * @throws IllegalStateException if there is none, or the [jepDirectory] cannot be listed.
      */
-    internal fun jepLibrary(jepDirectory: Path, python: String): Path {
+    internal fun jepLibrary(jepDirectory: Path, python: String, externallyManaged: Boolean): Path {
         val entries = try {
             jepDirectory.listDirectoryEntries()
         } catch (e: IOException) {
             throw IllegalStateException(
-                "Cannot list the directory of the jep package of $python: $jepDirectory, " +
-                    "reinstall jep with: $python -m pip install jep",
+                "Cannot list the directory of the jep package of $python: $jepDirectory.\n" +
+                    jepInstallAdvice(python, externallyManaged, reinstall = true),
                 e
             )
         }
         return entries.firstOrNull {
             it.name.startsWith("libjep.") || it.name == "jep.dll"
         } ?: throw IllegalStateException(
-            "No native Jep library in $jepDirectory, reinstall jep with: $python -m pip install jep"
+            "No native Jep library in $jepDirectory, the jep package of $python is broken.\n" +
+                jepInstallAdvice(python, externallyManaged, reinstall = true)
         )
     }
 
@@ -188,11 +203,11 @@ public object PythonEnvironment {
         }
         // only the probe's own check blames jep, any other failure is the one of Python itself,
         // e.g. of a pyenv shim of a version which is not installed
-        check(result.exitCode != PROBE_JEP_MISSING_EXIT_CODE) {
-            withOutput(
-                "Cannot find the jep package of $python, install it with: $python -m pip install jep",
-                result.failureOutput
-            )
+        val jepMissing = result.exitCode == PROBE_JEP_MISSING_EXIT_CODE
+        val jepMissingExternallyManaged = result.exitCode == PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE
+        check(!jepMissing && !jepMissingExternallyManaged) {
+            withOutput("Cannot find the jep package of $python.", result.failureOutput) +
+                "\n" + jepInstallAdvice(python, externallyManaged = jepMissingExternallyManaged)
         }
         check(result.exitCode == 0) {
             withOutput("Cannot run Python $python, it failed with exit code ${result.exitCode}", result.failureOutput)
@@ -251,9 +266,10 @@ public object PythonEnvironment {
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
         val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
-        if (values == null || values.size != 4) return null
-        val (executable, cacheTag, prefix, jepLocation) = values.map { it.hexToPath() ?: return null }
-        return PythonProbe(executable, cacheTag, prefix, jepLocation)
+        if (values == null || values.size != 5) return null
+        val (executable, cacheTag, prefix, jepLocation, externallyManaged) =
+            values.map { it.hexToPath() ?: return null }
+        return PythonProbe(executable, cacheTag, prefix, jepLocation, externallyManaged.isNotEmpty())
     }
 
     /**
@@ -265,7 +281,11 @@ public object PythonEnvironment {
      * as text, a path which is not valid UTF-8, e.g. `/home/josé` in ISO-8859-1,
      * would be surrogate-escaped by Python in UTF-8 mode, and could not be encoded to UTF-8,
      * while the JVM would decode a path of UTF-8 bytes to another one, in another encoding of its locale.
+     * The last value tells whether the Python is externally managed (PEP 668), `1` if it is, empty if not:
+     * a base Python, not a virtual environment, with an `EXTERNALLY-MANAGED` file in its standard library,
+     * into which pip refuses to install.
      * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
+     * or the [PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE] if the Python is externally managed,
      * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
      * The lines are written with an empty line before them, in case the standard output written before does not end with a newline,
      * and as bytes, without the newline translation of the text mode, e.g. on Windows,
@@ -275,17 +295,23 @@ public object PythonEnvironment {
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
         """
-        |import importlib.util, os, sys
+        |import importlib.util, os, sys, sysconfig
+        |externally_managed = sys.prefix == sys.base_prefix and os.path.isfile(
+        |    os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
+        |)
         |jep_spec = importlib.util.find_spec('jep')
         |if jep_spec is None or not jep_spec.submodule_search_locations:
         |    if jep_spec is not None:
         |        print('jep is not the package, but the module:', jep_spec.origin, file=sys.stderr)
-        |    sys.exit($PROBE_JEP_MISSING_EXIT_CODE)
+        |    sys.exit(
+        |        $PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE if externally_managed else $PROBE_JEP_MISSING_EXIT_CODE
+        |    )
         |values = [
         |    sys.executable,
         |    sys.implementation.cache_tag,
         |    sys.prefix,
         |    jep_spec.submodule_search_locations[0],
+        |    '1' if externally_managed else '',
         |]
         |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
         |sys.stdout.flush()
@@ -302,6 +328,9 @@ public object PythonEnvironment {
      * 126 and 127 of a shell which cannot run the command, and above 128 of a signal.
      */
     internal const val PROBE_JEP_MISSING_EXIT_CODE = 83
+
+    /** The exit code of [probeCommand] without the `jep` package in an externally managed Python. */
+    internal const val PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE = 84
 
     /** The maximum length of the standard error of the probe kept as [PythonProbe.error]. */
     internal const val PROBE_ERROR_LIMIT = 8192
@@ -349,6 +378,72 @@ internal fun pythonCommand(python: String, code: String, vararg arguments: Strin
     "import sys\nif sys.path[:1] == ['']: del sys.path[0]\n$code",
     *arguments
 )
+
+/**
+ * The version of the `org.ninia:jep` library in its `pom.properties`, read and closed,
+ * or `null` if it cannot be read, e.g. is malformed.
+ */
+internal fun readJepVersion(properties: InputStream): String? = try {
+    properties.use { Properties().apply { load(it) } }.getProperty("version")
+} catch (_: Exception) {
+    null
+}
+
+/**
+ * How to install the `jep` package of the [jepVersion] for the [python] executable,
+ * or to [reinstall] it, if it is broken.
+ *
+ * If the [python] is [externallyManaged] (PEP 668), e.g. the one of Homebrew or of most Linux distributions,
+ * pip refuses to install into it, so jep is installed into a new virtual environment in the [userHome],
+ * otherwise, e.g. in a virtual environment holding the other packages of the user, into the [python] itself,
+ * also with uv, as a virtual environment of uv has no pip.
+ * The paths are absolute, as `~` or `%USERPROFILE%` would not be expanded outside a shell, e.g. in an IDE,
+ * and quoted for cmd, which PowerShell runs only with the `&` operator before them.
+ * It also tells what building jep from its source needs, as PyPI has no wheels of it,
+ * and on Debian/Ubuntu also the package of the venv module, without which a virtual environment cannot be created.
+ */
+internal fun jepInstallAdvice(
+    python: String,
+    externallyManaged: Boolean,
+    reinstall: Boolean = false,
+    jepVersion: String? = PythonEnvironment.jepVersion,
+    javaHome: String? = System.getenv("JAVA_HOME"),
+    userHome: String = System.getProperty("user.home"),
+    windows: Boolean = System.getProperty("os.name").startsWith("Windows")
+): String {
+    fun quoted(path: String) = if (' ' in path) "\"$path\"" else path
+    val separator = if (windows) "\\" else "/"
+    val jep = if (jepVersion == null) "jep" else "jep==$jepVersion"
+    val version = if (jepVersion == null) ", in the version of the org.ninia:jep library,"
+    else " $jepVersion, the version of the org.ninia:jep library,"
+    val install = if (externallyManaged) {
+        val venv = listOf(userHome, ".venvs", "jep").joinToString(separator)
+        val venvPython = if (windows) "$venv\\Scripts\\python.exe" else "$venv/bin/python"
+        listOf(
+            "This Python is externally managed, install jep$version into a virtual environment:",
+            "  ${quoted(python)} -m venv ${quoted(venv)}",
+            "  ${quoted(venvPython)} -m pip install $jep",
+            "then set VIRTUAL_ENV to $venv, or PythonEnvironment.pythonExecutable to $venvPython."
+        )
+    } else listOf(
+        (if (reinstall) "Reinstall" else "Install") + " jep$version with:",
+        "  ${quoted(python)} -m pip install " + (if (reinstall) "--force-reinstall --no-cache-dir " else "") + jep,
+        "or, without pip, e.g. in a virtual environment of uv:",
+        "  uv pip install --python ${quoted(python)} " + (if (reinstall) "--reinstall --no-cache " else "") + jep
+    )
+    val build = if (windows) listOf(
+        "jep is built from its source, needing Microsoft C++ Build Tools and a JDK, found through JAVA_HOME" +
+            (if (javaHome == null) " (not set)." else ".")
+    ) else listOf(
+        "jep is built from its source, needing a C compiler, the Python headers, " +
+            "and a JDK, found through JAVA_HOME, or javac on the PATH;",
+        "on Debian/Ubuntu: apt install python3-dev" + (if (externallyManaged) " python3-venv" else "")
+    )
+    val powerShell = if (windows && install.any { "\"" in it }) {
+        listOf("In PowerShell, prefix a quoted command with &.")
+    } else emptyList()
+    return (install + build + powerShell).joinToString("\n")
+}
 
 /**
  * The encoding of the file paths of the JVM, the one of the locale on POSIX, `sun.jnu.encoding`,
@@ -457,6 +552,7 @@ internal class EmbeddedPythonStarter(private val executable: String, private val
  * @property cacheTag the `sys.implementation.cache_tag`, e.g. `cpython-313`.
  * @property prefix the `sys.prefix`, the virtual environment, if any.
  * @property jepLocation the directory of the `jep` package.
+ * @property externallyManaged whether pip refuses to install into it (PEP 668), see [PythonEnvironment.probeCommand].
  * @property error the standard error of the probe, e.g. a warning of Python, empty if none.
  */
 internal data class PythonProbe(
@@ -464,6 +560,7 @@ internal data class PythonProbe(
     val cacheTag: String,
     val prefix: String,
     val jepLocation: String,
+    val externallyManaged: Boolean = false,
     val error: String = ""
 )
 
