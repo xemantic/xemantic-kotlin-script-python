@@ -19,9 +19,13 @@
 package com.xemantic.kotlin.script.python
 
 import jep.SharedInterpreter
+import jep.python.InvocationHandler
 import jep.python.PyCallable
 import jep.python.PyObject
 import org.intellij.lang.annotations.Language
+import java.lang.reflect.Proxy
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -52,13 +56,29 @@ import java.util.concurrent.atomic.AtomicInteger
  * Only the running call completes, also when a Kotlin function it calls calls back this `Python`,
  * and the interpreter is closed after it,
  * exactly once, on the thread of this `Python`.
- * Also such a Kotlin function can call `close()`, which then closes this `Python` after the running call.
+ * Also such a Kotlin function can call `close()`, directly or from another thread it waits for,
+ * which then closes this `Python` after the running call.
  *
  * A Kotlin function can be set as a global variable and called from Python, like `python["f"] = { n: Long -> n * 2 }`.
- * It runs on the thread of this `Python`, and can call it back.
+ * It runs on the thread which calls it from Python: the thread of this `Python`,
+ * unless the Python code calls it from a thread of its own, like a `threading.Thread`.
+ * On the thread of this `Python` it can call this `Python` back directly, as a part of the running call,
+ * while on another thread, its call waits for its turn, like any call from another thread.
+ * The running call must not wait for another thread calling this `Python`, e.g. a Kotlin function
+ * with `thread { python.eval<Long>("x") }.join()`, or `runBlocking(Dispatchers.IO) { python["x"] }`,
+ * or Python code joining a `threading.Thread` which calls a Kotlin function calling this `Python`:
+ * such a call waits for its turn behind the running call, which waits for it, so both wait forever.
+ * It cannot be detected, as a call from another thread, made during the running call, can as well just wait for its turn.
+ * Call this `Python` directly from a Kotlin function running on the thread of this `Python` instead.
  *
  * The values are converted between Java and Python by Jep, e.g. a Python `int` becomes a [Long],
  * a `str` a [String], and a `list` a [List].
+ * A returned value which Jep cannot convert, also when nested in a [Collection], a [Map] or an array,
+ * becomes its Python `repr`, as a Python object cannot be used outside the thread of this `Python`.
+ * So does a Python object, which Jep converts to a proxy of a Java interface, as calling the proxy calls Python,
+ * e.g. a Python function passed to a Kotlin function taking a [Runnable], or an element of `eval("[len]", Comparable[]::class.java)`.
+ * If different keys of a `dict`, or elements of a [Set], have the same `repr`, e.g. `{'Point': 1, Point(): 2}`,
+ * an [IllegalStateException] is thrown, not to drop an entry silently.
  *
  * The Python environment is resolved on the first use, see [PythonEnvironment].
  * If it cannot be resolved, or the embedded CPython fails to start, the call fails with an [IllegalStateException].
@@ -85,6 +105,10 @@ public class Python private constructor(
     })
 
     private val closed = AtomicBoolean(false)
+
+    /** Whether a call is running on the thread of this `Python`, written only by this thread, see [close]. */
+    @Volatile
+    private var running = false
 
     private var interpreter: SharedInterpreter? = null
 
@@ -125,6 +149,7 @@ public class Python private constructor(
      *
      * @throws jep.JepException if the code fails, with the type and the message of the Python exception.
      * @throws PythonDependencyException if the declared dependencies cannot be installed.
+     * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public operator fun invoke(@Language("python") code: String): Any? = call {
         PythonDependencies.install(code, this)
@@ -134,20 +159,29 @@ public class Python private constructor(
         } as List<String>
         if (statements.isNotBlank()) exec(statements)
         if (expression.isEmpty()) return@call null
-        when (val value = getValue(expression)) {
-            is PyObject -> value.use {
-                getValue("__import__('builtins').repr", PyCallable::class.java).use { repr ->
-                    repr.callAs(String::class.java, it)
-                }
-            }
-            else -> value
-        }
+        toJava(getValue(expression))
     }
 
     /**
      * Evaluates a Python [expression], converting its value to the reified type [T].
      *
+     * A value which Jep cannot convert, e.g. of `eval<Any>("len")`, or nested in a [Collection] or a [Map],
+     * becomes its Python `repr`.
+     * So does a Python object requested as an interface which a [String] implements,
+     * e.g. `Comparable` or `java.io.Serializable`, so that the `repr` is returned instead of a proxy.
+     *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
+     * A value holding Python objects is copied to a [List], a [Set], a [Map] or an array, see [Python],
+     * so it cannot be of another collection type, like `ArrayDeque`.
+     *
+     * @throws IllegalArgumentException if [T] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`,
+     * or if [T] is another collection type, and the value holds Python objects,
+     * or if the value is a Python object, which Jep converts to a proxy of the interface [T],
+     * like a Python callable of `eval<Runnable>("lambda: 1")`, as its `repr` is not a [T].
+     * Such a proxy is not returned, as calling it from another thread fails,
+     * and dispatching its calls to the thread of this `Python` would fail once it is closed.
+     * It is rejected also when called by a Kotlin function, which is called from Python, on the thread of this `Python`.
+     * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
         eval(expression, T::class.javaObjectType)
@@ -155,17 +189,47 @@ public class Python private constructor(
     /**
      * Evaluates a Python [expression], converting its value to the given [type].
      *
+     * A value which Jep cannot convert, e.g. of `eval("len", Any::class.java)`, or nested in a [Collection] or a [Map],
+     * becomes its Python `repr`.
+     * So does a Python object requested as an interface which a [String] implements,
+     * e.g. `Comparable` or `java.io.Serializable`, so that the `repr` is returned instead of a proxy.
+     *
      * @throws jep.JepException if the evaluation fails, or the value cannot be converted.
+     * A value holding Python objects is copied to a [List], a [Set], a [Map] or an array, see [Python],
+     * so it cannot be of another collection type, like `ArrayDeque`.
+     *
+     * @throws IllegalArgumentException if the [type] is a [PyObject], or an array of them, which cannot leave the thread of this `Python`,
+     * or if the [type] is another collection type, and the value holds Python objects,
+     * or if the value is a Python object, which Jep converts to a proxy of the interface [type],
+     * like a Python callable of `eval("lambda: 1", Runnable::class.java)`, as its `repr` is not of the [type].
+     * Such a proxy is not returned, as calling it from another thread fails,
+     * and dispatching its calls to the thread of this `Python` would fail once it is closed.
+     * It is rejected also when called by a Kotlin function, which is called from Python, on the thread of this `Python`.
+     * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
      */
-    public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T =
-        call { getValue(expression, type) }
+    public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T = call {
+        // checked in the call, so that a closed Python fails as closed
+        require(!type.holdsPyObject()) { "A PyObject cannot leave the thread of Python" }
+        val raw = getValue(expression, type)
+        val value = toJava(raw)
+        // a repr is a String, and a copy a List, a Set, a Map, or an array, which might not be the type requested
+        require(value === raw || type.isInstance(value)) {
+            if (raw.toPyObject() != null) "A Python object is converted to its repr, which is not a ${type.typeName}"
+            else "A value holding Python objects is copied to a List, a Set, a Map or an array, which is not a ${type.typeName}"
+        }
+        type.cast(value)
+    }
 
     /**
      * Returns the value of the global variable of the given [name], converted to a Java object.
      *
+     * A value which Jep cannot convert, e.g. of an imported module, or nested in a [Collection] or a [Map],
+     * becomes its Python `repr`.
+     *
      * @throws jep.JepException if there is no such variable.
+     * @throws IllegalStateException if different keys of a `dict`, or elements of a [Set], have the same `repr`.
      */
-    public operator fun get(name: String): Any? = call { getValue(name) }
+    public operator fun get(name: String): Any? = call { toJava(getValue(name)) }
 
     /**
      * Sets the global variable of the given [name] to the [value], converted to a Python object.
@@ -177,16 +241,21 @@ public class Python private constructor(
     /**
      * Closes the interpreter and releases its thread.
      *
-     * It waits for the running call, if any, to complete, also calling back this `Python` from a Kotlin function,
-     * and then closes the interpreter on its thread.
+     * Unless a call is running, or starting or ending on the thread of this `Python`,
+     * it closes the interpreter on its thread, and waits for it,
+     * so that the interpreter is closed when it returns.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
      * Calling it again has no effect, and returns immediately.
      *
-     * Called by a Kotlin function, which is called from Python, it does not wait,
-     * as the running call is the one which called it:
+     * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
      * still able to call back this `Python`, and the interpreter is closed after it returns.
-     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is lost.
+     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is not reported,
+     * and if the JVM exits before the running call returns, e.g. at the end of `main`,
+     * the interpreter is never closed, as its thread is a daemon one.
+     * Waiting would deadlock, when the running call waits for `close()`:
+     * when it is called by a Kotlin function called from Python, or by another thread, which this function,
+     * or the Python code, waits for, and it cannot be told apart from a `close()` which the running call does not wait for.
      */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -201,9 +270,11 @@ public class Python private constructor(
         } finally {
             executor.shutdown()
         }
-        // called by a Kotlin function, called from Python, the running call is still on the stack of this thread,
-        // and the task of close() can run only after it, so waiting for it here would deadlock
-        if (Thread.currentThread() === thread) return
+        // the task of close() can run only after the running call, which might wait for this close(),
+        // called by a Kotlin function, called from Python, or by a thread it waits for, so waiting here could deadlock;
+        // read after setting closed, so that a call, which is not running yet, sees it closed before running any code,
+        // and then the task of close() runs right after it
+        if (running) return
         try {
             closing.get()
         } catch (e: ExecutionException) {
@@ -214,23 +285,29 @@ public class Python private constructor(
     private fun <T> call(block: SharedInterpreter.() -> T): T {
         // a Kotlin function called from Python, calling back this Python, runs already on its thread,
         // where waiting for the executor would deadlock; it belongs to the running call, which completes
-        // even if close() is already waiting for it, as the task of close() cannot run before
+        // even if close() is already called, as the task of close() cannot run before
         if (Thread.currentThread() === thread) return interpreter!!.block()
         checkNotClosed()
         val future = try {
             executor.submit<T> {
-                // close() might have been called after this call was submitted, and if its task has run already,
-                // creating a new interpreter here would leak it, never to be closed
-                checkNotClosed()
-                val interpreter = interpreter ?: run {
-                    PythonEnvironment.initialize()
-                    // assigned only once checked, so that a later call does not use an interpreter failing the check
-                    PythonEnvironment.starter.createInterpreter(
-                        create = { SharedInterpreter() },
-                        check = { PythonEnvironment.checkUtf8Mode(it) }
-                    ).also { interpreter = it }
+                // set before checking if closed, see close()
+                running = true
+                try {
+                    // close() might have been called after this call was submitted, and if its task has run already,
+                    // creating a new interpreter here would leak it, never to be closed
+                    checkNotClosed()
+                    val interpreter = interpreter ?: run {
+                        PythonEnvironment.initialize()
+                        // assigned only once checked, so that a later call does not use an interpreter failing the check
+                        PythonEnvironment.starter.createInterpreter(
+                            create = { SharedInterpreter() },
+                            check = { PythonEnvironment.checkUtf8Mode(it) }
+                        ).also { interpreter = it }
+                    }
+                    interpreter.block()
+                } finally {
+                    running = false
                 }
-                interpreter.block()
             }
         } catch (_: RejectedExecutionException) {
             // close() has shut down the executor after the check above
@@ -243,8 +320,192 @@ public class Python private constructor(
         }
     }
 
+    /** Whether this type is a [PyObject], or an array of them, also of arrays. */
+    private fun Class<*>.holdsPyObject(): Boolean =
+        PyObject::class.java.isAssignableFrom(this) || componentType?.holdsPyObject() == true
+
     private fun checkNotClosed() {
         if (closed.get()) throw closedException()
+    }
+
+    /**
+     * Replaces each Python object of the [value], also nested in a [Collection], a [Map] or an array, with its `repr`,
+     * as it is bound to the thread of this interpreter.
+     * A Python object is a [PyObject], or a proxy of a Java interface, which Jep creates for it, see [toPyObject].
+     *
+     * Only a top-level [PyObject] is closed, as it is created by Jep for this value.
+     * A nested one can be held by a Java collection, which Python can still use, e.g. set with `python["k"] = list`,
+     * so it is only left out of the returned copy, and Jep releases it once it is garbage collected.
+     * Neither is the [PyObject] of a proxy closed, also of a top-level one,
+     * as the proxy can be held by Python, e.g. created with `jep.jproxy`, which Jep returns as it is.
+     */
+    private fun SharedInterpreter.toJava(value: Any?): Any? = when (value) {
+        is PyObject -> value.use { PyObjectConverter(this).use { converter -> converter.convert(it) } }
+        else -> if (value.toPyObject() != null || value is Collection<*> || value is Map<*, *> || value is Array<*>) {
+            PyObjectConverter(this).use { it.convert(value) }
+        } else {
+            value
+        }
+    }
+
+    /**
+     * Converts a value returned by Jep, see [toJava].
+     *
+     * A value without any Python object, a [PyObject] or a proxy of one, is returned as it is.
+     * Otherwise each [Collection], [Map] and array reachable from it is copied, never changed,
+     * a [Set] to a [LinkedHashSet], another [Collection] than a [List] to an [ArrayList],
+     * and an array to an array of the same component type, unless it cannot hold a `repr`, like `PyObject[]`,
+     * which is widened to `Object[]`, also each dimension of a nested array, like `PyObject[][]` to `Object[][]`,
+     * or unless it cannot hold the copy of an element, like `Runnable[]` of proxies,
+     * which is widened to `Object[]` as well, so that the copy can be cast to the type requested from [eval],
+     * also when it contains itself, so that the copy contains itself as well.
+     * The same Python object becomes the same `repr`.
+     */
+    private class PyObjectConverter(private val interpreter: SharedInterpreter) : AutoCloseable {
+
+        private var repr: PyCallable? = null
+
+        /** The copy of each converted value, by its identity, so that a cycle is copied once. */
+        private val copies = IdentityHashMap<Any, Any>()
+
+        fun convert(value: Any?): Any? =
+            if (containsPyObject(value, Collections.newSetFromMap(IdentityHashMap()))) copy(value) else value
+
+        // only the containers are tracked, which can form a cycle, not to track each element of a large list
+        // a Python object first, as a proxy can also implement a Collection or a Map, and must not be copied as one
+        private fun containsPyObject(value: Any?, visited: MutableSet<Any>): Boolean =
+            value.toPyObject() != null || containsPyObjectElement(value, visited)
+
+        private fun containsPyObjectElement(value: Any?, visited: MutableSet<Any>): Boolean = when (value) {
+            is Collection<*> -> visited.add(value) && value.any { containsPyObject(it, visited) }
+            is Map<*, *> -> visited.add(value) && value.any { (key, element) ->
+                containsPyObject(key, visited) || containsPyObject(element, visited)
+            }
+            is Array<*> -> visited.add(value) && value.any { containsPyObject(it, visited) }
+            else -> false
+        }
+
+        private fun copy(value: Any?): Any? {
+            if (value == null) return null
+            copies[value]?.let { return it }
+            value.toPyObject()?.let { pyObject -> return repr(pyObject).also { copies[value] = it } }
+            return when (value) {
+                is Set<*> -> LinkedHashSet<Any?>().also { copy ->
+                    copies[value] = copy
+                    value.forEach { element ->
+                        val copiedElement = copy(element)
+                        check(copy.add(copiedElement)) { "Different elements of a set have the same repr: $copiedElement" }
+                    }
+                }
+                is Collection<*> -> ArrayList<Any?>(value.size).also { copy ->
+                    copies[value] = copy
+                    value.forEach { copy.add(copy(it)) }
+                }
+                is Map<*, *> -> LinkedHashMap<Any?, Any?>().also { copy ->
+                    copies[value] = copy
+                    value.forEach { (key, element) ->
+                        val copiedKey = copy(key)
+                        check(copiedKey !in copy) { "Different keys of a dict have the same repr: $copiedKey" }
+                        copy[copiedKey] = copy(element)
+                    }
+                }
+                is Array<*> -> newArray(arrayCopyClass(value), value.size).also { copy ->
+                    copies[value] = copy
+                    value.forEachIndexed { index, element -> copy[index] = copy(element) }
+                }
+                else -> value
+            }
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun newArray(arrayClass: Class<*>, size: Int): Array<Any?> =
+            java.lang.reflect.Array.newInstance(arrayClass.componentType, size) as Array<Any?>
+
+        /** The class of the copy of each array, by its identity, decided before copying it. */
+        private val arrayCopyClasses = IdentityHashMap<Array<*>, Class<*>>()
+
+        /** The arrays whose class of the copy is being decided, to detect a cycle. */
+        private val deciding = Collections.newSetFromMap(IdentityHashMap<Array<*>, Boolean>())
+
+        /**
+         * Returns the class of the copy of the [array]:
+         * its own class, widened by [copyType], so that no array of a [PyObject] type is left, even an empty one,
+         * unless it cannot hold the copy of an element, like a `repr` of a proxy in `Runnable[]`,
+         * then an array of [Any] of the same dimensions, like `Object[][]`, or `Object[]` as the last resort.
+         *
+         * It is decided before copying the array, so that the copy can contain itself.
+         * An array reached again while deciding, i.e. in a cycle, gets a class not depending on its elements,
+         * as the arrays deciding in the meantime rely on it: its own one, if it can hold a copy of any element,
+         * like `Object[]` or `Serializable[]`, or `Object[]` otherwise.
+         */
+        private fun arrayCopyClass(array: Array<*>): Class<*> {
+            arrayCopyClasses[array]?.let { return it }
+            val declared = copyType(array.javaClass)
+            if (!deciding.add(array)) {
+                return (if (canHoldAnyCopy(declared.componentType)) declared else Array<Any?>::class.java)
+                    .also { arrayCopyClasses[array] = it }
+            }
+            val decided = when {
+                // the common case, which can hold anything, so that its elements are not checked
+                declared == Array<Any?>::class.java || canHoldCopies(declared, array) -> declared
+                else -> objectArrayClass(dimensions(declared)).takeIf { canHoldCopies(it, array) }
+                    ?: Array<Any?>::class.java
+            }
+            deciding.remove(array)
+            // already decided, if reached again in a cycle
+            return arrayCopyClasses.getOrPut(array) { decided }
+        }
+
+        /** Whether the [type] can hold any copy of an element, which is not copied as it is. */
+        private fun canHoldAnyCopy(type: Class<*>): Boolean = listOf(
+            String::class.java, ArrayList::class.java, LinkedHashSet::class.java,
+            LinkedHashMap::class.java, Array<Any?>::class.java
+        ).all { type.isAssignableFrom(it) }
+
+        private fun canHoldCopies(arrayClass: Class<*>, array: Array<*>): Boolean = array.all { element ->
+            copyClass(element)?.let { arrayClass.componentType.isAssignableFrom(it) } ?: true
+        }
+
+        /**
+         * Widens a type which can hold a [PyObject], or its subtype, but not its `repr`, to [Any],
+         * also each dimension of an array.
+         */
+        private fun copyType(type: Class<*>): Class<*> = when {
+            type.isArray -> arrayClass(copyType(type.componentType))
+            type.isAssignableFrom(PyObject::class.java) && !type.isAssignableFrom(String::class.java) -> Any::class.java
+            PyObject::class.java.isAssignableFrom(type) -> Any::class.java
+            else -> type
+        }
+
+        private fun dimensions(type: Class<*>): Int = if (type.isArray) 1 + dimensions(type.componentType) else 0
+
+        private fun objectArrayClass(dimensions: Int): Class<*> =
+            (1..dimensions).fold(Any::class.java as Class<*>) { type, _ -> arrayClass(type) }
+
+        private fun arrayClass(componentType: Class<*>): Class<*> =
+            java.lang.reflect.Array.newInstance(componentType, 0).javaClass
+
+        /** Returns the class of the [copy] of the [value], or `null` for `null`. */
+        private fun copyClass(value: Any?): Class<*>? = when {
+            value == null -> null
+            value.toPyObject() != null -> String::class.java
+            value is Set<*> -> LinkedHashSet::class.java
+            value is Collection<*> -> ArrayList::class.java
+            value is Map<*, *> -> LinkedHashMap::class.java
+            value is Array<*> -> arrayCopyClass(value)
+            else -> value.javaClass
+        }
+
+        private fun repr(value: PyObject): String {
+            val repr = repr ?: interpreter.getValue("__import__('builtins').repr", PyCallable::class.java)
+                .also { repr = it }
+            return repr.callAs(String::class.java, value)
+        }
+
+        override fun close() {
+            repr?.close()
+        }
+
     }
 
     private fun closedException() = IllegalStateException("Python is closed")
@@ -260,6 +521,18 @@ public class Python private constructor(
         ): Python = Python(decorateExecutor)
 
         private val threadCounter = AtomicInteger()
+
+        /**
+         * Returns this value as a [PyObject], also when it is a proxy of a Java interface,
+         * which Jep creates for a Python object converted to an interface,
+         * or `null` if it is not a Python object.
+         */
+        private fun Any?.toPyObject(): PyObject? = when {
+            this is PyObject -> this
+            this != null && Proxy.isProxyClass(javaClass) ->
+                (Proxy.getInvocationHandler(this) as? InvocationHandler)?.pyObject
+            else -> null
+        }
 
         /**
          * Splits the code into the statements before its last expression, and this expression,

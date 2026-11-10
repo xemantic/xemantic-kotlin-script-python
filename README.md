@@ -95,24 +95,34 @@ In `build.gradle.kts` add:
 dependencies {
     implementation("com.xemantic.kotlin:xemantic-kotlin-script-python:0.1.0")
     // only for running Python in a ScriptSession, like below, as Python does not depend on it
-    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.0")
+    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.1")
 }
 ```
 
 Then:
 
 ```kotlin
-Python().use { python ->
-    ScriptSession {
-        "python" provides python
-    }.use { session ->
-        session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
-        session.execute("""python["factor"] = 3""")
-        val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
-        println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+import com.xemantic.kotlin.script.ScriptResult
+import com.xemantic.kotlin.script.ScriptSession
+import com.xemantic.kotlin.script.python.Python
+
+suspend fun main() {
+    Python().use { python ->
+        ScriptSession {
+            "python" provides python
+        }.use { session ->
+            session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
+            session.execute("""python["factor"] = 3""")
+            val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
+            println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+        }
     }
 }
 ```
+
+`ScriptSession.execute` is a suspending function,
+called here from a `suspend fun main()`,
+and otherwise from any coroutine, e.g. within `runBlocking`.
 
 The examples assume `numpy` installed in the Python environment,
 otherwise the code can declare it as a dependency, see below.
@@ -130,8 +140,17 @@ otherwise the code can declare it as a dependency, see below.
   python("import numpy as np; a = np.arange(10)") // null
   python("a.sum()")                                 // 45L
   ```
-  The value is converted by Jep to its default Java type,
-  and a value which Jep cannot convert is returned as its Python `repr`.
+  The value is converted by Jep to its default Java type.
+* A value returned by `python(code)`, `eval` or `python["name"]`, which Jep cannot convert,
+  like a module, a function or an instance of a Python class,
+  is returned as its Python `repr`, also when nested in a `List`, a `Set`, a `Map` or an array,
+  as a Python object can be used only on the thread of its `Python`:
+  ```kotlin
+  python("[len, 1]") // listOf("<built-in function len>", 1L)
+  ```
+  If different keys of a `dict`, or elements of a `Set`, have the same `repr`,
+  an `IllegalStateException` is thrown, not to drop an entry silently,
+  and `eval<PyObject>` (or an array of them) fails with an `IllegalArgumentException`.
 * For an AI agent, the `Python` can be started lazily, only when a script uses it,
   as the first one initializes the Python environment:
   ```kotlin
@@ -169,6 +188,11 @@ otherwise the code can declare it as a dependency, see below.
   The installed dependencies are shared by all the `Python` interpreters of the JVM,
   and they cannot change the versions of the distributions of the Python environment itself,
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.
+  The installations into the dependency directory are serialized, also across processes,
+  e.g. JVMs sharing the default directory in the user cache,
+  with a lock of its `.xemantic-kotlin-script-python.lock` file,
+  so a call with missing dependencies can wait for an installation of another process,
+  and the directory must be writable when something has to be installed.
   A dependency which cannot be installed fails the call with `PythonDependencyException`, with the output of the installer.
 * A Python exception fails the call with `jep.JepException`,
   reported by the `ScriptSession` as an `ExecutionPhase.EVALUATION` error, like:
@@ -180,7 +204,9 @@ otherwise the code can declare it as a dependency, see below.
 ## Development
 
 The tests run in the `.venv` Python virtual environment of the project,
-created by Gradle with `python3`, with only the `jep` package of the version of the library installed,
+created by Gradle with `python3`, or another base Python set with the `basePython` Gradle property
+(see [DEVELOPMENT.md](DEVELOPMENT.md#the-python-of-the-tests)),
+with only the `jep` package of the version of the library installed,
 like a clean environment of an agent.
 The tests declare the Python packages they use, like `numpy`, as dependencies,
 installed from PyPI into `build/python-dependencies`, which Gradle cleans before every test run,

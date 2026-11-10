@@ -53,8 +53,6 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The Gradle configuration cache is enabled (`gradle.properties`), so a task action (`doLast { … }`) must not call a function declared in the build script — the script object is not serializable.
   Inline the logic or move the helper into `buildSrc` / an included build, and register tasks with `tasks.register(...)` rather than the `by tasks.registering` delegate.
   This includes a lambda like `onlyIf { }` capturing a top-level `val` of the build script — copy it into a local `val` within the task configuration first.
-- `xemantic-kotlin-script` is resolved from `mavenLocal()` as a SNAPSHOT until it is released —
-  after changing it, run `./gradlew publishToMavenLocal` in that project, or this one keeps building against the stale copy.
 - With an `internal` primary constructor, the Kotlin ABI dump (`checkKotlinAbi`) omits a `public` secondary constructor as well, so `checkKotlinAbi` fails on a public API which did not change —
   make the primary constructor `private`, and expose a test seam through an `internal` factory instead (see `Python.withDecoratedExecutor`).
 - Removing a package from `installPythonPackages` does not uninstall it from `.venv` — pip only ever adds —
@@ -72,6 +70,8 @@ see [DEVELOPMENT.md](DEVELOPMENT.md#markdown-soft-wrapping-in-the-ide) for how t
 - The embedded CPython does not detect a virtual environment by itself —
   without the venv's `python` as its program name (`PyConfig.setProgramName`), it ignores `pyvenv.cfg` and also imports from the global and user `site-packages` of the base Python.
   When a module is unexpectedly importable, check `sys.path` of the embedded interpreter, not of `.venv/bin/python`.
+- A running Gradle daemon does not pass a changed `LD_LIBRARY_PATH` on to the test JVM,
+  so use `--no-daemon` when trying a `-PbasePython` which needs it (see [DEVELOPMENT.md](DEVELOPMENT.md#the-python-of-the-tests)).
 - Jep passes the `PyConfig` strings to CPython as JNI *modified* UTF-8 (`GetStringUTFChars`), not plain UTF-8 —
   a character outside the BMP becomes a CESU-8 surrogate pair, which CPython does not decode as that character.
   For a path under a non-UTF-8 locale, see `pythonPath`.

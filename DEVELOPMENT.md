@@ -4,6 +4,47 @@ Notes for working on this project itself:
 the conventions its documentation follows,
 and the tooling and dependency updates worth doing from time to time.
 
+## The Python of the tests
+
+The build creates the virtual environment of the tests in `.venv` with `python3` on the `PATH` of the Gradle daemon,
+which can differ from the one of your shell,
+e.g. resolve to the old Python of Xcode on macOS.
+To choose another base Python, set the `basePython` Gradle property,
+either on the command line, in `~/.gradle/gradle.properties`,
+or with the `ORG_GRADLE_PROJECT_basePython` environment variable, e.g. on CI:
+
+```shell
+./gradlew build -PbasePython=/opt/homebrew/bin/python3.13
+```
+
+It has to be Python 3.10 or newer, otherwise the build fails before creating the environment.
+On Linux, the tests fail to load `libjep.so` when it cannot find `libpython3.*.so` ([#54](https://github.com/xemantic/xemantic-kotlin-script-python/issues/54)).
+A Python outside the system library directories, e.g. installed by `uv`,
+needs its `lib` directory in `LD_LIBRARY_PATH`,
+which `actions/setup-python` sets on CI.
+`pyenv` builds Python without a shared `libpython` by default,
+build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"` (and then set `LD_LIBRARY_PATH` as well).
+
+An existing `.venv` is judged by its own Python:
+it is kept when this Python runs, is 3.10 or newer, and has `pip`,
+otherwise it is created again.
+Without `basePython` set, the `python3` on the `PATH` is not even checked then,
+so that an IDE with another `python3` keeps the environment created in a shell.
+With `basePython` set, `.venv` is also created again when it is of another base Python,
+compared by the prefix and version of the interpreter, not by the path given.
+The previous `.venv` is moved aside to `.venv.previous` meanwhile,
+and restored when creating the new one fails or is interrupted.
+An empty `basePython` counts as not set.
+The base Python of `.venv` is recorded in `.venv/base-python.txt`,
+an input of the tests, so that they run again after it changes.
+
+Besides the build with the `python3` of the runner,
+CI runs the tests with the minimum supported Python, and the newest one verified with the pinned jep,
+set up by `actions/setup-python` and passed as `ORG_GRADLE_PROJECT_basePython`,
+see [build-python.yml](.github/workflows/build-python.yml).
+Update its matrix when the minimum is raised,
+and bump the newest one after the tests pass with it locally (`-PbasePython`), usually together with a jep update.
+
 ## Update gradlew wrapper
 
 ```shell
