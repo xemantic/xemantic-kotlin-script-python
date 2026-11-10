@@ -22,16 +22,13 @@ import com.xemantic.kotlin.test.assert
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.nio.file.Path
-import java.util.concurrent.TimeUnit
 import kotlin.io.path.ExperimentalPathApi
-import kotlin.io.path.Path
 import kotlin.io.path.createDirectory
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
-import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.Test
 
@@ -116,47 +113,6 @@ class PythonLocaleTest {
             locale.resolve("LC_CTYPE").exists()
         } catch (_: IOException) {
             false
-        }
-    }
-
-    /**
-     * Runs the [mainClass] of the test classpath in a new JVM, with the [jvmArguments],
-     * and with the [environment] variables added to the inherited ones,
-     * unlike [runProcess], which would put Python in UTF-8 mode,
-     * writing the [input] to its standard input, as UTF-8.
-     *
-     * @return the exit code and the output, merged with the standard error, decoded as UTF-8.
-     */
-    private fun runInJvm(
-        mainClass: String,
-        input: String,
-        environment: Map<String, String>,
-        jvmArguments: List<String> = emptyList()
-    ): Pair<Int, String> {
-        val java = Path(System.getProperty("java.home"), "bin", "java").toString()
-        // a file, unlike a pipe, does not block the JVM when nobody reads it, so that it can be awaited with a timeout
-        val outputFile = createTempFile("jvm-output", ".txt")
-        try {
-            val builder = ProcessBuilder(
-                listOf(java, "--enable-native-access=ALL-UNNAMED") + jvmArguments +
-                    listOf("-cp", System.getProperty("java.class.path"), mainClass)
-            ).redirectErrorStream(true).redirectOutput(outputFile.toFile())
-            builder.environment().putAll(environment)
-            val process = builder.start()
-            try {
-                process.outputStream.use { it.write(input.toByteArray(Charsets.UTF_8)) }
-                val ended = process.waitFor(5, TimeUnit.MINUTES)
-                val output = outputFile.readText(Charsets.UTF_8).trim()
-                check(ended) { "The JVM of $mainClass has not ended in 5 minutes, its output:\n$output" }
-                return process.exitValue() to output
-            } finally {
-                if (process.isAlive) {
-                    process.destroyForcibly()
-                    process.waitFor()
-                }
-            }
-        } finally {
-            outputFile.deleteIfExists()
         }
     }
 
