@@ -18,10 +18,15 @@
 
 package com.xemantic.kotlin.script.python
 
+import jep.Interpreter
 import jep.MainInterpreter
 import jep.PyConfig
 import java.io.IOException
 import java.io.Reader
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.Charset
+import java.nio.charset.CodingErrorAction
 import java.nio.file.Path
 import java.security.MessageDigest
 import kotlin.concurrent.thread
@@ -82,30 +87,28 @@ public object PythonEnvironment {
     internal lateinit var executable: String
         private set
 
+    /** The starter of the interpreters of the embedded CPython, resolved on the first use of [Python]. */
+    internal lateinit var starter: EmbeddedPythonStarter
+        private set
+
     @Synchronized
     internal fun initialize() {
         if (initialized) return
         val python = (pythonExecutable ?: defaultPythonExecutable()).toString()
-        val (executable, cacheTag, prefix, jepLocation) = probePython(python)
-        val jepDir = Path(jepLocation)
-        val library = jepDir.listDirectoryEntries().firstOrNull {
-            it.name.startsWith("libjep.") || it.name == "jep.dll"
-        } ?: throw IllegalStateException(
-            "No native Jep library in $jepDir, reinstall jep with: $python -m pip install jep"
-        )
+        val (executable, cacheTag, prefix, jepLocation, probeError) = probePython(python)
+        val library = jepLibrary(Path(jepLocation), python)
         MainInterpreter.setJepLibraryPath(library.toString())
-        // the embedded CPython finds the pyvenv.cfg of a virtual environment next to its program,
-        // otherwise it would search the site-packages of the base Python as well
-        MainInterpreter.setInitParams(PyConfig.python().setProgramName(executable))
+        MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         this.executable = executable
+        starter = EmbeddedPythonStarter(executable, probeError)
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
         }
         if (dependencyDirectory == null) {
             val prefixHash = MessageDigest.getInstance("SHA-256")
                 .digest(prefix.toByteArray())
-                .take(6)
-                .joinToString("") { "%02x".format(it) }
+                .copyOf(6)
+                .toHexString()
             dependencyDirectory = Path(
                 System.getProperty("user.home"), ".cache", "xemantic-kotlin-script-python", "$cacheTag-$prefixHash"
             )
@@ -114,30 +117,198 @@ public object PythonEnvironment {
     }
 
     /**
+     * The native library of Jep in the [jepDirectory], the directory of the `jep` package of the [python].
+     *
+     * @throws IllegalStateException if there is none, or the [jepDirectory] cannot be listed.
+     */
+    internal fun jepLibrary(jepDirectory: Path, python: String): Path {
+        val entries = try {
+            jepDirectory.listDirectoryEntries()
+        } catch (e: IOException) {
+            throw IllegalStateException(
+                "Cannot list the directory of the jep package of $python: $jepDirectory, " +
+                    "reinstall jep with: $python -m pip install jep",
+                e
+            )
+        }
+        return entries.firstOrNull {
+            it.name.startsWith("libjep.") || it.name == "jep.dll"
+        } ?: throw IllegalStateException(
+            "No native Jep library in $jepDirectory, reinstall jep with: $python -m pip install jep"
+        )
+    }
+
+    /**
+     * The configuration of the embedded CPython of the Python [executable].
+     *
+     * Its program name is the [executable], as the embedded CPython finds the `pyvenv.cfg` of a virtual environment
+     * next to its program, otherwise it would search the `site-packages` of the base Python as well.
+     *
+     * It runs in the UTF-8 mode, like the Python subprocesses, see [runProcess],
+     * as otherwise it would use the encoding of the locale of the JVM, e.g. cp1252 on Windows, or ASCII in the C locale,
+     * for its standard streams and as the default encoding of `open`,
+     * and fail with a `UnicodeEncodeError` printing, or a `UnicodeDecodeError` reading a UTF-8 file, non-ASCII text.
+     * Jep has no setter of the UTF-8 mode, but its command line option `-X utf8` enables it,
+     * also over a `PYTHONUTF8=0` environment variable,
+     * as Jep 4.3 sets the argv before the other values, and CPython reads its options then,
+     * before decoding any other value; [checkUtf8Mode] tells if a version of Jep does not.
+     */
+    internal fun embeddedPythonConfig(executable: String): PyConfig = PyConfig.python()
+        .setParseArgv(true)
+        .setArgv(executable, "-X", "utf8")
+        .setProgramName(executable)
+
+    /**
+     * Checks that the embedded CPython of the [interpreter] runs in UTF-8 mode, see [embeddedPythonConfig].
+     *
+     * @throws IllegalStateException if it does not.
+     */
+    internal fun checkUtf8Mode(interpreter: Interpreter) {
+        val utf8Mode = interpreter.getValue("__import__('sys').flags.utf8_mode")
+        check(utf8Mode == 1L) {
+            "The embedded Python does not run in UTF-8 mode (sys.flags.utf8_mode is $utf8Mode), " +
+                "the version of Jep might not support enabling it with -X utf8 in PyConfig.setArgv"
+        }
+    }
+
+    /**
      * Asks the [python] executable about itself.
      *
-     * @throws IllegalStateException if it cannot be run, or has no `jep` package.
+     * The standard error of a successful probe, e.g. a warning, is kept as [PythonProbe.error].
+     *
+     * @throws IllegalStateException if it cannot be run, or fails, has no `jep` package,
+     * does not write the values of the probe, or cannot tell the path of its executable,
+     * or if its paths are not valid in the [filesystemCharset].
      */
     internal fun probePython(python: String): PythonProbe {
-        val (exitCode, output, error) = try {
+        val result = try {
             runProcess(probeCommand(python), mergeErrorStream = false)
         } catch (e: java.io.IOException) {
             throw IllegalStateException("Cannot run Python executable: $python", e)
         }
-        check(exitCode == 0) {
-            "Cannot find the jep package of $python, install it with: $python -m pip install jep\n" +
-                listOf(output, error).filter { it.isNotEmpty() }.joinToString("\n")
+        // only the probe's own check blames jep, any other failure is the one of Python itself,
+        // e.g. of a pyenv shim of a version which is not installed
+        check(result.exitCode != PROBE_JEP_MISSING_EXIT_CODE) {
+            withOutput(
+                "Cannot find the jep package of $python, install it with: $python -m pip install jep",
+                result.failureOutput
+            )
         }
-        val (executable, cacheTag, prefix, jepLocation) = output.lines()
+        check(result.exitCode == 0) {
+            withOutput("Cannot run Python $python, it failed with exit code ${result.exitCode}", result.failureOutput)
+        }
+        val parsed = try {
+            parseProbeOutput(result.output)
+        } catch (e: CharacterCodingException) {
+            throw IllegalStateException(
+                "The paths of Python $python are not valid in the file system encoding of the JVM, " +
+                    "$filesystemCharset, run the JVM in a locale of the encoding of the file system, e.g. UTF-8",
+                e
+            )
+        }
+        val probe = checkNotNull(parsed) {
+            withOutput(
+                "Cannot read the values of the Python environment probe of $python from its output",
+                result.failureOutput
+            )
+        }
+        // the embedded CPython needs it to find the pyvenv.cfg of a virtual environment, and pip is run with it
+        check(probe.executable.isNotEmpty()) {
+            "Python cannot tell the path of its executable (sys.executable is empty): $python"
+        }
+        // limited, as it is kept for the lifetime of the JVM; a warning of Python at startup comes first
+        return probe.copy(error = limitProbeError(result.error))
+    }
+
+    /** The [error] of the probe, limited to [PROBE_ERROR_LIMIT] characters, including the note of truncation. */
+    private fun limitProbeError(error: String): String {
+        if (error.length <= PROBE_ERROR_LIMIT) return error
+        val end = (PROBE_ERROR_LIMIT - PROBE_ERROR_TRUNCATED.length).let {
+            // not between the two chars of a surrogate pair
+            if (error[it - 1].isHighSurrogate()) it - 1 else it
+        }
+        return error.substring(0, end) + PROBE_ERROR_TRUNCATED
+    }
+
+    private const val PROBE_ERROR_TRUNCATED = "\n[truncated]"
+
+    private fun withOutput(headline: String, output: String) =
+        if (output.isEmpty()) headline else "$headline\n$output"
+
+    /**
+     * The [PythonProbe] of the standard [output] of [probeCommand].
+     *
+     * The values are taken only from between the last [PROBE_BEGIN] and the following [PROBE_END] line,
+     * as anything else run by Python, e.g. a `sitecustomize` module or a `.pth` file,
+     * can write to the standard output as well, before or after them.
+     *
+     * @return the probe, or `null` if the [output] has no such values.
+     * @throws CharacterCodingException if a value is not valid in the [filesystemCharset].
+     */
+    internal fun parseProbeOutput(output: String): PythonProbe? {
+        // the output is trimmed, also of the newline before the first line
+        val lines = "\n$output"
+        val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
+        val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
+        val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
+        if (values == null || values.size != 4) return null
+        val (executable, cacheTag, prefix, jepLocation) = values.map { it.hexToPath() ?: return null }
         return PythonProbe(executable, cacheTag, prefix, jepLocation)
     }
 
-    /** The command of [probePython]. */
+    /**
+     * The command of [probePython].
+     *
+     * It writes its values, separated by a space, between the [PROBE_BEGIN] and [PROBE_END] lines,
+     * each as the hex digits of its bytes, of `os.fsencode`, the bytes of a path in the file system,
+     * to be decoded with the [filesystemCharset] to the same path in the JVM:
+     * as text, a path which is not valid UTF-8, e.g. `/home/josé` in ISO-8859-1,
+     * would be surrogate-escaped by Python in UTF-8 mode, and could not be encoded to UTF-8,
+     * while the JVM would decode a path of UTF-8 bytes to another one, in another encoding of its locale.
+     * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
+     * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
+     * The lines are written with an empty line before them, in case the standard output written before does not end with a newline,
+     * and as bytes, without the newline translation of the text mode, e.g. on Windows,
+     * to the original standard output, as `sys.stdout` might be replaced, e.g. by a `sitecustomize` module,
+     * with a stream which has no `buffer`, or which does not write to the standard output at all.
+     */
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
-        "import importlib.util, sys; print(sys.executable, sys.implementation.cache_tag, sys.prefix, " +
-            "importlib.util.find_spec('jep').submodule_search_locations[0], sep='\\n')"
+        """
+        |import importlib.util, os, sys
+        |jep_spec = importlib.util.find_spec('jep')
+        |if jep_spec is None or not jep_spec.submodule_search_locations:
+        |    if jep_spec is not None:
+        |        print('jep is not the package, but the module:', jep_spec.origin, file=sys.stderr)
+        |    sys.exit($PROBE_JEP_MISSING_EXIT_CODE)
+        |values = [
+        |    sys.executable,
+        |    sys.implementation.cache_tag,
+        |    sys.prefix,
+        |    jep_spec.submodule_search_locations[0],
+        |]
+        |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
+        |sys.stdout.flush()
+        |sys.__stdout__.flush()
+        |sys.__stdout__.buffer.write(('\n$PROBE_BEGIN\n' + payload + '\n$PROBE_END\n').encode('utf-8'))
+        |sys.__stdout__.flush()
+        |""".trimMargin()
     )
+
+    /**
+     * The exit code of [probeCommand] without the `jep` package,
+     * unlike the ones of a failure of Python itself: 1 of an exception or of `sys.exit` with a message,
+     * 2 of a wrong command line, 120 of a failure to flush the standard streams at exit,
+     * 126 and 127 of a shell which cannot run the command, and above 128 of a signal.
+     */
+    internal const val PROBE_JEP_MISSING_EXIT_CODE = 83
+
+    /** The maximum length of the standard error of the probe kept as [PythonProbe.error]. */
+    internal const val PROBE_ERROR_LIMIT = 8192
+
+    internal const val PROBE_BEGIN = "--- xemantic-kotlin-script-python probe begin ---"
+
+    internal const val PROBE_END = "--- xemantic-kotlin-script-python probe end ---"
 
     private const val DEPENDENCY_DIRECTORY_PROPERTY = "xemantic.kotlin.script.python.dependencyDirectory"
 
@@ -180,18 +351,120 @@ internal fun pythonCommand(python: String, code: String, vararg arguments: Strin
 )
 
 /**
+ * The encoding of the file paths of the JVM, the one of the locale on POSIX, `sun.jnu.encoding`,
+ * with which the JVM passes a path, also in the command line of a process, to the OS,
+ * or UTF-8 on Windows, where the paths are UTF-16, and Python encodes them in UTF-8 with `os.fsencode`.
+ */
+internal val filesystemCharset: Charset =
+    if (System.getProperty("os.name").startsWith("Windows")) Charsets.UTF_8
+    else System.getProperty("sun.jnu.encoding")?.let { Charset.forName(it) } ?: Charset.defaultCharset()
+
+/**
+ * The Python expression of the [path] of the JVM, as the `str` of the same path in Python,
+ * decoded by `os.fsdecode` from its bytes in the [filesystemCharset].
+ *
+ * Python in UTF-8 mode decodes a path of the file system from UTF-8, surrogate-escaping the bytes which are not,
+ * so under a non-UTF-8 locale, e.g. `/home/josé` in ISO-8859-1,
+ * the `str` of the path of the JVM, as passed by Jep, would be another path, encoded in (modified) UTF-8.
+ * A path in the command line of a Python process is decoded by Python the same way, and needs no such conversion.
+ */
+internal fun pythonPath(path: String): String =
+    "__import__('os').fsdecode(bytes.fromhex('${path.toByteArray(filesystemCharset).toHexString()}'))"
+
+/**
+ * The path of the hex digits of its bytes in the [filesystemCharset], or `null` if they are not hex digits.
+ *
+ * @throws CharacterCodingException if the bytes are not valid in the [filesystemCharset],
+ * which would otherwise be replaced, and name another path.
+ */
+private fun String.hexToPath(): String? {
+    val bytes = try {
+        hexToByteArray()
+    } catch (_: IllegalArgumentException) {
+        return null
+    }
+    return filesystemCharset.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+        .decode(ByteBuffer.wrap(bytes))
+        .toString()
+}
+
+/**
+ * Creates the interpreters of the embedded CPython of the Python [executable],
+ * telling a failure of its startup with what the probe of the [executable] wrote to the standard error, if anything,
+ * as a warning of a successful probe, e.g. `Could not find platform libraries` of a wrong `PYTHONHOME`,
+ * might tell why the embedded CPython, configured the same way, fails.
+ */
+internal class EmbeddedPythonStarter(private val executable: String, private val probeError: String) {
+
+    /** Whether an interpreter has been created, so that the embedded CPython has started. */
+    @Volatile
+    private var started = false
+
+    /**
+     * Creates an interpreter with [create], and checks it with [check], closing it if the check fails.
+     *
+     * @throws IllegalStateException if the embedded CPython fails to start,
+     * with the original failure as its cause:
+     * any failure before the first interpreter is created,
+     * e.g. the [Error] with which Jep rethrows the failure of initializing CPython,
+     * also when it is retried, or an [UnsatisfiedLinkError] of its native libraries.
+     * Any failure after the first interpreter is created is thrown as is,
+     * as the embedded CPython starts once per JVM.
+     */
+    fun <T : AutoCloseable> createInterpreter(create: () -> T, check: (T) -> Unit): T {
+        val interpreter = try {
+            create()
+        } catch (e: VirtualMachineError) {
+            // e.g. an OutOfMemoryError, which is no failure of the embedded CPython
+            throw e
+        } catch (e: Throwable) {
+            if (started) throw e
+            throw startupFailure(e)
+        }
+        started = true
+        try {
+            check(interpreter)
+        } catch (e: Throwable) {
+            try {
+                interpreter.close()
+            } catch (closing: Throwable) {
+                e.addSuppressed(closing)
+            }
+            throw e
+        }
+        return interpreter
+    }
+
+    private fun startupFailure(cause: Throwable): IllegalStateException {
+        // Jep wraps the failure of initializing CPython in an Error, whose message is its toString()
+        val reason = cause.cause?.takeIf { cause.message == it.toString() } ?: cause
+        val message = "Cannot initialize the embedded Python $executable: ${reason.message ?: reason}"
+        return IllegalStateException(
+            if (probeError.isEmpty()) message
+            else "$message\nThe probe of this Python wrote to the standard error, which might tell why:\n$probeError",
+            cause
+        )
+    }
+
+}
+
+/**
  * What a Python executable tells about itself.
  *
  * @property executable the absolute path of the executable, `sys.executable`.
  * @property cacheTag the `sys.implementation.cache_tag`, e.g. `cpython-313`.
  * @property prefix the `sys.prefix`, the virtual environment, if any.
  * @property jepLocation the directory of the `jep` package.
+ * @property error the standard error of the probe, e.g. a warning of Python, empty if none.
  */
 internal data class PythonProbe(
     val executable: String,
     val cacheTag: String,
     val prefix: String,
-    val jepLocation: String
+    val jepLocation: String,
+    val error: String = ""
 )
 
 /**
@@ -205,7 +478,16 @@ internal data class ProcessResult(
     val exitCode: Int,
     val output: String,
     val error: String
-)
+) {
+
+    /**
+     * The standard error, followed by the standard output, without the empty ones,
+     * to tell why the process failed: the error, e.g. a traceback or the message of `sys.exit`,
+     * is what matters, and the output is likely partial then.
+     */
+    val failureOutput: String get() = listOf(error, output).filter { it.isNotEmpty() }.joinToString("\n")
+
+}
 
 /**
  * Runs the [command], writing the [input] to its standard input, and waits for it to end.

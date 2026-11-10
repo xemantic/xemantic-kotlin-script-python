@@ -256,6 +256,43 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan when Python writes to standard error without line break`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // like a warning written to the standard error, before the block-buffered standard output is flushed,
+        // which would be joined with the first line of the plan, if the streams were merged
+        val command = pythonCommand(
+            PythonEnvironment.executable,
+            "import sys; sys.stderr.write('warning: '); sys.stderr.flush()\n" + PythonDependencies.PLAN,
+            directory
+        )
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command
+        )
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
+    }
+
+    @Test
+    fun `should fail plan with message written to standard error`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+
+        // when
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan("dependencies = \n", directory, emptyList())
+        }
+
+        // then
+        assert(exception.message!!.startsWith("Invalid '# /// script' metadata: "))
+    }
+
+    @Test
     fun `should plan without tomllib of Python before 3_11`() {
         // given
         PythonEnvironment.initialize()
@@ -266,13 +303,15 @@ class PythonDependenciesTest {
             PythonDependencies.PLAN
 
         // when
-        val (exitCode, output) = runProcess(
-            pythonCommand(PythonEnvironment.executable, code, directory),
-            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n",
+            directory,
+            emptyList(),
+            pythonCommand(PythonEnvironment.executable, code, directory)
         )
 
         // then
-        assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
     }
 
     @Test
@@ -284,13 +323,17 @@ class PythonDependenciesTest {
             PythonDependencies.PLAN
 
         // when
-        val (exitCode, output) = runProcess(
-            pythonCommand(PythonEnvironment.executable, code, directory),
-            input = """{"metadata": "dependencies = \n", "modules": []}"""
-        )
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan(
+                "dependencies = \n",
+                directory,
+                emptyList(),
+                pythonCommand(PythonEnvironment.executable, code, directory)
+            )
+        }
 
         // then
-        assert(exitCode != 0 && output.startsWith("Invalid '# /// script' metadata: "))
+        assert(exception.message!!.startsWith("Invalid '# /// script' metadata: "))
     }
 
     @Test
@@ -302,13 +345,17 @@ class PythonDependenciesTest {
             PythonDependencies.PLAN
 
         // when
-        val (exitCode, output) = runProcess(
-            pythonCommand(PythonEnvironment.executable, code, directory),
-            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
-        )
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan(
+                "dependencies = [\"nonexistent-dependency\"]\n",
+                directory,
+                emptyList(),
+                pythonCommand(PythonEnvironment.executable, code, directory)
+            )
+        }
 
         // then
-        assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+        assert(exception.message == PythonDependencies.NO_TOML_PARSER_MESSAGE)
     }
 
     @OptIn(ExperimentalPathApi::class)
@@ -327,6 +374,7 @@ class PythonDependenciesTest {
             val (exitCode, output) = runProcess(
                 PythonDependencies.planCommand(directory),
                 input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}""",
+                mergeErrorStream = false,
                 directory = workingDirectory
             )
 
@@ -351,6 +399,7 @@ class PythonDependenciesTest {
             // when
             val (exitCode, output) = runProcess(
                 PythonDependencies.pipCommand("--version"),
+                mergeErrorStream = false,
                 directory = workingDirectory
             )
 
