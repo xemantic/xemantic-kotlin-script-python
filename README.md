@@ -36,12 +36,14 @@ An environment without `pip`, like the one of `uv venv`, can get `tomli` with `p
 
 Jep is a native CPython extension:
 the Java library comes from Maven Central,
-but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use,
-which must match the version of the `org.ninia:jep` Java library, 4.3.2 in these examples:
+but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use.
+The version of the `jep` package must match the version of the `org.ninia:jep` Java library, 4.3.2 in these examples:
 
 ```shell
 python -m pip install jep==4.3.2
 ```
+
+A virtual environment without `pip`, like the one of `uv venv`, can get it with `uv pip install --python <python> jep==4.3.2`.
 
 An externally managed Python ([PEP 668](https://peps.python.org/pep-0668/)),
 like the one of Homebrew or of most Linux distributions,
@@ -52,13 +54,15 @@ python3 -m venv ~/.venvs/jep
 ~/.venvs/jep/bin/python -m pip install jep==4.3.2
 ```
 
-and point to it with the `VIRTUAL_ENV` environment variable, or with `PythonEnvironment.pythonExecutable`,
-as an absolute path, e.g. `/home/me/.venvs/jep`, as `~` is expanded only by a shell, not by an IDE.
-On Windows, its Python is `Scripts\python.exe` of the virtual environment.
+and point to it with an absolute path, as `~` is expanded only by a shell, not by an IDE:
+either with the `VIRTUAL_ENV` environment variable set to the virtual environment, e.g. `/home/me/.venvs/jep`,
+or with `PythonEnvironment.pythonExecutable` set to its Python, e.g. `/home/me/.venvs/jep/bin/python`,
+which is `Scripts\python.exe` of the virtual environment on Windows.
 
 PyPI has no wheels of `jep`, so pip always builds it from its source,
-which requires a C compiler, the Python headers (e.g. `python3-dev` on Debian/Ubuntu),
+which requires a C compiler, the Python headers,
 and a JDK, found through `JAVA_HOME`, which is optional on Linux and macOS, where `javac` on the `PATH` is found as well.
+On Debian/Ubuntu, the Python headers, and the `venv` module, come with `apt install python3-dev python3-venv`.
 
 The Python executable is, in this order:
 1. `PythonEnvironment.pythonExecutable`, if set before the first use of `Python`,

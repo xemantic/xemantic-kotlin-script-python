@@ -513,8 +513,11 @@ class PythonEnvironmentTest {
             "  /venv/bin/python -m pip install jep==4.3.2\n" in advice &&
                 "-m venv" !in advice &&
                 "jep is built from its source" in advice &&
-                "python3-dev" in advice &&
-                "javac on the PATH" in advice
+                "apt install python3-dev" in advice &&
+                "python3-venv" !in advice &&
+                "javac on the PATH" in advice &&
+                // e.g. a virtual environment of uv, which has no pip
+                "uv pip install --python /venv/bin/python jep==4.3.2" in advice
         )
     }
 
@@ -537,7 +540,9 @@ class PythonEnvironmentTest {
                 "  /home/jane/.venvs/jep/bin/python -m pip install jep==4.3.2\n" in advice &&
                 "VIRTUAL_ENV to /home/jane/.venvs/jep" in advice &&
                 "PythonEnvironment.pythonExecutable" in advice &&
-                "~" !in advice
+                "~" !in advice &&
+                // the venv module, without which the first step fails, is a separate package on Debian/Ubuntu
+                "apt install python3-dev python3-venv" in advice
         )
     }
 
@@ -558,7 +563,9 @@ class PythonEnvironmentTest {
             "  \"C:\\Program Files\\Python313\\python.exe\" -m venv \"C:\\Users\\Jane Doe\\.venvs\\jep\"\n" in advice &&
                 "  \"C:\\Users\\Jane Doe\\.venvs\\jep\\Scripts\\python.exe\" -m pip install jep==4.3.2\n" in advice &&
                 "%" !in advice &&
-                "JAVA_HOME (not set)" in advice
+                "JAVA_HOME (not set)" in advice &&
+                // PowerShell would take a quoted command for a string
+                "In PowerShell, prefix a quoted command with &" in advice
         )
     }
 

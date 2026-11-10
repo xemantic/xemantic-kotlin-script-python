@@ -395,9 +395,12 @@ internal fun readJepVersion(properties: InputStream): String? = try {
  *
  * If the [python] is [externallyManaged] (PEP 668), e.g. the one of Homebrew or of most Linux distributions,
  * pip refuses to install into it, so jep is installed into a new virtual environment in the [userHome],
- * otherwise, e.g. in a virtual environment holding the other packages of the user, into the [python] itself.
- * The paths are absolute, as `~` or `%USERPROFILE%` would not be expanded outside a shell, e.g. in an IDE.
- * It also tells what building jep from its source needs, as PyPI has no wheels of it.
+ * otherwise, e.g. in a virtual environment holding the other packages of the user, into the [python] itself,
+ * also with uv, as a virtual environment of uv has no pip.
+ * The paths are absolute, as `~` or `%USERPROFILE%` would not be expanded outside a shell, e.g. in an IDE,
+ * and quoted for cmd, which PowerShell runs only with the `&` operator before them.
+ * It also tells what building jep from its source needs, as PyPI has no wheels of it,
+ * and on Debian/Ubuntu also the package of the venv module, without which a virtual environment cannot be created.
  */
 internal fun jepInstallAdvice(
     python: String,
@@ -424,13 +427,22 @@ internal fun jepInstallAdvice(
         )
     } else listOf(
         (if (reinstall) "Reinstall" else "Install") + " jep$version with:",
-        "  ${quoted(python)} -m pip install " + (if (reinstall) "--force-reinstall --no-cache-dir " else "") + jep
+        "  ${quoted(python)} -m pip install " + (if (reinstall) "--force-reinstall --no-cache-dir " else "") + jep,
+        "or, without pip, e.g. in a virtual environment of uv:",
+        "  uv pip install --python ${quoted(python)} " + (if (reinstall) "--reinstall --no-cache " else "") + jep
     )
-    val build = if (windows) "Microsoft C++ Build Tools and a JDK, found through JAVA_HOME" +
-        (if (javaHome == null) " (not set)" else "")
-    else "a C compiler, the Python headers (e.g. python3-dev on Debian/Ubuntu), " +
-        "and a JDK, found through JAVA_HOME, or javac on the PATH"
-    return (install + "jep is built from its source, needing $build.").joinToString("\n")
+    val build = if (windows) listOf(
+        "jep is built from its source, needing Microsoft C++ Build Tools and a JDK, found through JAVA_HOME" +
+            (if (javaHome == null) " (not set)." else ".")
+    ) else listOf(
+        "jep is built from its source, needing a C compiler, the Python headers, " +
+            "and a JDK, found through JAVA_HOME, or javac on the PATH;",
+        "on Debian/Ubuntu: apt install python3-dev" + (if (externallyManaged) " python3-venv" else "")
+    )
+    val powerShell = if (windows && install.any { "\"" in it }) {
+        listOf("In PowerShell, prefix a quoted command with &.")
+    } else emptyList()
+    return (install + build + powerShell).joinToString("\n")
 }
 
 /**
