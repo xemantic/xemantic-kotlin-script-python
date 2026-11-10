@@ -145,6 +145,11 @@ otherwise the code can declare it as a dependency, see below.
   The installed dependencies are shared by all the `Python` interpreters of the JVM,
   and they cannot change the versions of the distributions of the Python environment itself,
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.
+  The installations into the dependency directory are serialized, also across processes,
+  e.g. JVMs sharing the default directory in the user cache,
+  with a lock of its `.xemantic-kotlin-script-python.lock` file,
+  so a call with missing dependencies can wait for an installation of another process,
+  and the directory must be writable when something has to be installed.
   A dependency which cannot be installed fails the call with `PythonDependencyException`, with the output of the installer.
 * A Python exception fails the call with `jep.JepException`,
   reported by the `ScriptSession` as an `ExecutionPhase.EVALUATION` error, like:

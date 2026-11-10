@@ -20,8 +20,26 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import jep.Interpreter
+import org.junit.jupiter.api.Assumptions.assumeFalse
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.lang.reflect.Proxy
+import java.nio.file.FileSystems
+import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
+import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
+import kotlin.concurrent.withLock
+import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.createDirectories
+import kotlin.io.path.createFile
+import kotlin.io.path.deleteIfExists
+import kotlin.io.path.deleteRecursively
+import kotlin.io.path.exists
+import kotlin.io.path.getPosixFilePermissions
+import kotlin.io.path.isWritable
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 
@@ -95,10 +113,10 @@ class PythonDependenciesTest {
         ) { _, method, _ -> error("Unexpected call of Interpreter.${method.name}") } as Interpreter
 
         // when
-        val state = synchronized(PythonDependencies) {
+        val state = PythonDependencies.installLock.withLock {
             // as if another thread was installing dependencies
             val installer = thread { PythonDependencies.install("x = 1", interpreter) }
-            while (installer.state != Thread.State.BLOCKED && installer.state != Thread.State.TERMINATED) {
+            while (installer.state != Thread.State.WAITING && installer.state != Thread.State.TERMINATED) {
                 Thread.onSpinWait()
             }
             installer.state
@@ -107,6 +125,254 @@ class PythonDependenciesTest {
         // then
         assert(state == Thread.State.TERMINATED)
     }
+
+    @Test
+    fun `should wait for installation of other process into dependency directory`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory!!
+        val distribution = "lock-marker-${UUID.randomUUID()}"
+        // the other process "installs" the distribution only after this JVM tries to lock the directory,
+        // so an installation not waiting for it would not find it, and fail to install it from the index
+        val otherInstallation = startOtherInstallation(directory, distribution)
+        try {
+            Python().use { python ->
+                try {
+                    val thread = python.threadName
+                    val installation = CompletableFuture.runAsync {
+                        python.exec("# /// script\n# dependencies = [\"$distribution\"]\n# ///\nx = 1\n")
+                    }
+
+                    // when
+                    awaitDoneOrWaiting(installation, thread, ::isFileLock)
+                    otherInstallation.finish()
+                    val failure = runCatching { installation.get(5, TimeUnit.MINUTES) }.exceptionOrNull()
+
+                    // then
+                    assert(failure == null)
+                } finally {
+                    // before closing, which would wait forever for the Python thread waiting for the lock
+                    otherInstallation.destroy()
+                }
+            }
+        } finally {
+            @OptIn(ExperimentalPathApi::class)
+            directory.resolve("${distribution.replace('-', '_')}-1.0.dist-info").deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should not wait for installation of other process when code has no metadata`() {
+        // given
+        PythonEnvironment.initialize()
+        val otherInstallation = startOtherInstallation(PythonEnvironment.dependencyDirectory!!, distribution = null)
+        Python().use { python ->
+            try {
+                // when
+                val installation = CompletableFuture.runAsync { python.exec("x = 1") }
+                val failure = runCatching { installation.get(5, TimeUnit.MINUTES) }.exceptionOrNull()
+
+                // then
+                assert(failure == null)
+            } finally {
+                otherInstallation.destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `should not wait for installation of other process when dependencies are installed`() {
+        // given
+        PythonEnvironment.initialize()
+        val otherInstallation = startOtherInstallation(PythonEnvironment.dependencyDirectory!!, distribution = null)
+        Python().use { python ->
+            try {
+                val thread = python.threadName
+                // jep is a distribution of the Python environment
+                val installation = CompletableFuture.runAsync {
+                    python.exec("# /// script\n# dependencies = [\"jep\"]\n# ///\nx = 1\n")
+                }
+
+                // when
+                val locking = awaitDoneOrWaiting(installation, thread, ::isFileLock)
+                otherInstallation.destroy()
+                val failure = runCatching { installation.get(5, TimeUnit.MINUTES) }.exceptionOrNull()
+
+                // then
+                assert(!locking && failure == null)
+            } finally {
+                otherInstallation.destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `should not wait for other Python waiting for installation of other process when dependencies are installed`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory!!
+        val distribution = "lock-marker-${UUID.randomUUID()}"
+        val otherInstallation = startOtherInstallation(directory, distribution)
+        try {
+            Python().use { waitingPython ->
+                Python().use { python ->
+                    try {
+                        val waitingThread = waitingPython.threadName
+                        val waitingInstallation = CompletableFuture.runAsync {
+                            waitingPython.exec("# /// script\n# dependencies = [\"$distribution\"]\n# ///\nx = 1\n")
+                        }
+                        check(awaitDoneOrWaiting(waitingInstallation, waitingThread, ::isFileLock)) {
+                            "The other Python did not wait for the installation of the other process"
+                        }
+                        val thread = python.threadName
+                        // jep is a distribution of the Python environment
+                        val installation = CompletableFuture.runAsync {
+                            python.exec("# /// script\n# dependencies = [\"jep\"]\n# ///\nx = 1\n")
+                        }
+
+                        // when
+                        val waiting = awaitDoneOrWaiting(installation, thread, ::isInstallLock)
+                        otherInstallation.finish()
+                        val failure = runCatching { installation.get(5, TimeUnit.MINUTES) }.exceptionOrNull()
+
+                        // then
+                        assert(!waiting && failure == null)
+                    } finally {
+                        otherInstallation.destroy()
+                    }
+                }
+            }
+        } finally {
+            @OptIn(ExperimentalPathApi::class)
+            directory.resolve("${distribution.replace('-', '_')}-1.0.dist-info").deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should create lock file writable for other users`() {
+        // given
+        assumeTrue("posix" in FileSystems.getDefault().supportedFileAttributeViews(), "POSIX permissions only")
+        PythonEnvironment.initialize()
+        // e.g. for users of a group sharing the dependency directory
+        val lockFile = PythonEnvironment.dependencyDirectory!!.createDirectories()
+            .resolve(PythonDependencies.LOCK_FILE_NAME)
+        lockFile.deleteIfExists()
+        Python().use { python ->
+            // when
+            // failing to install, but locking the directory first
+            assertFailsWith<PythonDependencyException> {
+                python.exec("# /// script\n# dependencies = [\"nonexistent-dependency\"]\n# ///\nx = 1\n")
+            }
+
+            // then
+            assert(lockFile.getPosixFilePermissions() == PosixFilePermissions.fromString("rw-rw-rw-"))
+        }
+    }
+
+    @Test
+    fun `should run code with installed dependencies when lock file is not writable`() {
+        // given
+        PythonEnvironment.initialize()
+        // e.g. created by another user, or in a read-only directory of a container image
+        val lockFile = readOnlyLockFile()
+        try {
+            Python().use { python ->
+                // when
+                // jep is a distribution of the Python environment
+                python.exec("# /// script\n# dependencies = [\"jep\"]\n# ///\nx = 1\n")
+
+                // then
+                assert(python["x"] == 1L)
+            }
+        } finally {
+            lockFile.toFile().setWritable(true)
+        }
+    }
+
+    @Test
+    fun `should fail with dependency exception when lock file is not writable for missing dependency`() {
+        // given
+        PythonEnvironment.initialize()
+        val lockFile = readOnlyLockFile()
+        try {
+            Python().use { python ->
+                // when
+                val exception = assertFailsWith<PythonDependencyException> {
+                    python.exec("# /// script\n# dependencies = [\"nonexistent-dependency\"]\n# ///\nx = 1\n")
+                }
+
+                // then
+                assert(exception.message!!.startsWith("Cannot lock the dependency directory with $lockFile"))
+            }
+        } finally {
+            lockFile.toFile().setWritable(true)
+        }
+    }
+
+    private fun readOnlyLockFile(): Path {
+        val lockFile = PythonEnvironment.dependencyDirectory!!.createDirectories()
+            .resolve(PythonDependencies.LOCK_FILE_NAME)
+        if (!lockFile.exists()) lockFile.createFile()
+        // e.g. root can write it anyway
+        assumeTrue(lockFile.toFile().setWritable(false) && !lockFile.isWritable(), "Cannot make lock file read-only")
+        return lockFile
+    }
+
+    /**
+     * Starts a Python process locking the dependency [directory], like an installation of another JVM,
+     * which, on [finish], "installs" the [distribution], if any, and unlocks the directory.
+     *
+     * It locks with POSIX `fcntl.lockf`, like `FileChannel.lock` on Linux and macOS, so the test is skipped on Windows.
+     */
+    private fun startOtherInstallation(directory: Path, distribution: String?): Process {
+        assumeFalse(System.getProperty("os.name").startsWith("Windows"), "fcntl.lockf is POSIX only")
+        directory.createDirectories()
+        val process = ProcessBuilder(
+            PythonEnvironment.executable, "-c", OTHER_INSTALLATION,
+            directory.resolve(PythonDependencies.LOCK_FILE_NAME).toString(),
+            distribution ?: ""
+        ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
+        val line = process.inputStream.bufferedReader().readLine()
+        check(line == "locked") { "The other installation did not lock the directory: $line" }
+        return process
+    }
+
+    private fun Process.finish() {
+        outputStream.use { it.write('\n'.code) }
+        check(waitFor(5, TimeUnit.MINUTES) && exitValue() == 0) { "The other installation did not finish" }
+    }
+
+    /** The name of the thread of this [Python], which is busy until the calls submitted before are done. */
+    private val Python.threadName: String
+        get() = eval("__import__('java.lang', fromlist=['Thread']).Thread.currentThread().getName()")
+
+    /**
+     * Waits until the [installation] is done, or the [thread] waits in a stack frame matching [waitsIn],
+     * at most for minutes, so that a regression fails instead of hanging.
+     *
+     * @return whether the [thread] waits.
+     */
+    private fun awaitDoneOrWaiting(
+        installation: CompletableFuture<*>,
+        thread: String,
+        waitsIn: (StackTraceElement) -> Boolean
+    ): Boolean {
+        fun isWaiting() = Thread.getAllStackTraces().any { (it, stackTrace) ->
+            it.name == thread && stackTrace.any(waitsIn)
+        }
+        val deadline = System.nanoTime() + TimeUnit.MINUTES.toNanos(5)
+        while (!installation.isDone && System.nanoTime() < deadline) {
+            if (isWaiting()) return true
+            Thread.sleep(10)
+        }
+        return isWaiting()
+    }
+
+    private fun isFileLock(frame: StackTraceElement) =
+        frame.className == "sun.nio.ch.FileChannelImpl" && frame.methodName == "lock"
+
+    private fun isInstallLock(frame: StackTraceElement) =
+        frame.className == ReentrantLock::class.java.name && frame.methodName.startsWith("lock")
 
     @Test
     fun `should find no metadata for lone script marker line`() {
@@ -304,6 +570,28 @@ class PythonDependenciesTest {
 
         // then
         assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+    }
+
+    private companion object {
+
+        val OTHER_INSTALLATION = """
+            import fcntl, os, sys
+
+            lock_file, distribution = sys.argv[1], sys.argv[2]
+            fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o666)
+            fcntl.lockf(fd, fcntl.LOCK_EX)
+            print("locked", flush=True)
+            sys.stdin.read()
+            if distribution:
+                info = os.path.join(
+                    os.path.dirname(lock_file), distribution.replace("-", "_") + "-1.0.dist-info"
+                )
+                os.makedirs(info)
+                with open(os.path.join(info, "METADATA"), "w") as metadata:
+                    metadata.write(f"Metadata-Version: 2.1\nName: {distribution}\nVersion: 1.0\n")
+            fcntl.lockf(fd, fcntl.LOCK_UN)
+        """.trimIndent()
+
     }
 
 }

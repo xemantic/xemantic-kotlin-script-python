@@ -22,11 +22,22 @@ import jep.Interpreter
 import jep.python.PyCallable
 import org.intellij.lang.annotations.Language
 import java.io.File
+import java.io.IOException
+import java.nio.channels.FileChannel
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
+import kotlin.io.path.createFile
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
+import kotlin.io.path.exists
 import kotlin.io.path.isExecutable
+import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeLines
 
 /**
@@ -45,6 +56,15 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  * are kept in their versions, as a module cannot be replaced once imported.
  */
 internal object PythonDependencies {
+
+    /**
+     * The file in the dependency directory, locked by every JVM while it installs into the directory.
+     *
+     * Not `.lock`, which `uv pip install --target` locks itself while this JVM waits for it,
+     * where the locks of both interact, e.g. on Windows, macOS, or NFS,
+     * so uv would wait for its timeout, and then install without locking.
+     */
+    internal const val LOCK_FILE_NAME = ".xemantic-kotlin-script-python.lock"
 
     private val blockStart = Regex("# /// [a-zA-Z0-9-]+")
 
@@ -97,31 +117,96 @@ internal object PythonDependencies {
 
     private fun String.isComment() = this == "#" || startsWith("# ")
 
+    /**
+     * Serializes the installations of this JVM,
+     * before the [LOCK_FILE_NAME] serializes them with the ones of other processes,
+     * as a JVM cannot lock a file it already holds a lock on.
+     */
+    internal val installLock = ReentrantLock()
+
     /** Installs the missing dependencies declared by the [code], if any, on the thread of the [interpreter]. */
     fun install(code: String, interpreter: Interpreter) {
-        // outside the lock, so that code without metadata does not wait for an installation of another thread
+        // before locking, so that code without metadata does not wait for an installation of another thread
         val metadata = scriptMetadata(code) ?: return
-        installMetadata(metadata, interpreter)
-    }
-
-    @Synchronized
-    private fun installMetadata(metadata: String, interpreter: Interpreter) {
-        val directory = PythonEnvironment.dependencyDirectory!!.createDirectories().toString()
+        val directory = PythonEnvironment.dependencyDirectory!!
         val imported = interpreter.getValue(
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
             List::class.java
         ).map { it.toString() }
-        val plan = plan(metadata, directory, imported)
-        val missing = plan.filter { it.first == "install" }.map { it.second }
-        if (missing.isNotEmpty()) {
-            installMissing(missing, plan.filter { it.first == "constraint" }.map { it.second }, directory)
+        // without locking, as the plan only reads the directory, which can be read-only when nothing is missing,
+        // and so that the installed dependencies do not wait for an installation of another thread or process
+        if (plan(metadata, directory.toString(), imported).missing().isNotEmpty()) {
+            installLock.withLock {
+                withDirectoryLock(directory) {
+                    // again, as another thread or process could have installed them meanwhile
+                    val plan = plan(metadata, directory.toString(), imported)
+                    val missing = plan.missing()
+                    if (missing.isNotEmpty()) {
+                        val constraints = plan.filter { it.first == "constraint" }.map { it.second }
+                        installMissing(missing, constraints, directory.toString())
+                    }
+                }
+            }
         }
-        @Suppress("UNCHECKED_CAST")
-        val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
-        if (directory !in path) {
-            interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use { it.call(directory) }
+        // the sys module is shared by all the interpreters, so that the directory is appended only once
+        synchronized(this) {
+            @Suppress("UNCHECKED_CAST")
+            val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
+            if (directory.toString() !in path) {
+                interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use {
+                    it.call(directory.toString())
+                }
+            }
         }
         interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
+    }
+
+    private fun List<Pair<String, String>>.missing() = filter { it.first == "install" }.map { it.second }
+
+    /**
+     * Runs the [block] with the [LOCK_FILE_NAME] of the dependency [directory] locked,
+     * against another JVM installing into the same directory, e.g. a shared one of the user cache,
+     * which would otherwise delete or overwrite the files being installed.
+     *
+     * The lock file is never deleted, as another process could have opened it already, and would lock a deleted file.
+     * It is created writable for everyone, like the lock file of uv,
+     * so that the users sharing the directory, e.g. of a group, can lock it.
+     *
+     * @throws PythonDependencyException if the directory cannot be locked, e.g. when it is not writable.
+     */
+    private fun withDirectoryLock(directory: Path, block: () -> Unit) {
+        val lockFile = directory.resolve(LOCK_FILE_NAME)
+        val channel = try {
+            directory.createDirectories()
+            if (!lockFile.exists()) createLockFile(lockFile)
+            FileChannel.open(lockFile, WRITE)
+        } catch (e: IOException) {
+            throw PythonDependencyException("Cannot lock the dependency directory with $lockFile: $e")
+        }
+        channel.use {
+            val lock = try {
+                channel.lock()
+            } catch (e: IOException) {
+                // e.g. ENOLCK of a network file system without locking
+                throw PythonDependencyException("Cannot lock the dependency directory with $lockFile: $e")
+            }
+            lock.use { block() }
+        }
+    }
+
+    private fun createLockFile(lockFile: Path) {
+        try {
+            lockFile.createFile()
+        } catch (_: FileAlreadyExistsException) {
+            // created by another process meanwhile
+            return
+        }
+        try {
+            // after creating, as the permissions of creating are restricted by the umask
+            lockFile.setPosixFilePermissions(PosixFilePermissions.fromString("rw-rw-rw-"))
+        } catch (_: UnsupportedOperationException) {
+            // e.g. on Windows
+        }
     }
 
     /**
