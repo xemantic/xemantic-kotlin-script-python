@@ -116,11 +116,11 @@ internal object PythonDependencies {
         if (missing.isNotEmpty()) {
             installMissing(missing, plan.filter { it.first == "constraint" }.map { it.second }, directory)
         }
-        @Suppress("UNCHECKED_CAST")
-        val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
-        if (directory !in path) {
-            interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use { it.call(directory) }
-        }
+        // as the str of the path in Python, which differs from the one of the JVM under a non-UTF-8 locale
+        interpreter.exec(
+            "(lambda path, sys: path in sys.path or sys.path.append(path))" +
+                "(${pythonPath(directory)}, __import__('sys'))"
+        )
         interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
     }
 
