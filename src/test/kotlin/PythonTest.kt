@@ -986,17 +986,22 @@ class PythonTest {
     fun `should search modules in the same paths as the Python executable`() {
         // given
         val executable = Path(System.getenv("VIRTUAL_ENV"), "bin", "python")
-        val process = ProcessBuilder(executable.toString(), "-c", "import sys; print(*sys.path[1:], sep='\\n')").start()
-        val executablePath = process.inputStream.bufferedReader().readLines()
-        process.waitFor()
+        PythonEnvironment.initialize()
+        // as ascii, as a path which is not UTF-8, under a non-UTF-8 locale, is surrogate-escaped by Python
+        val executablePath = runProcess(
+            listOf(executable.toString(), "-c", "import sys; print(*map(ascii, sys.path[1:]), sep='\\n')"),
+            mergeErrorStream = false
+        ).output.lines()
 
         // when
-        val path = python.eval<List<String>>("__import__('sys').path")
+        // the dependency directory is added once any snippet of this JVM declares dependencies
+        val path = python.eval<List<String>>(
+            "[ascii(path) for path in __import__('sys').path " +
+                "if path != ${pythonPath(PythonEnvironment.dependencyDirectory.toString())}]"
+        )
 
         // then
-        // the dependency directory is added once any snippet of this JVM declares dependencies
-        val dependencyDirectory = PythonEnvironment.dependencyDirectory.toString()
-        assert(path.filter { it != dependencyDirectory } == executablePath)
+        assert(path == executablePath)
     }
 
 }

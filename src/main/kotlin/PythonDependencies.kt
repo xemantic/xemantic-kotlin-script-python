@@ -148,15 +148,13 @@ internal object PythonDependencies {
                 }
             }
         }
-        // the sys module is shared by all the interpreters, so that the directory is appended only once
+        // the sys module is shared by all the interpreters, so that the directory is appended only once;
+        // as the str of the path in Python, which differs from the one of the JVM under a non-UTF-8 locale
         synchronized(this) {
-            @Suppress("UNCHECKED_CAST")
-            val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
-            if (directory.toString() !in path) {
-                interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use {
-                    it.call(directory.toString())
-                }
-            }
+            interpreter.exec(
+                "(lambda path, sys: path in sys.path or sys.path.append(path))" +
+                    "(${pythonPath(directory.toString())}, __import__('sys'))"
+            )
         }
         interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
     }
@@ -211,21 +209,37 @@ internal object PythonDependencies {
 
     /**
      * Runs the [PLAN] for the [metadata], found by [scriptMetadata], the dependency [directory],
-     * and the [imported] top-level modules.
+     * and the [imported] top-level modules, with the [command], by default the [planCommand].
      *
      * @return the `install` and `constraint` entries of the plan, as pairs of the kind and the value.
      * @throws PythonDependencyException if the plan cannot be made.
      */
-    fun plan(metadata: String, directory: String, imported: List<String>): List<Pair<String, String>> {
+    fun plan(
+        metadata: String,
+        directory: String,
+        imported: List<String>,
+        command: List<String> = planCommand(directory)
+    ): List<Pair<String, String>> {
         // on the standard input, as the command line would exceed the OS limit after importing many modules
         val input = """{"metadata": ${metadata.toJson()}, "modules": [${imported.joinToString(", ") { it.toJson() }}]}"""
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", PLAN, directory),
-            input = input
-        )
-        if (exitCode != 0) throw PythonDependencyException(output)
-        return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+        // the standard error separately, as a write to it, e.g. a warning, could split a line of the plan
+        val result = runProcess(command, input = input, mergeErrorStream = false)
+        if (result.exitCode != 0) throw PythonDependencyException(result.failureOutput)
+        return result.output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
     }
+
+    /** The command running the [PLAN] for the dependency [directory]. */
+    fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
+
+    /**
+     * The command running `pip` of the environment with the [arguments],
+     * like `python -m pip`, which would import from the working directory, also `pip` itself.
+     */
+    fun pipCommand(vararg arguments: String): List<String> = pythonCommand(
+        PythonEnvironment.executable,
+        "import runpy\nrunpy.run_module('pip', run_name='__main__', alter_sys=True)",
+        *arguments
+    )
 
     /** This string as a JSON string, with every character outside printable ASCII escaped, so it is ASCII only. */
     private fun String.toJson(): String = buildString(length + 2) {
@@ -254,8 +268,8 @@ internal object PythonDependencies {
                     "--constraints", constraintsFile.toString()
                 )
             } else {
-                listOf(
-                    PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
+                pipCommand(
+                    "install", "--quiet",
                     "--disable-pip-version-check", "--no-input", "--upgrade",
                     "--target", directory,
                     "--constraint", constraintsFile.toString()

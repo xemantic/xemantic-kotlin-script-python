@@ -34,12 +34,15 @@ import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.createDirectories
+import kotlin.io.path.createDirectory
 import kotlin.io.path.createFile
+import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
 import kotlin.io.path.getPosixFilePermissions
 import kotlin.io.path.isWritable
+import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
 
@@ -517,6 +520,43 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan when Python writes to standard error without line break`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // like a warning written to the standard error, before the block-buffered standard output is flushed,
+        // which would be joined with the first line of the plan, if the streams were merged
+        val command = pythonCommand(
+            PythonEnvironment.executable,
+            "import sys; sys.stderr.write('warning: '); sys.stderr.flush()\n" + PythonDependencies.PLAN,
+            directory
+        )
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command
+        )
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
+    }
+
+    @Test
+    fun `should fail plan with message written to standard error`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+
+        // when
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan("dependencies = \n", directory, emptyList())
+        }
+
+        // then
+        assert(exception.message!!.startsWith("Invalid '# /// script' metadata: "))
+    }
+
+    @Test
     fun `should plan without tomllib of Python before 3_11`() {
         // given
         PythonEnvironment.initialize()
@@ -527,13 +567,15 @@ class PythonDependenciesTest {
             PythonDependencies.PLAN
 
         // when
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", code, directory),
-            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n",
+            directory,
+            emptyList(),
+            pythonCommand(PythonEnvironment.executable, code, directory)
         )
 
         // then
-        assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
     }
 
     @Test
@@ -545,13 +587,17 @@ class PythonDependenciesTest {
             PythonDependencies.PLAN
 
         // when
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", code, directory),
-            input = """{"metadata": "dependencies = \n", "modules": []}"""
-        )
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan(
+                "dependencies = \n",
+                directory,
+                emptyList(),
+                pythonCommand(PythonEnvironment.executable, code, directory)
+            )
+        }
 
         // then
-        assert(exitCode != 0 && output.startsWith("Invalid '# /// script' metadata: "))
+        assert(exception.message!!.startsWith("Invalid '# /// script' metadata: "))
     }
 
     @Test
@@ -563,13 +609,69 @@ class PythonDependenciesTest {
             PythonDependencies.PLAN
 
         // when
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", code, directory),
-            input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}"""
-        )
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan(
+                "dependencies = [\"nonexistent-dependency\"]\n",
+                directory,
+                emptyList(),
+                pythonCommand(PythonEnvironment.executable, code, directory)
+            )
+        }
 
         // then
-        assert(exitCode != 0 && output == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+        assert(exception.message == PythonDependencies.NO_TOML_PARSER_MESSAGE)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should plan in working directory with modules shadowing the ones it imports`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val workingDirectory = createTempDirectory("python-shadowing")
+        for (module in listOf("json", "tomllib", "tomli", "importlib", "re")) {
+            workingDirectory.resolve("$module.py").writeText("raise SystemExit('shadowing $module imported')\n")
+        }
+
+        try {
+            // when
+            val (exitCode, output) = runProcess(
+                PythonDependencies.planCommand(directory),
+                input = """{"metadata": "dependencies = [\"nonexistent-dependency\"]\n", "modules": []}""",
+                mergeErrorStream = false,
+                directory = workingDirectory
+            )
+
+            // then
+            assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+        } finally {
+            workingDirectory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should run pip in working directory with pip package shadowing it`() {
+        // given
+        PythonEnvironment.initialize()
+        val workingDirectory = createTempDirectory("python-shadowing")
+        val pip = workingDirectory.resolve("pip").createDirectory()
+        pip.resolve("__init__.py").writeText("raise SystemExit('shadowing pip imported')\n")
+        pip.resolve("__main__.py").writeText("raise SystemExit('shadowing pip run')\n")
+
+        try {
+            // when
+            val (exitCode, output) = runProcess(
+                PythonDependencies.pipCommand("--version"),
+                mergeErrorStream = false,
+                directory = workingDirectory
+            )
+
+            // then
+            assert(exitCode == 0 && output.startsWith("pip "))
+        } finally {
+            workingDirectory.deleteRecursively()
+        }
     }
 
     private companion object {
