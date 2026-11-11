@@ -36,6 +36,7 @@ import kotlin.io.path.Path
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
+import kotlin.io.path.isRegularFile
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.name
 import kotlin.io.path.readText
@@ -102,8 +103,9 @@ public object PythonEnvironment {
         val library = jepLibrary(Path(jepLocation), python, probe.externallyManaged)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
+        val preloadFailure = preloadPythonLibrary(pythonLibrary(probe.libraryDirectory, probe.librarySoname))
         this.executable = executable
-        starter = EmbeddedPythonStarter(executable, probe.error)
+        starter = EmbeddedPythonStarter(executable, probe.error, probe.libraryDirectory, preloadFailure)
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
         }
@@ -117,6 +119,70 @@ public object PythonEnvironment {
             )
         }
         initialized = true
+    }
+
+    /** The shared `libpython` loaded by [preloadPythonLibrary], whose symbols are not global yet. */
+    @Volatile
+    private var preloadedLibrary: Path? = null
+
+    /**
+     * Loads the shared [library] of Python, if any, before Jep loads its native library, which depends on it.
+     *
+     * On Linux, the dynamic loader finds the `libpython3.X.so.1.0` of the native library of Jep by its soname
+     * only in the system library directories, or the ones of `LD_LIBRARY_PATH`, read when the JVM starts,
+     * so not the one of a Python installed elsewhere, e.g. by uv, pyenv, conda, or `actions/setup-python`;
+     * once loaded by its path, the loader takes the library of the same soname instead,
+     * also over another Python of the same version in the system library directories.
+     *
+     * @return the failure to load the [library], e.g. of another architecture,
+     * kept to tell why Jep cannot load its native library, if it cannot, or `null`.
+     */
+    private fun preloadPythonLibrary(library: Path?): UnsatisfiedLinkError? {
+        if (library == null) return null
+        return try {
+            System.load(library.toString())
+            preloadedLibrary = library
+            null
+        } catch (e: UnsatisfiedLinkError) {
+            e
+        }
+    }
+
+    /**
+     * Makes the symbols of the shared `libpython` loaded by [preloadPythonLibrary], if any, global,
+     * run in the [interpreter], the first one, before any code of the user.
+     *
+     * The JVM loads a native library with `RTLD_LOCAL`, so the symbols of the preloaded `libpython`
+     * are not global, while a C extension module on Linux is not linked to `libpython`,
+     * e.g. the ones of numpy, or of the standard library of most Pythons, `_ctypes` among them,
+     * and would fail to import with `undefined symbol: PyExc_ValueError`.
+     * Jep makes `libpython` global itself, but finds it by its file name,
+     * which the loader cannot find, like its soname.
+     * The JVM of Java 17 cannot load a library with `RTLD_GLOBAL`, but CPython can,
+     * loading an extension module with the flags of `sys.setdlopenflags`:
+     * loading the already loaded `libpython` as one makes it global,
+     * before it fails as an extension module without its initialization function.
+     */
+    internal fun makePythonLibraryGlobal(interpreter: Interpreter) {
+        val library = preloadedLibrary ?: return
+        interpreter.exec(
+            """
+            |def _xemantic_make_python_library_global():
+            |    import _imp, os, sys
+            |    from importlib.machinery import ModuleSpec
+            |    flags = sys.getdlopenflags()
+            |    sys.setdlopenflags(flags | os.RTLD_GLOBAL)
+            |    try:
+            |        _imp.create_dynamic(ModuleSpec('_xemantic_libpython', None, origin=${pythonPath(library.toString())}))
+            |    except ImportError:
+            |        pass
+            |    finally:
+            |        sys.setdlopenflags(flags)
+            |_xemantic_make_python_library_global()
+            |del _xemantic_make_python_library_global
+            |""".trimMargin()
+        )
+        preloadedLibrary = null
     }
 
     /**
@@ -266,10 +332,14 @@ public object PythonEnvironment {
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
         val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
-        if (values == null || values.size != 5) return null
-        val (executable, cacheTag, prefix, jepLocation, externallyManaged) =
-            values.map { it.hexToPath() ?: return null }
-        return PythonProbe(executable, cacheTag, prefix, jepLocation, externallyManaged.isNotEmpty())
+        if (values == null || values.size != 7) return null
+        val paths = values.map { it.hexToPath() ?: return null }
+        val (executable, cacheTag, prefix, jepLocation, externallyManaged) = paths
+        return PythonProbe(
+            executable, cacheTag, prefix, jepLocation, externallyManaged.isNotEmpty(),
+            libraryDirectory = paths[5],
+            librarySoname = paths[6]
+        )
     }
 
     /**
@@ -281,9 +351,11 @@ public object PythonEnvironment {
      * as text, a path which is not valid UTF-8, e.g. `/home/josé` in ISO-8859-1,
      * would be surrogate-escaped by Python in UTF-8 mode, and could not be encoded to UTF-8,
      * while the JVM would decode a path of UTF-8 bytes to another one, in another encoding of its locale.
-     * The last value tells whether the Python is externally managed (PEP 668), `1` if it is, empty if not:
+     * The fifth value tells whether the Python is externally managed (PEP 668), `1` if it is, empty if not:
      * a base Python, not a virtual environment, with an `EXTERNALLY-MANAGED` file in its standard library,
      * into which pip refuses to install.
+     * The values after it are the directory and the soname of the `libpython` of the base Python,
+     * `LIBDIR` and `INSTSONAME` of `sysconfig`, empty if unknown, e.g. on Windows, see [pythonLibrary].
      * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
      * or the [PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE] if the Python is externally managed,
      * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
@@ -312,6 +384,8 @@ public object PythonEnvironment {
         |    sys.prefix,
         |    jep_spec.submodule_search_locations[0],
         |    '1' if externally_managed else '',
+        |    sysconfig.get_config_var('LIBDIR'),
+        |    sysconfig.get_config_var('INSTSONAME'),
         |]
         |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
         |sys.stdout.flush()
@@ -486,12 +560,38 @@ private fun String.hexToPath(): String? {
 }
 
 /**
+ * The shared `libpython` of the [soname] in the library [directory] of a Python, see [PythonEnvironment.probeCommand],
+ * to be loaded before the native library of Jep, see [PythonEnvironment.preloadPythonLibrary],
+ * or `null` if there is none, e.g. of a Python linked to `libpython` statically, with `libpython3.X.a` as its soname.
+ *
+ * Not on Windows, where the native library of Jep finds the DLL of Python next to the `python.exe`,
+ * nor on macOS, where it refers to `libpython` by its path, e.g. in a framework,
+ * and the same library loaded by another path, e.g. of a symbolic link, could be loaded twice.
+ */
+internal fun pythonLibrary(
+    directory: String,
+    soname: String,
+    osName: String = System.getProperty("os.name")
+): Path? {
+    if (osName.startsWith("Windows") || osName.startsWith("Mac")) return null
+    if (directory.isEmpty() || soname.isEmpty() || soname.endsWith(".a")) return null
+    return Path(directory, soname).takeIf { it.isRegularFile() }
+}
+
+/**
  * Creates the interpreters of the embedded CPython of the Python [executable],
  * telling a failure of its startup with what the probe of the [executable] wrote to the standard error, if anything,
  * as a warning of a successful probe, e.g. `Could not find platform libraries` of a wrong `PYTHONHOME`,
  * might tell why the embedded CPython, configured the same way, fails.
+ * When the native library of Jep cannot load `libpython`, it tells the [libraryDirectory] of `libpython`,
+ * and keeps the [libraryPreloadFailure] of [PythonEnvironment.preloadPythonLibrary], if any, as suppressed.
  */
-internal class EmbeddedPythonStarter(private val executable: String, private val probeError: String) {
+internal class EmbeddedPythonStarter(
+    private val executable: String,
+    private val probeError: String,
+    private val libraryDirectory: String = "",
+    private val libraryPreloadFailure: UnsatisfiedLinkError? = null
+) {
 
     /** Whether an interpreter has been created, so that the embedded CPython has started. */
     @Volatile
@@ -535,12 +635,22 @@ internal class EmbeddedPythonStarter(private val executable: String, private val
     private fun startupFailure(cause: Throwable): IllegalStateException {
         // Jep wraps the failure of initializing CPython in an Error, whose message is its toString()
         val reason = cause.cause?.takeIf { cause.message == it.toString() } ?: cause
-        val message = "Cannot initialize the embedded Python $executable: ${reason.message ?: reason}"
+        val headline = "Cannot initialize the embedded Python $executable: ${reason.message ?: reason}"
+        // e.g. libjep.so: libpython3.13.so.1.0: cannot open shared object file
+        val libraryAdvice = if (
+            libraryDirectory.isNotEmpty() && reason is UnsatisfiedLinkError && reason.message?.contains("libpython") == true
+        ) {
+            "\nThe dynamic loader cannot find the libpython of this Python in $libraryDirectory, " +
+                "put this directory on LD_LIBRARY_PATH (DYLD_LIBRARY_PATH on macOS) before the JVM starts."
+        } else ""
+        val message = headline + libraryAdvice
         return IllegalStateException(
             if (probeError.isEmpty()) message
             else "$message\nThe probe of this Python wrote to the standard error, which might tell why:\n$probeError",
             cause
-        )
+        ).apply {
+            libraryPreloadFailure?.let { addSuppressed(it) }
+        }
     }
 
 }
@@ -553,6 +663,8 @@ internal class EmbeddedPythonStarter(private val executable: String, private val
  * @property prefix the `sys.prefix`, the virtual environment, if any.
  * @property jepLocation the directory of the `jep` package.
  * @property externallyManaged whether pip refuses to install into it (PEP 668), see [PythonEnvironment.probeCommand].
+ * @property libraryDirectory the directory of the `libpython` of the base Python, `LIBDIR`, empty if unknown.
+ * @property librarySoname the soname of the `libpython`, `INSTSONAME`, empty if unknown, see [pythonLibrary].
  * @property error the standard error of the probe, e.g. a warning of Python, empty if none.
  */
 internal data class PythonProbe(
@@ -561,6 +673,8 @@ internal data class PythonProbe(
     val prefix: String,
     val jepLocation: String,
     val externallyManaged: Boolean = false,
+    val libraryDirectory: String = "",
+    val librarySoname: String = "",
     val error: String = ""
 )
 

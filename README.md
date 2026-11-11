@@ -72,6 +72,16 @@ The Python executable is, in this order:
 The Python code imports the modules from the same paths as this executable,
 e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
 
+The native library of `jep` links to the shared `libpython` of the Python, e.g. `libpython3.13.so.1.0`,
+which on Linux the dynamic loader finds only in the system library directories, or in the ones of `LD_LIBRARY_PATH`.
+For a Python installed elsewhere, e.g. by `uv python install`, pyenv, conda, or in a custom prefix,
+the library loads `libpython` from the `LIBDIR` of the Python's `sysconfig` itself,
+so that `LD_LIBRARY_PATH` is not needed.
+If `libpython` is still not found, e.g. on macOS, where this is not done,
+put its directory, which the error message names, on `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS),
+set before the JVM starts, as the loader reads it only then.
+pyenv builds Python without a shared `libpython` by default, build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
+
 The embedded Python, like every Python process started by this library, e.g. `pip`,
 runs in the [UTF-8 mode](https://peps.python.org/pep-0540/),
 whatever the locale, e.g. cp1252 on Windows, or `C` on Linux:

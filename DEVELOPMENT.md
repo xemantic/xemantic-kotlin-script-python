@@ -18,12 +18,13 @@ or with the `ORG_GRADLE_PROJECT_basePython` environment variable, e.g. on CI:
 ```
 
 It has to be Python 3.10 or newer, otherwise the build fails before creating the environment.
-On Linux, the tests fail to load `libjep.so` when it cannot find `libpython3.*.so` ([#54](https://github.com/xemantic/xemantic-kotlin-script-python/issues/54)).
-A Python outside the system library directories, e.g. installed by `uv`,
-needs its `lib` directory in `LD_LIBRARY_PATH`,
-which `actions/setup-python` sets on CI.
+On Linux, a Python outside the system library directories, e.g. installed by `uv`,
+does not need its `lib` directory in `LD_LIBRARY_PATH`,
+as `PythonEnvironment` loads its `libpython` before `libjep.so` ([#54](https://github.com/xemantic/xemantic-kotlin-script-python/issues/54)).
+`actions/setup-python` sets `LD_LIBRARY_PATH` on CI anyway,
+so `PythonLibraryTest` removes it in the JVM it starts, to test the loading with such a base Python.
 `pyenv` builds Python without a shared `libpython` by default,
-build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"` (and then set `LD_LIBRARY_PATH` as well).
+build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
 
 An existing `.venv` is judged by its own Python:
 it is kept when this Python runs, is 3.10 or newer, and has `pip`,
