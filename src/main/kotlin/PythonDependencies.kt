@@ -21,10 +21,10 @@ package com.xemantic.kotlin.script.python
 import jep.Interpreter
 import jep.python.PyCallable
 import org.intellij.lang.annotations.Language
-import java.io.File
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.FileAlreadyExistsException
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.PosixFilePermissions
@@ -303,12 +303,45 @@ internal object PythonDependencies {
      * A relative entry is skipped, as it resolves against a directory which can change, and whose files must not run as a tool:
      * the working directory for an empty entry or `.`,
      * and on Windows the current directory of a drive for `C:tools`, or the root of the current drive for `\tools`.
+     * An entry which is not a valid path is skipped as well, instead of failing every lookup.
+     * On [windows], the entries are split by [splitWindowsPath], otherwise at `:`, keeping the quotes —
+     * `"` is illegal in a Windows path, while on POSIX it is a legal file name character.
      */
-    internal fun executableCandidates(name: String, path: String, windows: Boolean): List<Path> = path
-        .split(File.pathSeparator)
-        .map { Path(it) }
+    internal fun executableCandidates(
+        name: String,
+        path: String,
+        windows: Boolean
+    ): List<Path> = (if (windows) splitWindowsPath(path) else path.split(':'))
+        .mapNotNull { entry ->
+            try {
+                Path(entry)
+            } catch (_: InvalidPathException) {
+                null
+            }
+        }
         .filter { it.isAbsolute }
         .map { it.resolve(if (windows) "$name.exe" else name) }
+
+    /**
+     * The entries of the Windows [path], as Windows splits them:
+     * separated by `;` outside of double quotes, with the quotes removed, and with surrounding whitespace trimmed,
+     * which Windows ignores, while a Windows [Path] rejects a trailing space.
+     */
+    internal fun splitWindowsPath(path: String): List<String> = buildList {
+        val entry = StringBuilder()
+        var quoted = false
+        for (char in path) {
+            when {
+                char == '"' -> quoted = !quoted
+                char == ';' && !quoted -> {
+                    add(entry.toString().trim())
+                    entry.clear()
+                }
+                else -> entry.append(char)
+            }
+        }
+        add(entry.toString().trim())
+    }
 
     /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
     internal const val NO_TOML_PARSER_MESSAGE =

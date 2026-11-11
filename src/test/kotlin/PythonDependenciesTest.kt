@@ -22,7 +22,6 @@ import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Assumptions.assumeTrue
-import java.io.File
 import java.lang.reflect.Proxy
 import java.nio.file.FileSystems
 import java.nio.file.Path
@@ -679,9 +678,8 @@ class PythonDependenciesTest {
     @Test
     fun `should consider only absolute PATH directories for executable candidates`() {
         // given
-        val separator = File.pathSeparator
         val absolute = Path("").toAbsolutePath()
-        val path = listOf("", absolute.toString(), ".", "bin", "").joinToString(separator)
+        val path = listOf("", absolute.toString(), ".", "bin", "").joinToString(":")
 
         // when
         val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
@@ -731,7 +729,7 @@ class PythonDependenciesTest {
         try {
             // when
             val found = PythonDependencies.findOnPath(
-                executable.fileName.toString(), "${File.pathSeparator}$directory", windows = false
+                executable.fileName.toString(), ":$directory", windows = false
             )
 
             // then
@@ -751,7 +749,7 @@ class PythonDependenciesTest {
         val name = executable.fileName.toString()
 
         try {
-            for (path in listOf("/nonexistent${File.pathSeparator}", "", ".", "./")) {
+            for (path in listOf("/nonexistent:", "", ".", "./")) {
                 // when
                 val found = PythonDependencies.findOnPath(name, path, windows = false)
 
@@ -761,6 +759,67 @@ class PythonDependenciesTest {
         } finally {
             executable.deleteIfExists()
         }
+    }
+
+    @Test
+    fun `should split Windows PATH, removing quotes, also around a separator`() {
+        // given
+        val path = """"C:\Program Files\Tool";"C:\a;b";C:\"quoted"\bin;;C:\Windows"""
+
+        // when
+        val entries = PythonDependencies.splitWindowsPath(path)
+
+        // then
+        assert(entries == listOf("""C:\Program Files\Tool""", """C:\a;b""", """C:\quoted\bin""", "", """C:\Windows"""))
+    }
+
+    @Test
+    fun `should trim surrounding whitespace of Windows PATH entries`() {
+        // given
+        val path = " C:\\Tool ; \"C:\\Program Files\\Tool \" ;C:\\Windows\t"
+
+        // when
+        val entries = PythonDependencies.splitWindowsPath(path)
+
+        // then
+        assert(entries == listOf("""C:\Tool""", """C:\Program Files\Tool""", """C:\Windows"""))
+    }
+
+    @Test
+    fun `should find executable candidate in quoted Windows PATH entry`() {
+        // given
+        val absolute = Path("").toAbsolutePath()
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", "\"$absolute\" ", windows = true)
+
+        // then
+        assert(candidates == listOf(absolute.resolve("uv.exe")))
+    }
+
+    @Test
+    fun `should keep quotes of POSIX PATH entries, as they are legal file name characters`() {
+        // given
+        val path = "\"/opt/tool\":/opt/\"quoted\""
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
+
+        // then
+        assert(candidates == listOf(Path("/opt/\"quoted\"", "uv")))
+    }
+
+    @Test
+    fun `should skip PATH entry which is not a valid path`() {
+        // given
+        val absolute = Path("").toAbsolutePath()
+        val path = listOf("/opt/in\u0000valid", absolute.toString()).joinToString(":")
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
+
+        // then
+        assert(candidates == listOf(absolute.resolve("uv")))
     }
 
     private companion object {
