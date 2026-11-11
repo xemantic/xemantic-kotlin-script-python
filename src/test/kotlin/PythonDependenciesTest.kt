@@ -681,37 +681,34 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should run uv in root directory, where it finds no configuration of working directory`() {
-        // given
-        PythonEnvironment.initialize()
-        val dependencyDirectory = PythonEnvironment.dependencyDirectory!!
-
+    fun `should run uv in working directory of JVM, against which relative paths are resolved`() {
         // when
-        val (workingDirectory, _) = runFakeUv(dependencyDirectory.toString())
+        val (workingDirectory, _) = runFakeUv()
 
         // then
-        // uv reads a uv.toml, or a pyproject.toml with a [tool.uv] section, of its working directory and its parents
-        assert(workingDirectory == dependencyDirectory.toAbsolutePath().root.toRealPath())
+        // e.g. of a dependency like 'name @ ./dist/name.whl', or of UV_CONFIG_FILE or UV_CACHE_DIR
+        assert(workingDirectory == Path("").toAbsolutePath().toRealPath())
     }
 
     @Test
-    fun `should run uv with absolute target of relative dependency directory`() {
+    fun `should run uv with project in root directory, so that it finds no configuration of working directory`() {
         // when
-        val (_, arguments) = runFakeUv("relative-dependencies")
+        val (_, arguments) = runFakeUv()
 
         // then
-        val target = arguments[arguments.indexOf("--target") + 1]
-        assert(target == Path("relative-dependencies").toAbsolutePath().toString())
+        // uv reads a uv.toml, or a pyproject.toml with a [tool.uv] section, of its project directory and its parents
+        val project = arguments.getOrNull(arguments.indexOf("--project") + 1)
+        assert(project == Path("").toAbsolutePath().root.toString())
     }
 
     /**
-     * Installs a dependency into the dependency [directory] with a fake `uv`,
+     * Installs a dependency with a fake `uv`,
      * which only records its working directory and arguments, so that uv need not be installed.
      *
      * @return the working directory and the arguments of the fake `uv`.
      */
     @OptIn(ExperimentalPathApi::class)
-    private fun runFakeUv(directory: String): Pair<Path, List<String>> {
+    private fun runFakeUv(): Pair<Path, List<String>> {
         assumeFalse(System.getProperty("os.name").startsWith("Windows"), "the fake uv is a shell script")
         PythonEnvironment.initialize()
         val uvDirectory = createTempDirectory("python-fake-uv")
@@ -720,7 +717,9 @@ class PythonDependenciesTest {
             val uv = uvDirectory.resolve("uv")
             uv.writeText("#!/bin/sh\npwd -P > '$record'\nprintf '%s\\n' \"$@\" >> '$record'\n")
             uv.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
-            PythonDependencies.installMissing(listOf("fake-dependency"), emptyList(), directory, uv = uv.toString())
+            PythonDependencies.installMissing(
+                listOf("fake-dependency"), emptyList(), uvDirectory.resolve("dependencies").toString(), uv = uv.toString()
+            )
             val lines = record.readLines()
             return Path(lines.first()) to lines.drop(1)
         } finally {
@@ -728,20 +727,27 @@ class PythonDependenciesTest {
         }
     }
 
+    /**
+     * In a JVM of its own, as the working directory of this one cannot be changed.
+     * The dependency is a local wheel, and the cache of uv is a new one,
+     * so that uv neither needs the network, nor waits for the lock of the shared cache of the user,
+     * e.g. held by uv of another build.
+     */
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should install with uv in working directory with uv configuration`() {
+    fun `should install with uv relative path dependency in working directory with uv configuration`() {
         // given
         assumeTrue(PythonDependencies.findOnPath("uv") != null, "uv is not on the PATH")
         val directory = createTempDirectory("python-uv-config")
         try {
             val workingDirectory = directory.resolve("work").createDirectory()
-            // uv fails whenever it reads this configuration
+            // uv fails whenever it reads this configuration, of the working directory or of its parent
             workingDirectory.resolve("uv.toml").writeText("index-url = 42\n")
-            val wheel = writeFakeWheel(directory)
+            directory.resolve("pyproject.toml").writeText("[tool.uv]\nindex-url = 42\n")
+            writeFakeWheel(workingDirectory.resolve("dist").createDirectory())
             val code = """
                 |# /// script
-                |# dependencies = ["fake-dependency @ ${wheel.toUri()}"]
+                |# dependencies = ["fake-dependency @ ./dist/fake_dependency-1.0-py3-none-any.whl"]
                 |# ///
                 |import fake_dependency
                 |print(fake_dependency.VALUE, flush=True)
@@ -751,7 +757,7 @@ class PythonDependenciesTest {
             val (exitCode, output) = runInJvm(
                 EmbeddedPythonMain::class.java.name,
                 input = code,
-                environment = emptyMap(),
+                environment = mapOf("UV_CACHE_DIR" to ".uv-cache"),
                 jvmArguments = listOf(
                     "-Dxemantic.kotlin.script.python.dependencyDirectory=${directory.resolve("dependencies")}"
                 ),
@@ -761,6 +767,7 @@ class PythonDependenciesTest {
             // then
             assert(output == "installed")
             assert(exitCode == 0)
+            assert(workingDirectory.resolve(".uv-cache").exists())
         } finally {
             directory.deleteRecursively()
         }

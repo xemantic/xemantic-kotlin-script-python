@@ -259,15 +259,19 @@ internal object PythonDependencies {
      * Installs the [missing] dependencies into the dependency [directory], keeping the [constraints],
      * with the [uv] executable, if any, otherwise with `pip` of the environment.
      *
-     * The installer runs in the root directory of the file system,
-     * not in the working directory of the JVM, where uv would read a `uv.toml`,
-     * or a `pyproject.toml` with a `[tool.uv]` section, of the directory or any of its parents,
-     * e.g. one written by an agent among its generated files, changing the index the packages come from.
-     * Only the root directory, writable only by an administrator, has no parents,
-     * and it is the same for all the JVMs, which share the dependency directory.
-     * The user and system configuration of uv, and its environment variables, like `UV_CONFIG_FILE`, still apply,
+     * The installer runs in the working directory of the JVM,
+     * against which the relative paths are resolved, e.g. of a dependency like `name @ ./dist/name.whl`,
+     * or of an environment variable like `UV_CONFIG_FILE` or `UV_CACHE_DIR`.
+     * uv would read a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]` section, of this directory or of its parents,
+     * e.g. one written by an agent among its generated files, changing the index the packages come from,
+     * so its project is the root directory of the working one instead,
+     * where it reads only the configuration of the root directory itself,
+     * which only an administrator can write on Unix, but e.g. every user on a drive other than the system one on Windows,
+     * or by every process of a container running as root.
+     * The user and system configuration of uv, and its environment variables, still apply,
      * as `--no-config` would ignore the user configuration too, e.g. of a company index,
      * and so install from PyPI instead.
+     * pip reads no configuration of the working directory.
      */
     fun installMissing(
         missing: List<String>,
@@ -275,27 +279,26 @@ internal object PythonDependencies {
         directory: String,
         uv: String? = findOnPath("uv")
     ) {
-        // absolute, as the installer runs in another working directory
-        val target = Path(directory).toAbsolutePath()
-        val constraintsFile = createTempFile("python-constraints", ".txt").toAbsolutePath()
+        val constraintsFile = createTempFile("python-constraints", ".txt")
         try {
             constraintsFile.writeLines(constraints)
             val command = if (uv != null) {
                 listOf(
                     uv, "pip", "install", "--quiet",
+                    "--project", Path("").toAbsolutePath().root.toString(),
                     "--python", PythonEnvironment.executable,
-                    "--target", target.toString(),
+                    "--target", directory,
                     "--constraints", constraintsFile.toString()
                 )
             } else {
                 pipCommand(
                     "install", "--quiet",
                     "--disable-pip-version-check", "--no-input", "--upgrade",
-                    "--target", target.toString(),
+                    "--target", directory,
                     "--constraint", constraintsFile.toString()
                 )
             } + missing
-            val (exitCode, output) = runProcess(command, directory = target.root)
+            val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
                     "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
@@ -306,13 +309,11 @@ internal object PythonDependencies {
         }
     }
 
-    /** The absolute path of the executable of the [name] on the `PATH`, or `null` if there is none. */
+    /** The executable of the [name] on the `PATH`, or `null` if there is none. */
     fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
         ?.flatMap { listOf(Path(it, name), Path(it, "$name.exe")) }
         ?.firstOrNull { it.isExecutable() }
-        // absolute, as a relative entry of the PATH would be resolved against the working directory of the installer
-        ?.toAbsolutePath()
         ?.toString()
 
     /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
