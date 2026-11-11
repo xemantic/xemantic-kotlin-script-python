@@ -24,6 +24,7 @@ import org.intellij.lang.annotations.Language
 import java.io.File
 import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.charset.CharacterCodingException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.WRITE
@@ -225,8 +226,41 @@ internal object PythonDependencies {
         // the standard error separately, as a write to it, e.g. a warning, could split a line of the plan
         val result = runProcess(command, input = input, mergeErrorStream = false)
         if (result.exitCode != 0) throw PythonDependencyException(result.failureOutput)
-        return result.output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+        return parsePlanOutput(result.output) ?: throw PythonDependencyException(
+            "Cannot read the plan of the Python dependencies from its output" +
+                if (result.failureOutput.isEmpty()) "" else ":\n${limitOutput(result.failureOutput, PLAN_OUTPUT_LIMIT)}"
+        )
     }
+
+    /**
+     * The entries of the plan in the standard [output] of the [PLAN],
+     * taken only from between the last [PLAN_BEGIN] and the following [PLAN_END] line,
+     * as anything else run by Python, e.g. a `sitecustomize` module or a `.pth` file,
+     * can write to the standard output as well, before or after them.
+     *
+     * @return the entries, or `null` if the [output] has no plan, or an entry is not the hex digits of UTF-8.
+     */
+    internal fun parsePlanOutput(output: String): List<Pair<String, String>>? =
+        framedOutput(output, PLAN_BEGIN, PLAN_END)
+            ?.lines()
+            ?.filter { it.isNotBlank() }
+            ?.map { line ->
+                val entry = try {
+                    line.hexToByteArray().decodeToString(throwOnInvalidSequence = true)
+                } catch (_: IllegalArgumentException) {
+                    return null
+                } catch (_: CharacterCodingException) {
+                    return null
+                }
+                entry.substringBefore(' ') to entry.substringAfter(' ')
+            }
+
+    internal const val PLAN_BEGIN = "--- xemantic-kotlin-script-python plan begin ---"
+
+    internal const val PLAN_END = "--- xemantic-kotlin-script-python plan end ---"
+
+    /** The maximum length of the output of the [PLAN] in the message of a failure to read the plan. */
+    internal const val PLAN_OUTPUT_LIMIT = 8192
 
     /** The command running the [PLAN] for the dependency [directory]. */
     fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
@@ -297,15 +331,19 @@ internal object PythonDependencies {
         "Cannot read '# /// script' metadata: Python 3.11+ is required, or the tomli or pip package before 3.11"
 
     /**
-     * Prints the dependencies to install, as `install <requirement>`,
+     * Writes the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
      * or exits with the error.
+     * Each entry is a line of the hex digits of its UTF-8 bytes, so that no requirement can break the lines,
+     * e.g. with a line break within its URL, accepted by the `packaging` library.
+     * The lines are written by the [FRAMED_WRITER] between the [PLAN_BEGIN] and [PLAN_END] lines,
+     * after a newline, in case the output written before does not end with a newline.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
     @Language("python")
-    internal val PLAN = """
+    internal val PLAN = FRAMED_WRITER + """
         import json, sys
 
         # before any import which can fail, so that the input is always read
@@ -360,6 +398,7 @@ internal object PythonDependencies {
             return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
 
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
+        plan = []
         if missing:
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
@@ -370,10 +409,9 @@ internal object PythonDependencies {
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
                 if name and (not in_dependencies or name in in_use):
                     constraints.setdefault(name, distribution.version)
-            for dependency in missing:
-                print("install", dependency)
-            for name, version in constraints.items():
-                print("constraint", f"{name}=={version}")
+            plan += [f"install {dependency}" for dependency in missing]
+            plan += [f"constraint {name}=={version}" for name, version in constraints.items()]
+        write_framed("$PLAN_BEGIN", [entry.encode("utf-8").hex() for entry in plan], "$PLAN_END")
     """.trimIndent()
 
 }
