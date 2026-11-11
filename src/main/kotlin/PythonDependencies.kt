@@ -25,6 +25,7 @@ import java.io.File
 import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.FileAlreadyExistsException
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.PosixFilePermissions
@@ -295,13 +296,40 @@ internal object PythonDependencies {
     /**
      * The files named [name], or `$name.exe`, in the directories of the [path], in their order.
      * An empty or relative entry is skipped, as it would resolve against the working directory,
-     * whose files must not run as a tool.
+     * whose files must not run as a tool,
+     * and so is an entry which is not a valid path, instead of failing every lookup.
+     * On [windows], the entries are split as Windows does:
+     * a double-quoted part of an entry may contain the `;` separator, and the quotes are removed —
+     * `"` is illegal in a Windows path, while on POSIX it is a legal file name character, kept as is.
      */
-    internal fun executableCandidates(name: String, path: String): List<Path> = path
-        .split(File.pathSeparator)
-        .map { Path(it) }
+    internal fun executableCandidates(
+        name: String,
+        path: String,
+        windows: Boolean = File.pathSeparatorChar == ';'
+    ): List<Path> = (if (windows) splitWindowsPath(path) else path.split(File.pathSeparatorChar))
+        .mapNotNull { entry ->
+            try {
+                Path(entry)
+            } catch (_: InvalidPathException) {
+                null
+            }
+        }
         .filter { it.isAbsolute }
         .flatMap { listOf(it.resolve(name), it.resolve("$name.exe")) }
+
+    /** The entries of the Windows [path], separated by `;` outside of double quotes, with the quotes removed. */
+    private fun splitWindowsPath(path: String): List<String> = buildList {
+        val entry = StringBuilder()
+        var quoted = false
+        for (char in path) {
+            when {
+                char == '"' -> quoted = !quoted
+                char == ';' && !quoted -> add(entry.toString()).also { entry.clear() }
+                else -> entry.append(char)
+            }
+        }
+        add(entry.toString())
+    }
 
     /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
     internal const val NO_TOML_PARSER_MESSAGE =

@@ -732,6 +732,46 @@ class PythonDependenciesTest {
         }
     }
 
+    @Test
+    fun `should strip quotes of Windows PATH entries, also keeping a quoted separator`() {
+        // given
+        val path = "\"/opt/tool;s\";/usr/\"bin\";\"/opt/other\""
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", path, windows = true)
+
+        // then
+        assert(candidates == listOf("/opt/tool;s", "/usr/bin", "/opt/other").flatMap {
+            listOf(Path(it, "uv"), Path(it, "uv.exe"))
+        })
+    }
+
+    @Test
+    fun `should keep quotes of POSIX PATH entries, as they are legal file name characters`() {
+        // given
+        val path = "\"/opt/tool\":/opt/\"quoted\""
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
+
+        // then
+        assert(candidates == listOf(Path("/opt/\"quoted\"", "uv"), Path("/opt/\"quoted\"", "uv.exe")))
+    }
+
+    @Test
+    fun `should skip PATH entry which is not a valid path`() {
+        // given
+        val separator = File.pathSeparator
+        val absolute = Path("").toAbsolutePath()
+        val path = listOf("/opt/in\u0000valid", absolute.toString()).joinToString(separator)
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", path)
+
+        // then
+        assert(candidates == listOf(absolute.resolve("uv"), absolute.resolve("uv.exe")))
+    }
+
     private companion object {
 
         val OTHER_INSTALLATION = """
