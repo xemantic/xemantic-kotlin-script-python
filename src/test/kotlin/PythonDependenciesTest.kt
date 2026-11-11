@@ -1477,18 +1477,20 @@ class PythonDependenciesTest {
     }
 
     /**
-     * Writes the dist-info directory of the [name] [version] into the [directory],
+     * Writes the dist-info directory of the [name] [version] into the [directory], requiring the [requires],
      * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds.
      */
     private fun writeDistInfo(
         directory: Path,
         version: String,
         files: Map<String, String> = emptyMap(),
-        name: String = "replaced-probe"
+        name: String = "replaced-probe",
+        requires: List<String> = emptyList()
     ) {
         val distInfo = "${name.replace('-', '_')}-$version.dist-info"
         val metadata = mapOf(
-            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n",
+            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n" +
+                requires.joinToString("") { "Requires-Dist: $it\n" },
             // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
             "$distInfo/top_level.txt" to "${name.replace('-', '_')}\n"
         )
@@ -1631,7 +1633,7 @@ class PythonDependenciesTest {
     fun `should plan requirements of distributions of dependency directory`() {
         // given
         PythonEnvironment.initialize()
-        withDirectory { directory ->
+        withDistInfos { directory ->
             directory.writeDistribution("issue28-dependent", "1.0", "Issue28_Dependency<2,>=1", "issue28-other!=1.5")
             directory.writeDistribution("issue28-dependency", "1.9")
 
@@ -1641,8 +1643,8 @@ class PythonDependenciesTest {
             // then
             assert(
                 plan.filter { it.first == "requirement" } == listOf(
-                    "requirement" to "issue28-dependent 1.0 issue28-dependency <2,>=1",
-                    "requirement" to "issue28-dependent 1.0 issue28-other !=1.5"
+                    "requirement" to "issue28-dependent issue28-dependency <2,>=1 1.0",
+                    "requirement" to "issue28-dependent issue28-other !=1.5 1.0"
                 )
             )
         }
@@ -1652,7 +1654,7 @@ class PythonDependenciesTest {
     fun `should not plan requirements of extras and other platforms`() {
         // given
         PythonEnvironment.initialize()
-        withDirectory { directory ->
+        withDistInfos { directory ->
             directory.writeDistribution(
                 "issue28-dependent", "1.0",
                 "issue28-extra-dependency<2; extra == \"socks\"",
@@ -1668,7 +1670,7 @@ class PythonDependenciesTest {
             // a constraint cannot have extras
             assert(
                 plan.filter { it.first == "requirement" } ==
-                    listOf("requirement" to "issue28-dependent 1.0 issue28-dependency <2")
+                    listOf("requirement" to "issue28-dependent issue28-dependency <2 1.0")
             )
         }
     }
@@ -1677,7 +1679,7 @@ class PythonDependenciesTest {
     fun `should plan requirements of all dist-info of distribution with several dist-info directories`() {
         // given
         PythonEnvironment.initialize()
-        withDirectory { directory ->
+        withDistInfos { directory ->
             // e.g. left by a failed removal after pip --target replaced the version, or on a file system
             // without inode numbers, of metapackages without files to tell which of them is installed
             directory.writeMetapackage("issue28-dependent", "1.0", "issue28-dependency<2")
@@ -1690,8 +1692,8 @@ class PythonDependenciesTest {
             // the requirements of all of them, as which one is installed is not known
             assert(
                 plan.filter { it.first == "requirement" } == listOf(
-                    "requirement" to "issue28-dependent 1.0 issue28-dependency <2",
-                    "requirement" to "issue28-dependent 2.0 issue28-dependency <3"
+                    "requirement" to "issue28-dependent issue28-dependency <2 1.0",
+                    "requirement" to "issue28-dependent issue28-dependency <3 2.0"
                 )
             )
         }
@@ -1701,7 +1703,7 @@ class PythonDependenciesTest {
     fun `should not plan requirements of distribution declared as dependency`() {
         // given
         PythonEnvironment.initialize()
-        withDirectory { directory ->
+        withDistInfos { directory ->
             directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
             directory.writeDistribution("issue28-dependency", "1.0")
 
@@ -1720,7 +1722,7 @@ class PythonDependenciesTest {
     fun `should keep imported distribution of dependency directory in its version`() {
         // given
         PythonEnvironment.initialize()
-        withDirectory { directory ->
+        withDistInfos { directory ->
             directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
             directory.writeDistribution("issue28-dependency", "1.5")
 
@@ -1741,7 +1743,7 @@ class PythonDependenciesTest {
     fun `should not keep distribution of dependency directory in its version without packaging`() {
         // given
         PythonEnvironment.initialize()
-        withDirectory { directory ->
+        withDistInfos { directory ->
             directory.writeDistribution("issue28-dependency", "1.0")
             // None in sys.modules makes the import fail, like without packaging, and without pip vendoring it
             val code = "import sys; sys.modules.update(dict.fromkeys(['packaging', 'pip._vendor.packaging'], None))\n" +
@@ -1769,8 +1771,8 @@ class PythonDependenciesTest {
                 // given
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=2")
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=2"))
 
                 // when
                 val exception = assertFailsWith<PythonDependencyException> {
@@ -1793,9 +1795,9 @@ class PythonDependenciesTest {
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency>=3")
                 // so that each of the requirements alone can be satisfied
-                index.writeWheel("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependency", "3.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependency")
+                writeWheel(index, "issue28-dependency", "1.0")
+                writeWheel(index, "issue28-dependency", "3.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency"))
 
                 // when
                 val exception = assertFailsWith<PythonDependencyException> {
@@ -1817,9 +1819,9 @@ class PythonDependenciesTest {
                 // given
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-dependency", "0.9")
-                index.writeWheel("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=1")
+                writeWheel(index, "issue28-dependency", "1.0")
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=1"))
 
                 // when
                 directory.installDependencies(installer, index, "issue28-new")
@@ -1837,9 +1839,9 @@ class PythonDependenciesTest {
                 // given
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependent", "2.0", "issue28-dependency>=2")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependent>=2")
+                writeWheel(index, "issue28-dependent", "2.0", listOf("issue28-dependency>=2"))
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependent>=2"))
 
                 // when
                 val exception = assertFailsWith<PythonDependencyException> {
@@ -1861,9 +1863,9 @@ class PythonDependenciesTest {
                 // given
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependent", "2.0", "issue28-dependency>=2")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependent>=2")
+                writeWheel(index, "issue28-dependent", "2.0", listOf("issue28-dependency>=2"))
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependent>=2"))
 
                 // when
                 directory.installDependencies(installer, index, "issue28-new", "issue28-dependent>=2")
@@ -1884,11 +1886,11 @@ class PythonDependenciesTest {
                 directory.writeDistribution("issue28-dependency", "1.0")
                 directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-other-dependency<2")
                 directory.writeDistribution("issue28-other-dependency", "1.0")
-                index.writeWheel("issue28-new", "2.0", "issue28-dependency>=2")
+                writeWheel(index, "issue28-new", "2.0", listOf("issue28-dependency>=2"))
                 // the version the installer backtracks to, constrained to issue28-dependency<2
-                index.writeWheel("issue28-new", "1.0", "issue28-other-dependency>=2")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-other-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-other-dependency>=2"))
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-other-dependency", "2.0")
 
                 // when
                 val exception = assertFailsWith<PythonDependencyException> {
@@ -1907,13 +1909,13 @@ class PythonDependenciesTest {
         forEachInstaller { installer ->
             withLocalIndex { directory, index ->
                 // given
-                index.writeWheel("issue28-dependent", "1.0", "issue28-dependency<2")
-                index.writeWheel("issue28-dependent", "2.0", "issue28-dependency<3")
-                index.writeWheel("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependency", "3.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=3")
+                writeWheel(index, "issue28-dependent", "1.0", listOf("issue28-dependency<2"))
+                writeWheel(index, "issue28-dependent", "2.0", listOf("issue28-dependency<3"))
+                writeWheel(index, "issue28-dependency", "1.0")
+                writeWheel(index, "issue28-dependency", "3.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=3"))
                 directory.installDependencies(installer, index, "issue28-dependent==1.0")
-                // pip --target leaves the dist-info of the replaced version behind
+                // the requirements of the version replacing the installed one count, not of the replaced one
                 directory.installDependencies(installer, index, "issue28-dependent==2.0")
 
                 // when
@@ -1936,7 +1938,7 @@ class PythonDependenciesTest {
             // installed from a URL, or an index no longer configured, like pip would install it again
             directory.writeDistribution("issue28-dependency", "1.0")
             directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency>=1")
-            index.writeWheel("issue28-new", "1.0", "issue28-dependency")
+            writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency"))
 
             // when
             directory.installDependencies(uv, index, "issue28-new")
@@ -2015,8 +2017,8 @@ class PythonDependenciesTest {
                 directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-dependency-toolbelt", "1.0", "issue28-dependency<4")
                 directory.writeDistribution("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=2")
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=2"))
 
                 // when
                 val exception = assertFailsWith<PythonDependencyException> {
@@ -2039,10 +2041,10 @@ class PythonDependenciesTest {
                 // given
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-dependency", "1.0")
-                index.writeWheel("issue28-dependent", "1.0", "issue28-dependency<2")
-                index.writeWheel("issue28-dependent", "2.0", "issue28-dependency>=2")
-                index.writeWheel("issue28-dependency", "2.0")
-                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=2")
+                writeWheel(index, "issue28-dependent", "1.0", listOf("issue28-dependency<2"))
+                writeWheel(index, "issue28-dependent", "2.0", listOf("issue28-dependency>=2"))
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=2"))
                 // declared without a version, the installed version satisfies it, so it is not replaced
                 val unversioned = assertFailsWith<PythonDependencyException> {
                     directory.installDependencies(installer, index, "issue28-new", "issue28-dependent")
@@ -2060,6 +2062,141 @@ class PythonDependenciesTest {
         }
     }
 
+    @Test
+    fun `should tell imported dependent cannot be upgraded instead of advising later version`() {
+        forEachInstaller { installer ->
+            withLocalIndex { directory, index ->
+                // given
+                directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+                directory.writeDistribution("issue28-dependency", "1.0")
+                writeWheel(index, "issue28-dependent", "2.0", listOf("issue28-dependency>=2"))
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=2"))
+
+                // when
+                val exception = assertFailsWith<PythonDependencyException> {
+                    directory.installDependencies(
+                        installer, index, "issue28-new", imported = listOf("issue28_dependent")
+                    )
+                }
+
+                // then
+                // kept in its version, as a module cannot be replaced once imported
+                val message = exception.message!!
+                assert("  issue28-dependency <2, required by issue28-dependent 1.0, imported\n" in message)
+                assert("issue28-dependent>" !in message)
+            }
+        }
+    }
+
+    @Test
+    fun `should not plan requirements of distribution of dependency directory shadowed by environment`() {
+        // given
+        withDistInfos { directory ->
+            // pip of the environment comes first on sys.path, so the one of the directory is never imported
+            directory.writeMetapackage("pip", "1.0", "issue28-dependency<2")
+
+            // when
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
+
+            // then
+            assert(plan.none { it.first == "requirement" })
+        }
+    }
+
+    @Test
+    fun `should advise public version of dependent installed in local version`() {
+        forEachInstaller { installer ->
+            withLocalIndex { directory, index ->
+                // given
+                directory.writeDistribution("issue28-dependent", "1.0+cpu", "issue28-dependency<2")
+                directory.writeDistribution("issue28-dependency", "1.0")
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=2"))
+
+                // when
+                val exception = assertFailsWith<PythonDependencyException> {
+                    directory.installDependencies(installer, index, "issue28-new")
+                }
+
+                // then
+                // a local version cannot be compared with >, but >1.0 excludes 1.0+cpu
+                assert(Regex("issue28-dependent>\\S+").findAll(exception.message!!).single().value == "issue28-dependent>1.0")
+            }
+        }
+    }
+
+    @Test
+    fun `should name all installed distributions whose requirements conflict`() {
+        forEachInstaller { installer ->
+            withLocalIndex { directory, index ->
+                // given
+                directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+                directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency<2")
+                directory.writeDistribution("issue28-dependency", "1.0")
+                writeWheel(index, "issue28-dependency", "2.0")
+                writeWheel(index, "issue28-new", "1.0", listOf("issue28-dependency>=2"))
+
+                // when
+                val exception = assertFailsWith<PythonDependencyException> {
+                    directory.installDependencies(installer, index, "issue28-new")
+                }
+
+                // then
+                // so that declaring the advised versions does not fail again, naming the other one
+                val message = exception.message!!
+                assert("  issue28-dependency <2, required by issue28-dependent 1.0\n" in message)
+                assert("  issue28-dependency <2, required by issue28-other-dependent 1.0\n" in message)
+                assert("  issue28-dependent>1.0\n" in message && "  issue28-other-dependent>1.0\n" in message)
+            }
+        }
+    }
+
+    @Test
+    fun `should list requirements possibly in conflict when installer cannot resolve without installing`() {
+        // given
+        val requirements = listOf(
+            PythonDependencies.InstalledRequirement("issue28-dependent", "1.0", "issue28-dependency", "<2", imported = false),
+            PythonDependencies.InstalledRequirement(
+                "issue28-other-dependent", "1.0", "issue28-other", ">=1", imported = false
+            )
+        )
+        val output = "ERROR: Cannot install issue28-new==1.0 " +
+            "because these package versions have conflicting dependencies.\n" +
+            "ERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/\n"
+        val dryRuns = mutableListOf<List<PythonDependencies.InstalledRequirement>>()
+
+        // when
+        val explanation = PythonDependencies.explainConflict(requirements, output, "/directory") {
+            dryRuns += it
+            // pip before 22.2
+            ProcessResult(2, "Usage: ...\n\nno such option: --dry-run\n", "")
+        }
+
+        // then
+        assert(explanation != null)
+        assert("pip before 22.2" in explanation)
+        assert("  issue28-dependency <2, required by issue28-dependent 1.0\n" in explanation)
+        assert("  issue28-other >=1, required by issue28-other-dependent 1.0\n" in explanation)
+        assert(dryRuns.size == 1)
+    }
+
+    @Test
+    fun `should not explain failure as conflict when installer cannot resolve without installing nor reports conflict`() {
+        // given
+        val requirements = listOf(
+            PythonDependencies.InstalledRequirement("issue28-dependent", "1.0", "issue28-dependency", "<2", imported = false)
+        )
+
+        // when
+        val explanation = PythonDependencies.explainConflict(requirements, "ERROR: Failed building wheel\n", "/directory") {
+            ProcessResult(2, "no such option: --dry-run\n", "")
+        }
+
+        // then
+        assert(explanation == null)
+    }
+
     /**
      * Runs the [block] with pip, as `null`, and with uv, if it is on the `PATH`,
      * not inherited by the test JVM from the Gradle client, but from its daemon.
@@ -2072,114 +2209,75 @@ class PythonDependenciesTest {
 
     /**
      * Plans and installs the [dependencies] into this directory, only from the wheels of the [index] directory,
-     * with the [uv] executable, or pip, if `null`.
+     * with the [uv] executable, or pip, if `null`, with the [imported] top-level modules.
      */
-    private fun Path.installDependencies(uv: String?, index: Path, vararg dependencies: String) {
+    private fun Path.installDependencies(
+        uv: String?,
+        index: Path,
+        vararg dependencies: String,
+        imported: List<String> = emptyList()
+    ) {
         val metadata = "dependencies = [${dependencies.joinToString { "\"$it\"" }}]\n"
-        val plan = PythonDependencies.plan(metadata, toString(), emptyList())
+        val plan = PythonDependencies.plan(metadata, toString(), imported)
         val installerOptions = listOf("--no-index", "--find-links", index.toString())
         PythonDependencies.installMissing(plan, toString(), installerOptions, uv)
     }
 
     /** The version of the distribution of the [module], written by [writeDistribution] or [writeWheel]. */
-    private fun Path.version(module: String) = resolve(module).resolve("__init__.py").readText()
+    private fun Path.version(module: String) =
+        resolve(module).resolve("__init__.py").readText().substringAfter("VERSION = '").substringBefore("'")
 
     private fun withLocalIndex(block: (directory: Path, index: Path) -> Unit) {
-        withDirectory { directory ->
-            withDirectory { index -> block(directory, index) }
+        withDistInfos { directory ->
+            withDistInfos { index -> block(directory, index) }
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
-    private fun withDirectory(block: (Path) -> Unit) {
-        val directory = createTempDirectory("python-dependencies")
-        try {
-            block(directory)
-        } finally {
-            directory.deleteRecursively()
-        }
+    /**
+     * Writes the distribution [name] [version] installed into this directory, requiring the [requirements],
+     * with its package, like [writeWheel] writes it.
+     */
+    private fun Path.writeDistribution(name: String, version: String, vararg requirements: String) {
+        val module = "${name.replace('-', '_')}/__init__.py"
+        val content = "VERSION = '$version'\n"
+        resolve(module).createParentDirectories().writeText(content)
+        writeDistInfo(this, version, mapOf(module to content), name, requirements.toList())
+    }
+
+    /**
+     * Writes the metadata of a metapackage installed into this directory, without files,
+     * like pip would install a wheel with only its dist-info.
+     */
+    private fun Path.writeMetapackage(name: String, version: String, vararg requirements: String) {
+        writeDistInfo(this, version, name = name, requires = requirements.toList())
+    }
+
+    /**
+     * Writes into this directory a project whose build backend prepares its metadata, but fails to build its wheel,
+     * with `issue28 build failure`.
+     */
+    private fun Path.writeProjectFailingToBuildWheel(name: String, version: String) {
+        val distInfo = "${name.replace('-', '_')}-$version.dist-info"
+        resolve("pyproject.toml").writeText(
+            "[build-system]\nrequires = []\nbuild-backend = \"backend\"\nbackend-path = [\".\"]\n"
+        )
+        resolve("backend.py").writeText(
+            """
+            import os
+
+            def get_requires_for_build_wheel(config_settings=None):
+                return []
+
+            def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+                os.makedirs(os.path.join(metadata_directory, "$distInfo"))
+                with open(os.path.join(metadata_directory, "$distInfo", "METADATA"), "w") as file:
+                    file.write("Metadata-Version: 2.1\nName: $name\nVersion: $version\n")
+                return "$distInfo"
+
+            def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+                raise RuntimeError("issue28 build failure")
+            """.trimIndent()
+        )
     }
 
 }
-
-/**
- * Writes the metadata of a distribution installed into this directory, with its package,
- * whose `__init__.py` contains its version, like pip would install the wheel written by [writeWheel].
- */
-internal fun Path.writeDistribution(name: String, version: String, vararg requirements: String) {
-    val distribution = name.replace('-', '_')
-    val distInfo = resolve("$distribution-$version.dist-info").createDirectories()
-    distInfo.resolve("METADATA").writeText(metadata(name, version, requirements))
-    resolve(distribution).createDirectories().resolve("__init__.py").writeText(version)
-    distInfo.resolve("RECORD").writeText(
-        "$distribution/__init__.py,${hash(version)},${version.length}\n" +
-            "${distInfo.fileName}/METADATA,,\n${distInfo.fileName}/RECORD,,\n"
-    )
-}
-
-/**
- * Writes the metadata of a metapackage installed into this directory, without files,
- * like pip would install a wheel with only its dist-info.
- */
-internal fun Path.writeMetapackage(name: String, version: String, vararg requirements: String) {
-    val distInfo = resolve("${name.replace('-', '_')}-$version.dist-info").createDirectories()
-    distInfo.resolve("METADATA").writeText(metadata(name, version, requirements))
-    distInfo.resolve("RECORD").writeText("${distInfo.fileName}/METADATA,,\n${distInfo.fileName}/RECORD,,\n")
-}
-
-/**
- * Writes into this directory a project whose build backend prepares its metadata, but fails to build its wheel,
- * with `issue28 build failure`.
- */
-internal fun Path.writeProjectFailingToBuildWheel(name: String, version: String) {
-    val distInfo = "${name.replace('-', '_')}-$version.dist-info"
-    resolve("pyproject.toml").writeText(
-        "[build-system]\nrequires = []\nbuild-backend = \"backend\"\nbackend-path = [\".\"]\n"
-    )
-    resolve("backend.py").writeText(
-        """
-        import os
-
-        def get_requires_for_build_wheel(config_settings=None):
-            return []
-
-        def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
-            os.makedirs(os.path.join(metadata_directory, "$distInfo"))
-            with open(os.path.join(metadata_directory, "$distInfo", "METADATA"), "w") as file:
-                file.write("${metadata(name, version, emptyArray()).replace("\n", "\\n")}")
-            return "$distInfo"
-
-        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-            raise RuntimeError("issue28 build failure")
-        """.trimIndent()
-    )
-}
-
-/** Writes a wheel into this directory, like [writeDistribution] would install it. */
-internal fun Path.writeWheel(name: String, version: String, vararg requirements: String) {
-    val distribution = name.replace('-', '_')
-    val distInfo = "$distribution-$version.dist-info"
-    ZipOutputStream(resolve("$distribution-$version-py3-none-any.whl").outputStream()).use { zip ->
-        mapOf(
-            "$distribution/__init__.py" to version,
-            "$distInfo/METADATA" to metadata(name, version, requirements),
-            "$distInfo/WHEEL" to "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-            "$distInfo/RECORD" to
-                "$distribution/__init__.py,${hash(version)},${version.length}\n" +
-                listOf("$distInfo/METADATA", "$distInfo/WHEEL", "$distInfo/RECORD").joinToString("") { "$it,,\n" }
-        ).forEach { (entry, content) ->
-            zip.putNextEntry(ZipEntry(entry))
-            zip.write(content.toByteArray())
-            zip.closeEntry()
-        }
-    }
-}
-
-/** The hash of the [content] of a file, as in a `RECORD` file. */
-private fun hash(content: String) = "sha256=" + Base64.getUrlEncoder().withoutPadding().encodeToString(
-    MessageDigest.getInstance("SHA-256").digest(content.toByteArray())
-)
-
-private fun metadata(name: String, version: String, requirements: Array<out String>) =
-    "Metadata-Version: 2.1\nName: $name\nVersion: $version\n" +
-        requirements.joinToString("") { "Requires-Dist: $it\n" }

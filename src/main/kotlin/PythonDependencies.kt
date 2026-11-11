@@ -139,12 +139,14 @@ internal object PythonDependencies {
         // without locking, as the plan only reads the directory, which can be read-only when nothing is missing,
         // and so that the installed dependencies do not wait for an installation of another thread or process
         if (plan(metadata, directory.toString(), imported).missing().isNotEmpty()) {
-            installLock.withLock {
+            val failure = installLock.withLock {
                 withDirectoryLock(directory) {
                     // again, as another thread or process could have installed them meanwhile
-                    installMissing(plan(metadata, directory.toString(), imported), directory.toString())
+                    tryInstallMissing(plan(metadata, directory.toString(), imported), directory.toString())
                 }
             }
+            // after unlocking, as explaining the failure takes resolutions without installing
+            if (failure != null) throw failure()
         }
         // the sys module is shared by all the interpreters, so that the directory is appended only once;
         // as the str of the path in Python, which differs from the one of the JVM under a non-UTF-8 locale
@@ -170,7 +172,7 @@ internal object PythonDependencies {
      *
      * @throws PythonDependencyException if the directory cannot be locked, e.g. when it is not writable.
      */
-    private fun withDirectoryLock(directory: Path, block: () -> Unit) {
+    private fun <T> withDirectoryLock(directory: Path, block: () -> T): T {
         val lockFile = directory.resolve(LOCK_FILE_NAME)
         val channel = try {
             directory.createDirectories()
@@ -186,7 +188,7 @@ internal object PythonDependencies {
                 // e.g. ENOLCK of a network file system without locking
                 throw PythonDependencyException("Cannot lock the dependency directory with $lockFile: $e")
             }
-            lock.use { block() }
+            return lock.use { block() }
         }
     }
 
@@ -254,13 +256,14 @@ internal object PythonDependencies {
     }
 
     /** A requirement of a distribution installed in the dependency directory, of the [PLAN]. */
-    private class InstalledRequirement(
+    internal class InstalledRequirement(
         val dependent: String,
         val version: String,
         val name: String,
-        val specifier: String
+        val specifier: String,
+        val imported: Boolean
     ) {
-        override fun toString() = "$name $specifier, required by $dependent $version"
+        override fun toString() = "$name $specifier, required by $dependent $version" + if (imported) ", imported" else ""
     }
 
     /**
@@ -281,12 +284,27 @@ internal object PythonDependencies {
         installerOptions: List<String> = emptyList(),
         uv: String? = findOnPath("uv")
     ) {
+        tryInstallMissing(plan, directory, installerOptions, uv)?.let { throw it() }
+    }
+
+    /**
+     * Like [installMissing], but returns the failure, if any, to explain and throw,
+     * which can take a while, e.g. after releasing the locks of the installation.
+     */
+    private fun tryInstallMissing(
+        plan: List<Pair<String, String>>,
+        directory: String,
+        installerOptions: List<String> = emptyList(),
+        uv: String? = findOnPath("uv")
+    ): (() -> PythonDependencyException)? {
         val missing = plan.missing()
-        if (missing.isEmpty()) return
+        if (missing.isEmpty()) return null
         val pinned = plan.filter { it.first == "constraint" }.map { it.second }
+        val imported = pinned.map { canonicalName(it.substringBefore("==")) }.toSet()
         val requirements = plan.filter { it.first == "requirement" }.map {
-            val (dependent, version, name, specifier) = it.second.split(' ')
-            InstalledRequirement(dependent, version, name, specifier)
+            // the version last, as a version which is not PEP 440 one can have spaces
+            val (dependent, name, specifier, version) = it.second.split(' ', limit = 4)
+            InstalledRequirement(dependent, version, name, specifier, imported = dependent in imported)
         }
         fun runInstaller(requirements: List<InstalledRequirement>, dryRun: Boolean = false): ProcessResult {
             val constraints = pinned + requirements.groupBy { it.name }.map { (name, requirements) ->
@@ -317,31 +335,83 @@ internal object PythonDependencies {
         if (exitCode == 0) {
             // within the lock, as another process could be installing another version meanwhile
             removeReplacedDistInfo(directory, plan.single { it.first == "dist-info" }.second)
-            return
+            return null
         }
-        val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
-        fun resolves(requirements: List<InstalledRequirement>) = runInstaller(requirements, dryRun = true).exitCode == 0
+        return {
+            val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
+            val explanation = explainConflict(requirements, output, directory) { runInstaller(it, dryRun = true) }
+            PythonDependencyException(if (explanation == null) message else message + "\n" + explanation)
+        }
+    }
+
+    /** The [name] of a distribution, normalized like `packaging.utils.canonicalize_name`. */
+    private fun canonicalName(name: String) = name.lowercase().replace(Regex("[-_.]+"), "-")
+
+    /**
+     * The explanation of the failure of an installation, with the [output],
+     * as a conflict with the [requirements] of the distributions installed in the dependency [directory],
+     * found with the [dryRun] of the installation with some of them,
+     * or `null`, if it is not such a conflict.
+     */
+    internal fun explainConflict(
+        requirements: List<InstalledRequirement>,
+        output: String,
+        directory: String,
+        dryRun: (List<InstalledRequirement>) -> ProcessResult
+    ): String? {
+        fun resolves(requirements: List<InstalledRequirement>) = dryRun(requirements).exitCode == 0
+        if (requirements.isEmpty()) return null
+        val constrained = dryRun(requirements)
+        if (constrained.exitCode != 0 && "no such option: --dry-run" in constrained.output) {
+            // pip before 22.2, which cannot resolve without installing, so all the requirements are suspected
+            // when its resolution failed, as with --quiet it does not name the ones in conflict
+            if ("ResolutionImpossible" !in output) return null
+            return "The dependencies might conflict with these requirements of the distributions " +
+                "installed in the dependency directory $directory, " +
+                "which pip before 22.2 cannot tell, as it cannot resolve without installing (--dry-run):\n" +
+                requirements.joinToString("") { "  $it\n" } +
+                advice(requirements)
+        }
         // the failure is a conflict with the requirements of the installed distributions,
         // only if the resolution fails with them, unlike e.g. building a wheel, which a dry run does not do,
         // and succeeds without them, unlike e.g. a dependency not found
-        if (requirements.isEmpty() || resolves(requirements) || !resolves(emptyList())) {
-            throw PythonDependencyException(message)
-        }
-        val conflicting = minimalConflict(emptyList(), requirements, ::resolves)
-        val advice = conflicting.map { "${it.dependent}>${it.version}" }.distinct()
-        throw PythonDependencyException(
-            message + "\n" +
-                "The dependencies conflict with these requirements of the distributions " +
-                "installed in the dependency directory $directory:\n" +
-                conflicting.joinToString("") { "  $it\n" } +
-                "A later version of such a distribution might not require it, " +
+        if (constrained.exitCode == 0 || !resolves(emptyList())) return null
+        // every minimal conflict, as resolving one, e.g. by upgrading its dependent, would leave the others
+        val conflicting = mutableListOf<InstalledRequirement>()
+        var remaining = requirements
+        do {
+            val conflict = minimalConflict(emptyList(), remaining, ::resolves)
+            // none only when the resolution is not repeatable, e.g. with the network failing meanwhile
+            if (conflict.isEmpty()) break
+            conflicting += conflict
+            remaining = remaining - conflict.toSet()
+        } while (remaining.isNotEmpty() && !resolves(remaining))
+        if (conflicting.isEmpty()) return null
+        return "The dependencies conflict with these requirements of the distributions " +
+            "installed in the dependency directory $directory:\n" +
+            requirements.filter { it in conflicting }.joinToString("") { "  $it\n" } +
+            advice(conflicting)
+    }
+
+    /** How to resolve a conflict with the [requirements] of the installed distributions. */
+    private fun advice(requirements: List<InstalledRequirement>): String {
+        val (imported, upgradable) = requirements.partition { it.imported }
+        // against the public version, as a local one, like 2.1.0+cpu, cannot be compared with >,
+        // while >2.1.0 excludes it
+        val laterVersions = upgradable.map { "${it.dependent}>${it.version.substringBefore('+')}" }.distinct()
+        return (
+            if (laterVersions.isEmpty()) "" else "A later version of such a distribution might not require it, " +
                 "so to upgrade it along, declare it as a dependency in a later version than the installed one:\n" +
-                advice.joinToString("") { "  $it\n" } +
-                "Declared without a version, the installed version satisfies it, and its requirements stay. " +
-                "Otherwise, installing the dependencies would break these distributions, " +
-                "so they need another dependency directory, see PythonEnvironment.dependencyDirectory, " +
-                "or the dependency directory can be deleted, when no Python uses it, to start from scratch."
-        )
+                laterVersions.joinToString("") { "  $it\n" } +
+                "Declared without a version, the installed version satisfies it, and its requirements stay.\n"
+            ) + (
+            if (imported.isEmpty()) "" else "The imported distributions are kept in their versions, " +
+                "as a module cannot be replaced once imported, " +
+                "so they can be upgraded only in a new JVM, by code declaring them before they are imported.\n"
+            ) +
+            "Otherwise, installing the dependencies would break these distributions, " +
+            "so they need another dependency directory, see PythonEnvironment.dependencyDirectory, " +
+            "or the dependency directory can be deleted, when no Python uses it, to start from scratch."
     }
 
     /**
@@ -487,7 +557,8 @@ internal object PythonDependencies {
      * Prints the dependencies to install, as `install <requirement>`,
      * the distributions to keep in their versions, as `constraint <name>==<version>`,
      * the requirements of the distributions of the dependency directory,
-     * as `requirement <dependent> <version> <name> <specifier>`, with canonical names,
+     * as `requirement <dependent> <name> <specifier> <version>`, with canonical names,
+     * except the ones of the distributions shadowed by the ones of the environment,
      * except the ones of the declared dependencies, which [installMissing] turns into constraints,
      * and, when something is to be installed, the identities of the dist-info directories,
      * as `dist-info <JSON object>`, for [removeReplacedDistInfo] after the installation,
@@ -636,6 +707,15 @@ internal object PythonDependencies {
                     # an invalid requirement, or marker, of an installed distribution cannot be honored anyway
                     pass
 
+        def is_shadowed(name):
+            # by a distribution of the environment, before the dependency directory on sys.path,
+            # so that the one of the directory is never imported, nor are its requirements needed
+            try:
+                found = metadata.distribution(name)
+            except metadata.PackageNotFoundError:
+                return False
+            return os.path.realpath(found.locate_file("")) != dependency_location
+
         def without_credentials(url):
             # direct_url.json holds the URL without credentials, and without the fragment
             parts = urlsplit(url)
@@ -767,10 +847,12 @@ internal object PythonDependencies {
                     if name and distribution.version and canonicalize_name(name) not in declared:
                         installed.append((canonicalize_name(name), version_key(distribution.version), distribution))
                 for name, _, distribution in sorted(installed, key=lambda it: it[:2]):
+                    if is_shadowed(name):
+                        continue
                     for requirement in requirements_of(distribution):
                         required = canonicalize_name(requirement.name)
                         if requirement.specifier and required not in kept:
-                            print("requirement", name, distribution.version, required, requirement.specifier)
+                            print("requirement", name, required, requirement.specifier, distribution.version)
             # the dist-info directories before the installation, to remove the ones it replaced
             print("dist-info", json.dumps(dist_info_snapshot(directory)))
     """.trimIndent()

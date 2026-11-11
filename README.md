@@ -194,11 +194,16 @@ otherwise the code can declare it as a dependency, see below.
   installed earlier for a distribution requiring `attrs<24`, which would break the next time it is imported.
   Only the requirements of the distributions the code declares as missing dependencies do not count, as they are replaced,
   so to upgrade an installed distribution along with the ones it requires, the code declares it as well,
-  in a later version than the installed one, e.g. `pkg>1.0` for the installed `pkg` 1.0 —
-  declared without a version, or with one the installed version satisfies, it is not missing, and its requirements stay.
+  in a later version than the installed one, e.g. `pkg>1.0` for the installed `pkg` 1.0, or `pkg` 1.0+cpu —
+  declared without a version, or with one the installed version satisfies, it is not missing, and its requirements stay —
+  unless it is imported already, which keeps it in its version until the JVM is restarted.
+  A distribution of the dependency directory shadowed by one of the Python environment is never imported,
+  so its requirements do not count.
   A dependency conflicting with these requirements fails the call with `PythonDependencyException`,
   naming the requirements in conflict, found by resolving the dependencies with fewer of them (`--dry-run`),
-  and the installed distributions requiring them, to declare in a later version,
+  until the rest of them can be satisfied,
+  and the installed distributions requiring them, to declare in a later version —
+  pip before 22.2 has no `--dry-run`, so then all the requirements are named as possibly in conflict, when its resolution fails —
   as there can be only one version of a distribution in the directory —
   code with dependencies conflicting with the ones of other code needs its own `PythonEnvironment.dependencyDirectory`,
   in a JVM of its own, as the dependency directory is shared by all the `Python` interpreters of the JVM.
