@@ -286,11 +286,22 @@ internal object PythonDependencies {
         }
     }
 
-    private fun findOnPath(name: String): String? = System.getenv("PATH")
-        ?.split(File.pathSeparator)
-        ?.flatMap { listOf(Path(it, name), Path(it, "$name.exe")) }
+    /** The first executable of [executableCandidates] in the [path], or `null`. */
+    internal fun findOnPath(name: String, path: String? = System.getenv("PATH")): String? = path
+        ?.let { executableCandidates(name, it) }
         ?.firstOrNull { it.isExecutable() }
         ?.toString()
+
+    /**
+     * The files named [name], or `$name.exe`, in the directories of the [path], in their order.
+     * An empty or relative entry is skipped, as it would resolve against the working directory,
+     * whose files must not run as a tool.
+     */
+    internal fun executableCandidates(name: String, path: String): List<Path> = path
+        .split(File.pathSeparator)
+        .map { Path(it) }
+        .filter { it.isAbsolute }
+        .flatMap { listOf(it.resolve(name), it.resolve("$name.exe")) }
 
     /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
     internal const val NO_TOML_PARSER_MESSAGE =

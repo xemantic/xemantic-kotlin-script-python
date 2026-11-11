@@ -22,6 +22,7 @@ import com.xemantic.kotlin.test.assert
 import jep.Interpreter
 import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Assumptions.assumeTrue
+import java.io.File
 import java.lang.reflect.Proxy
 import java.nio.file.FileSystems
 import java.nio.file.Path
@@ -33,6 +34,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createDirectory
 import kotlin.io.path.createFile
@@ -671,6 +673,62 @@ class PythonDependenciesTest {
             assert(exitCode == 0 && output.startsWith("pip "))
         } finally {
             workingDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should consider only absolute PATH directories for executable candidates`() {
+        // given
+        val separator = File.pathSeparator
+        val absolute = Path("").toAbsolutePath()
+        val path = listOf("", absolute.toString(), ".", "bin", "").joinToString(separator)
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", path)
+
+        // then
+        assert(candidates == listOf(absolute.resolve("uv"), absolute.resolve("uv.exe")))
+    }
+
+    @Test
+    fun `should find executable in absolute PATH directory`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        val executable = directory.resolve("planted-${UUID.randomUUID()}").createFile()
+        executable.toFile().setExecutable(true)
+
+        try {
+            // when
+            val found = PythonDependencies.findOnPath(
+                executable.fileName.toString(), "${File.pathSeparator}$directory"
+            )
+
+            // then
+            assert(found == executable.toString())
+        } finally {
+            executable.deleteIfExists()
+            directory.deleteIfExists()
+        }
+    }
+
+    @Test
+    fun `should not find executable in working directory through empty or relative PATH entry`() {
+        // given
+        val workingDirectory = Path("").toAbsolutePath()
+        val executable = workingDirectory.resolve("planted-${UUID.randomUUID()}").createFile()
+        executable.toFile().setExecutable(true)
+        val name = executable.fileName.toString()
+
+        try {
+            for (path in listOf("/nonexistent${File.pathSeparator}", "", ".", "./")) {
+                // when
+                val found = PythonDependencies.findOnPath(name, path)
+
+                // then
+                assert(found == null)
+            }
+        } finally {
+            executable.deleteIfExists()
         }
     }
 
