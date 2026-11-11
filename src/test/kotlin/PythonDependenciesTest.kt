@@ -1245,6 +1245,64 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should constrain imported package of distribution without top_level_txt`() {
+        // given
+        // like a wheel built by hatchling or flit, which Python 3.10 tells the modules of only by top_level.txt
+        withDistInfos { directory ->
+            val modules = mapOf(
+                "replaced_probe/__init__.py" to "X = 1\n",
+                "../../bin/replaced-probe" to ""
+            )
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", modules, topLevel = false)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported single-file module of distribution without top_level_txt`() {
+        // given
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe.py" to "X = 1\n")
+            modules.forEach { (path, content) -> directory.resolve(path).writeText(content) }
+            writeDistInfo(directory, "1.0", modules, topLevel = false)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should not constrain distribution without top_level_txt of modules not imported`() {
+        // given
+        // its .pth file, scripts and data, and files outside the directory are no modules
+        withDistInfos { directory ->
+            val files = mapOf(
+                "other_probe/__init__.py" to "X = 1\n",
+                "replaced_probe.pth" to "",
+                "replaced_probe-1.0.data/scripts/replaced_probe" to "",
+                "../../bin/replaced_probe" to ""
+            )
+            directory.resolve("other_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", files, topLevel = false)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints.isEmpty())
+        }
+    }
+
+    @Test
     fun `should remove dist-info of other version by name when identities are unknown`() {
         withDistInfos { directory ->
             // given
@@ -1484,14 +1542,16 @@ class PythonDependenciesTest {
         directory: Path,
         version: String,
         files: Map<String, String> = emptyMap(),
-        name: String = "replaced-probe"
+        name: String = "replaced-probe",
+        topLevel: Boolean = true
     ) {
         val distInfo = "${name.replace('-', '_')}-$version.dist-info"
         val metadata = mapOf(
-            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n",
+            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n"
+        ) + if (topLevel) mapOf(
             // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
             "$distInfo/top_level.txt" to "${name.replace('-', '_')}\n"
-        )
+        ) else emptyMap()
         metadata.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
         directory.resolve("$distInfo/RECORD").writeText(record(files + metadata, distInfo))
     }

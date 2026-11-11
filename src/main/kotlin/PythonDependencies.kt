@@ -413,7 +413,7 @@ internal object PythonDependencies {
         # while the ones of DIST_INFOS above, of the standard library, cannot
         request = json.loads(sys.stdin.read())
 
-        import base64, csv, hashlib, importlib, importlib.metadata as metadata
+        import base64, csv, hashlib, importlib, importlib.machinery, importlib.metadata as metadata
         from pathlib import Path
         from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
@@ -629,6 +629,28 @@ internal object PythonDependencies {
                 return file_digests(path, expected) == expected
             return not requested and is_unmodified_since_uv_install(path, distribution)
 
+        def inferred_top_level(distribution):
+            # the top-level modules of a distribution without top_level.txt, told by its recorded files,
+            # as packages_distributions of Python 3.10 tells them only by top_level.txt,
+            # which e.g. hatchling and flit do not write:
+            # the package directories and the single-file modules, like demo/ or demo.py,
+            # but not e.g. ../../bin/ of pip install --target, the dist-info, the data, __pycache__ or a .pth file
+            suffixes = sorted(importlib.machinery.all_suffixes(), key=len, reverse=True)
+            names = set()
+            for file in distribution.files or []:
+                parts = file.parts
+                if len(parts) > 1:
+                    name = parts[0]
+                else:
+                    name = next((parts[0][:-len(suffix)] for suffix in suffixes if parts[0].endswith(suffix)), "")
+                if name.isidentifier() and name != "__pycache__":
+                    names.add(name)
+            return names
+
+        def is_imported_without_top_level(distribution):
+            # what packages_distributions of Python 3.11+ already tells by the recorded files
+            return distribution.read_text("top_level.txt") is None and not imported.isdisjoint(inferred_top_level(distribution))
+
         # the URL requirements whose marker applies, collected by is_missing
         url_dependencies = set()
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
@@ -642,7 +664,7 @@ internal object PythonDependencies {
             for distribution in metadata.distributions():
                 name = distribution.metadata["Name"]
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
-                if name and name not in constraints and (not in_dependencies or name in in_use):
+                if name and name not in constraints and (not in_dependencies or name in in_use or is_imported_without_top_level(distribution)):
                     if in_dependencies and len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
                         # not the version of a dist-info left by a replaced version
                         distribution = imported_distribution(name, distribution)
