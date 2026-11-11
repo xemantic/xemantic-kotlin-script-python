@@ -838,6 +838,85 @@ class PythonEnvironmentTest {
         }
     }
 
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds libpython in directory of LD_LIBRARY_PATH`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val other = directory.resolve("other").createDirectory()
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = null)
+
+            // then
+            assert(found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds libpython listed in its cache`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+        val cache = "ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$library\u0000/usr/lib/libc.so.6\u0000"
+            .toByteArray(filesystemCharset)
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = null, cache = cache)
+
+            // then
+            assert(found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader does not find libpython`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+        val cache = "ld.so-1.7.0\u0000libc.so.6\u0000/usr/lib/libc.so.6\u0000".toByteArray(filesystemCharset)
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "", cache = cache)
+
+            // then
+            assert(!found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds another libpython of same soname first`() {
+        // given
+        // e.g. of another installation of the same Python version
+        val directory = createTempDirectory("python-library")
+        val other = directory.resolve("other").createDirectory()
+        other.resolve("libxemantic-test.so.1").createFile()
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = null)
+
+            // then
+            assert(!found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
     @Test
     fun `should advise library directory of libpython when native library of Jep cannot load it`() {
         // given
@@ -898,6 +977,10 @@ class PythonEnvironmentTest {
             "/venv/bin/python", "", pythonLibrary = Path("/opt/python/lib/libpython3.13.so.1.0")
         )
         val wrongClass = UnsatisfiedLinkError("/venv/lib/python3.13/site-packages/jep/libjep.so: wrong ELF class: ELFCLASS32")
+        // of libpython found, but of another Python
+        val undefinedSymbol = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: undefined symbol: PyFoo, version libpython3.13.so.1.0"
+        )
         // of jep built for another Python
         val anotherVersion = UnsatisfiedLinkError(
             "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
@@ -905,7 +988,7 @@ class PythonEnvironmentTest {
         )
 
         // when
-        val messages = listOf(wrongClass, anotherVersion).map { cause ->
+        val messages = listOf(wrongClass, undefinedSymbol, anotherVersion).map { cause ->
             assertFailsWith<IllegalStateException> {
                 starter.createInterpreter(create = { throw cause }, check = {})
             }.message
@@ -915,6 +998,7 @@ class PythonEnvironmentTest {
         assert(
             messages == listOf(
                 "Cannot initialize the embedded Python /venv/bin/python: ${wrongClass.message}",
+                "Cannot initialize the embedded Python /venv/bin/python: ${undefinedSymbol.message}",
                 "Cannot initialize the embedded Python /venv/bin/python: ${anotherVersion.message}"
             )
         )

@@ -26,6 +26,7 @@ so `PythonLibraryTest` removes it in the JVM it starts, to test the loading with
 importing a C extension it compiles with `cc`, which tests nothing with a Python of the system library directories.
 `pyenv` builds Python without a shared `libpython` by default,
 build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
+On Java 17 to 21, also set `LD_LIBRARY_PATH` then, for a C extension imported at the startup of Python, see the README.
 
 An existing `.venv` is judged by its own Python:
 it is kept when this Python runs, is 3.10 or newer, and has `pip`,

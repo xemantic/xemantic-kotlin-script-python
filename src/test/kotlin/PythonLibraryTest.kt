@@ -72,6 +72,8 @@ class PythonLibraryTest {
     @Test
     fun `should import C extension not linked to libpython at startup of Python without LD_LIBRARY_PATH`() {
         // given
+        // on Java 17 to 21, the symbols of libpython become global only after the startup, see loadPythonLibrary
+        assumeTrue(Runtime.version().feature() >= 22, "the foreign linker is of Java 22")
         val directory = createTempDirectory("python-library")
         try {
             compileExtension(directory)

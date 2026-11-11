@@ -18,11 +18,14 @@
 
 package com.xemantic.kotlin.script.python
 
+import java.io.IOException
 import java.lang.invoke.MethodHandle
 import java.nio.file.Path
 import java.util.Optional
 import kotlin.io.path.Path
 import kotlin.io.path.isRegularFile
+import kotlin.io.path.isSameFileAs
+import kotlin.io.path.readBytes
 
 /**
  * The system property which, set, keeps [loadPythonLibrary] from using the foreign linker of Java 22,
@@ -44,20 +47,21 @@ internal fun pythonLibrary(directory: String, soname: String): Path? {
  *
  * @property failure the failure to load the library, e.g. of another architecture,
  * kept to tell why Jep cannot load its native library, if it cannot.
- * @property libraryToMakeGlobal the library loaded with local symbols, to be made global once Python runs,
+ * @property localSymbols whether the library is loaded with local symbols, to be made global once Python runs,
  * see [EmbeddedPythonStarter].
  */
 internal class PythonLibraryLoading(
     val failure: Throwable? = null,
-    val libraryToMakeGlobal: Path? = null
+    val localSymbols: Boolean = false
 )
 
 /**
- * Loads the shared `libpython` [library] of the Python on Linux, before Jep loads its native library, which depends on it.
+ * Loads the shared `libpython` [library] of the Python on Linux, before Jep loads its native library, which depends on it,
+ * when the dynamic loader would not find it, see [loaderFinds].
  *
  * The dynamic loader finds the `libpython3.X.so.1.0` of the native library of Jep by its soname
- * only in the system library directories, or the ones of `LD_LIBRARY_PATH`, read when the JVM starts,
- * so not the one of a Python installed elsewhere, e.g. by uv, pyenv, conda, or `actions/setup-python`;
+ * in the directories of `LD_LIBRARY_PATH`, read when the JVM starts, of `ld.so.cache`, and the system ones,
+ * so not the one of a Python installed elsewhere, e.g. by uv, pyenv, or `actions/setup-python`;
  * once loaded by its path, the loader takes the library of the same soname instead.
  *
  * Its symbols must be global as well, as a C extension module on Linux is not linked to `libpython`,
@@ -74,10 +78,64 @@ internal fun loadPythonLibrary(library: Path): PythonLibraryLoading {
     if (System.getProperty(NO_FOREIGN_LINKER_PROPERTY) == null && loadGlobally(library)) return PythonLibraryLoading()
     return try {
         System.load(library.toString())
-        PythonLibraryLoading(libraryToMakeGlobal = library)
+        PythonLibraryLoading(localSymbols = true)
     } catch (e: UnsatisfiedLinkError) {
         PythonLibraryLoading(failure = e)
     }
+}
+
+/**
+ * Whether the dynamic loader finds the [library] by its soname, its file name, as the same file,
+ * so that it needs not be loaded by its path, see [loadPythonLibrary], e.g. of a Python of the system.
+ *
+ * Like the loader, it takes the first file of the soname in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
+ * then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
+ * of the directories configured in `/etc/ld.so.conf`, and then in the system directories.
+ * It does not know the `RUNPATH` of the native library of Jep, e.g. of conda,
+ * with which the library would be loaded when not needed.
+ */
+internal fun loaderFinds(
+    library: Path,
+    libraryPath: String? = System.getenv("LD_LIBRARY_PATH"),
+    cache: ByteArray? = readLoaderCache()
+): Boolean {
+    val soname = library.fileName.toString()
+    val candidates = libraryPath.orEmpty().split(':').filter { it.isNotEmpty() }.map { Path(it, soname) } +
+        cachedLibraries(cache, soname) +
+        SYSTEM_LIBRARY_DIRECTORIES.map { Path(it, soname) }
+    val found = candidates.firstOrNull { it.isRegularFile() } ?: return false
+    return try {
+        found.isSameFileAs(library)
+    } catch (_: IOException) {
+        false
+    }
+}
+
+/** The directories which the dynamic loader of glibc searches last, also without `ld.so.cache`. */
+private val SYSTEM_LIBRARY_DIRECTORIES = listOf("/lib64", "/usr/lib64", "/lib", "/usr/lib")
+
+/** The `/etc/ld.so.cache` of the dynamic loader, or `null` if it cannot be read, e.g. of musl, which has none. */
+private fun readLoaderCache(): ByteArray? = try {
+    Path("/etc/ld.so.cache").takeIf { it.isRegularFile() }?.readBytes()
+} catch (_: IOException) {
+    null
+}
+
+/** The paths of the libraries of the [soname] in the [cache] of the dynamic loader, its null-terminated strings. */
+private fun cachedLibraries(cache: ByteArray?, soname: String): List<Path> {
+    if (cache == null) return emptyList()
+    // ISO-8859-1 maps each byte to a char, so that the indexes are the ones of the bytes
+    val text = String(cache, Charsets.ISO_8859_1)
+    val suffix = "/" + String(soname.toByteArray(filesystemCharset), Charsets.ISO_8859_1) + "\u0000"
+    val paths = mutableListOf<Path>()
+    var end = text.indexOf(suffix)
+    while (end != -1) {
+        val start = text.lastIndexOf('\u0000', end) + 1
+        val bytes = text.substring(start, end + suffix.length - 1).toByteArray(Charsets.ISO_8859_1)
+        String(bytes, filesystemCharset).takeIf { it.startsWith("/") }?.let { paths.add(Path(it)) }
+        end = text.indexOf(suffix, end + 1)
+    }
+    return paths
 }
 
 /** `RTLD_LAZY | RTLD_GLOBAL` of glibc and musl. */
@@ -90,8 +148,11 @@ private const val RTLD_LAZY_GLOBAL = 0x101
  * @return `true` if loaded, `false` if the foreign linker is not available, or `dlopen` fails.
  */
 private fun loadGlobally(library: Path): Boolean = try {
-    val linkerClass = Class.forName("java.lang.foreign.Linker")
     val arenaClass = Class.forName("java.lang.foreign.Arena")
+    // of Java 22, as the foreign linker of Java 21 is a preview,
+    // looked up before calling a restricted method, which would print a warning without --enable-native-access
+    val allocateFrom = arenaClass.getMethod("allocateFrom", String::class.java)
+    val linkerClass = Class.forName("java.lang.foreign.Linker")
     val segmentClass = Class.forName("java.lang.foreign.MemorySegment")
     val layoutClass = Class.forName("java.lang.foreign.MemoryLayout")
     val valueLayoutClass = Class.forName("java.lang.foreign.ValueLayout")
@@ -115,8 +176,6 @@ private fun loadGlobally(library: Path): Boolean = try {
         val noOptions = java.lang.reflect.Array.newInstance(optionClass, 0)
         val handle = linkerClass.getMethod("downcallHandle", segmentClass, descriptorClass, noOptions.javaClass)
             .invoke(linker, dlopen, descriptor, noOptions) as MethodHandle
-        // allocateFrom is of Java 22, the foreign linker of Java 21 is a preview
-        val allocateFrom = arenaClass.getMethod("allocateFrom", String::class.java)
         (arenaClass.getMethod("ofConfined").invoke(null) as AutoCloseable).use { arena ->
             val path = allocateFrom.invoke(arena, library.toString())
             val result = handle.invokeWithArguments(path, RTLD_LAZY_GLOBAL)

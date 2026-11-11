@@ -103,12 +103,15 @@ public object PythonEnvironment {
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
-        val loading = if (pythonLibrary != null && System.getProperty("os.name").startsWith("Linux")) {
+        // only when needed, as the foreign linker prints a warning without --enable-native-access
+        val loading = if (
+            pythonLibrary != null && System.getProperty("os.name").startsWith("Linux") && !loaderFinds(pythonLibrary)
+        ) {
             loadPythonLibrary(pythonLibrary)
         } else PythonLibraryLoading()
         this.executable = executable
         starter = EmbeddedPythonStarter(
-            executable, probe.error, pythonLibrary, loading.failure, loading.libraryToMakeGlobal
+            executable, probe.error, pythonLibrary, loading.failure, loading.localSymbols
         )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -507,7 +510,7 @@ private fun String.hexToPath(): String? {
  * When the native library of Jep cannot load the shared [pythonLibrary] of the Python, see [pythonLibrary],
  * it tells to put its directory on `LD_LIBRARY_PATH`,
  * and keeps the [libraryPreloadFailure] of [loadPythonLibrary], if any, as suppressed.
- * The symbols of the `libpython` loaded locally by [loadPythonLibrary], if any,
+ * The symbols of the [pythonLibrary] loaded by [loadPythonLibrary], if [libraryLocalSymbols],
  * are made global in the first interpreter, see [makePythonLibraryGlobal].
  */
 internal class EmbeddedPythonStarter(
@@ -515,13 +518,11 @@ internal class EmbeddedPythonStarter(
     private val probeError: String,
     private val pythonLibrary: Path? = null,
     private val libraryPreloadFailure: Throwable? = null,
-    libraryToMakeGlobal: Path? = null
+    libraryLocalSymbols: Boolean = false
 ) {
 
-    /** The `libpython` to make global in the first interpreter, see [makePythonLibraryGlobal]. */
-    @Volatile
-    private var libraryToMakeGlobal: Path? = libraryToMakeGlobal
-
+    /** Whether the symbols of the [pythonLibrary] are still to be made global, see [makePythonLibraryGlobal]. */
+    private var libraryLocalSymbols = libraryLocalSymbols
 
     /** Whether an interpreter has been created, so that the embedded CPython has started. */
     @Volatile
@@ -564,9 +565,10 @@ internal class EmbeddedPythonStarter(
     }
 
     /**
-     * Makes the symbols of the `libpython` loaded locally by [loadPythonLibrary], if any, global,
+     * Makes the symbols of the [pythonLibrary] loaded by [loadPythonLibrary] global, if [libraryLocalSymbols],
      * in the first [interpreter], before any code of the user, but after the startup of Python,
      * see [loadPythonLibrary].
+     * The interpreters created meanwhile on other threads wait for it, so that no code runs before.
      *
      * CPython can load a library with `RTLD_GLOBAL`,
      * loading an extension module with the flags of `sys.setdlopenflags`:
@@ -574,9 +576,12 @@ internal class EmbeddedPythonStarter(
      * before it fails as an extension module without its initialization function.
      * It is best-effort: a failure is only logged, as the code of the user might not need any C extension.
      */
+    @Synchronized
     private fun makePythonLibraryGlobal(interpreter: Interpreter) {
-        val library = libraryToMakeGlobal ?: return
-        libraryToMakeGlobal = null
+        if (!libraryLocalSymbols) return
+        val library = pythonLibrary ?: return
+        // also on a failure, which would only repeat
+        libraryLocalSymbols = false
         try {
             interpreter.exec(
                 """
@@ -612,12 +617,14 @@ internal class EmbeddedPythonStarter(
         // Jep wraps the failure of initializing CPython in an Error, whose message is its toString()
         val reason = cause.cause?.takeIf { cause.message == it.toString() } ?: cause
         val headline = "Cannot initialize the embedded Python $executable: ${reason.message ?: reason}"
-        // e.g. libjep.so: libpython3.13.so.1.0: cannot open shared object file,
+        // e.g. libjep.so: libpython3.13.so.1.0: cannot open shared object file, or Library not loaded on macOS,
         // also as the cause of the Error of Jep retrying to initialize CPython
         val library = pythonLibrary
         val libraryAdvice = if (
             library != null && generateSequence(cause) { it.cause }.any {
-                it is UnsatisfiedLinkError && it.message?.contains(library.fileName.toString()) == true
+                val message = it.message ?: ""
+                it is UnsatisfiedLinkError && library.fileName.toString() in message &&
+                    ("cannot open shared object file" in message || "Library not loaded" in message)
             }
         ) {
             "\nThe dynamic loader cannot load ${library.fileName} of this Python, " +
