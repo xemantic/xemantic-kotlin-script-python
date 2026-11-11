@@ -1674,23 +1674,25 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should plan requirements of current dist-info of distribution with several dist-info directories`() {
+    fun `should plan requirements of all dist-info of distribution with several dist-info directories`() {
         // given
         PythonEnvironment.initialize()
         withDirectory { directory ->
-            // pip --target leaves the dist-info of the replaced version behind,
-            // with the hashes of the files since overwritten
-            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
-            directory.writeDistribution("issue28-dependent", "2.0", "issue28-dependency>=2")
-            directory.writeDistribution("issue28-dependency", "2.0")
+            // e.g. left by a failed removal after pip --target replaced the version, or on a file system
+            // without inode numbers, of metapackages without files to tell which of them is installed
+            directory.writeMetapackage("issue28-dependent", "1.0", "issue28-dependency<2")
+            directory.writeMetapackage("issue28-dependent", "2.0", "issue28-dependency<3")
 
             // when
             val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
 
             // then
+            // the requirements of all of them, as which one is installed is not known
             assert(
-                plan.filter { it.first == "requirement" } ==
-                    listOf("requirement" to "issue28-dependent 2.0 issue28-dependency >=2")
+                plan.filter { it.first == "requirement" } == listOf(
+                    "requirement" to "issue28-dependent 1.0 issue28-dependency <2",
+                    "requirement" to "issue28-dependent 2.0 issue28-dependency <3"
+                )
             )
         }
     }
@@ -1753,7 +1755,10 @@ class PythonDependenciesTest {
 
             // then
             assert(exitCode == 0)
-            assert(output.lines().filter { "issue28" in it && !it.startsWith("dist-info ") } == listOf("install issue28-dependency>=2"))
+            assert(
+                output.lines().filter { "issue28" in it && !it.startsWith("dist-info ") } ==
+                    listOf("install issue28-dependency>=2")
+            )
         }
     }
 
@@ -1787,7 +1792,9 @@ class PythonDependenciesTest {
                 // given
                 directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
                 directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency>=3")
-                index.writeWheel("issue28-dependency", "2.0")
+                // so that each of the requirements alone can be satisfied
+                index.writeWheel("issue28-dependency", "1.0")
+                index.writeWheel("issue28-dependency", "3.0")
                 index.writeWheel("issue28-new", "1.0", "issue28-dependency")
 
                 // when
@@ -1959,6 +1966,100 @@ class PythonDependenciesTest {
         }
     }
 
+    @Test
+    fun `should find minimal conflict among candidates`() {
+        // given
+        val resolved = mutableListOf<List<Int>>()
+
+        // when
+        val conflict = PythonDependencies.minimalConflict(emptyList(), (1..100).toList()) {
+            resolved += it
+            !(17 in it && 64 in it && 65 in it)
+        }
+
+        // then
+        assert(conflict.sorted() == listOf(17, 64, 65))
+        // logarithmically many, not one per candidate
+        assert(resolved.size < 50)
+    }
+
+    @Test
+    fun `should fail building dependency without blaming dependency directory`() {
+        forEachInstaller { installer ->
+            withLocalIndex { directory, index ->
+                // given
+                directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+                // a dry run only prepares the metadata, it does not build the wheel
+                val project = index.resolve("issue28-unbuildable").createDirectories()
+                project.writeProjectFailingToBuildWheel("issue28-unbuildable", "1.0")
+
+                // when
+                val exception = assertFailsWith<PythonDependencyException> {
+                    directory.installDependencies(installer, index, "issue28-unbuildable @ ${project.toUri()}")
+                }
+
+                // then
+                val message = exception.message!!
+                assert("issue28 build failure" in message)
+                assert("required by" !in message && "dependency directory" !in message)
+            }
+        }
+    }
+
+    @Test
+    fun `should name only installed distribution whose requirement conflicts`() {
+        forEachInstaller { installer ->
+            withLocalIndex { directory, index ->
+                // given
+                directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<3")
+                directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency<2")
+                directory.writeDistribution("issue28-dependency-toolbelt", "1.0", "issue28-dependency<4")
+                directory.writeDistribution("issue28-dependency", "1.0")
+                index.writeWheel("issue28-dependency", "2.0")
+                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=2")
+
+                // when
+                val exception = assertFailsWith<PythonDependencyException> {
+                    directory.installDependencies(installer, index, "issue28-new")
+                }
+
+                // then
+                val message = exception.message!!
+                assert("  issue28-dependency <2, required by issue28-other-dependent 1.0\n" in message)
+                assert("required by issue28-dependent 1.0" !in message)
+                assert("required by issue28-dependency-toolbelt 1.0" !in message)
+            }
+        }
+    }
+
+    @Test
+    fun `should upgrade installed distribution declared in later version as advised by conflict`() {
+        forEachInstaller { installer ->
+            withLocalIndex { directory, index ->
+                // given
+                directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+                directory.writeDistribution("issue28-dependency", "1.0")
+                index.writeWheel("issue28-dependent", "1.0", "issue28-dependency<2")
+                index.writeWheel("issue28-dependent", "2.0", "issue28-dependency>=2")
+                index.writeWheel("issue28-dependency", "2.0")
+                index.writeWheel("issue28-new", "1.0", "issue28-dependency>=2")
+                // declared without a version, the installed version satisfies it, so it is not replaced
+                val unversioned = assertFailsWith<PythonDependencyException> {
+                    directory.installDependencies(installer, index, "issue28-new", "issue28-dependent")
+                }
+                val advised = Regex("issue28-dependent>\\S+").findAll(unversioned.message!!).single().value
+
+                // when
+                directory.installDependencies(installer, index, "issue28-new", advised)
+
+                // then
+                assert(advised == "issue28-dependent>1.0")
+                assert(directory.version("issue28_dependent") == "2.0")
+                assert(directory.version("issue28_dependency") == "2.0")
+            }
+        }
+    }
+
     /**
      * Runs the [block] with pip, as `null`, and with uv, if it is on the `PATH`,
      * not inherited by the test JVM from the Gradle client, but from its daemon.
@@ -2013,6 +2114,44 @@ internal fun Path.writeDistribution(name: String, version: String, vararg requir
     distInfo.resolve("RECORD").writeText(
         "$distribution/__init__.py,${hash(version)},${version.length}\n" +
             "${distInfo.fileName}/METADATA,,\n${distInfo.fileName}/RECORD,,\n"
+    )
+}
+
+/**
+ * Writes the metadata of a metapackage installed into this directory, without files,
+ * like pip would install a wheel with only its dist-info.
+ */
+internal fun Path.writeMetapackage(name: String, version: String, vararg requirements: String) {
+    val distInfo = resolve("${name.replace('-', '_')}-$version.dist-info").createDirectories()
+    distInfo.resolve("METADATA").writeText(metadata(name, version, requirements))
+    distInfo.resolve("RECORD").writeText("${distInfo.fileName}/METADATA,,\n${distInfo.fileName}/RECORD,,\n")
+}
+
+/**
+ * Writes into this directory a project whose build backend prepares its metadata, but fails to build its wheel,
+ * with `issue28 build failure`.
+ */
+internal fun Path.writeProjectFailingToBuildWheel(name: String, version: String) {
+    val distInfo = "${name.replace('-', '_')}-$version.dist-info"
+    resolve("pyproject.toml").writeText(
+        "[build-system]\nrequires = []\nbuild-backend = \"backend\"\nbackend-path = [\".\"]\n"
+    )
+    resolve("backend.py").writeText(
+        """
+        import os
+
+        def get_requires_for_build_wheel(config_settings=None):
+            return []
+
+        def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+            os.makedirs(os.path.join(metadata_directory, "$distInfo"))
+            with open(os.path.join(metadata_directory, "$distInfo", "METADATA"), "w") as file:
+                file.write("${metadata(name, version, emptyArray()).replace("\n", "\\n")}")
+            return "$distInfo"
+
+        def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+            raise RuntimeError("issue28 build failure")
+        """.trimIndent()
     )
 }
 

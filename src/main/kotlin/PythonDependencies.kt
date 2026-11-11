@@ -288,53 +288,83 @@ internal object PythonDependencies {
             val (dependent, version, name, specifier) = it.second.split(' ')
             InstalledRequirement(dependent, version, name, specifier)
         }
-        val constraints = pinned + requirements.groupBy { it.name }.map { (name, requirements) ->
-            name + requirements.joinToString(",") { it.specifier }
+        fun runInstaller(requirements: List<InstalledRequirement>, dryRun: Boolean = false): ProcessResult {
+            val constraints = pinned + requirements.groupBy { it.name }.map { (name, requirements) ->
+                name + requirements.joinToString(",") { it.specifier }
+            }
+            return withConstraints(constraints) { constraintsFile ->
+                runProcess(
+                    if (uv != null) {
+                        listOf(
+                            uv, "pip", "install", "--quiet",
+                            "--python", PythonEnvironment.executable,
+                            "--target", directory,
+                            "--constraints", constraintsFile
+                        )
+                    } else {
+                        pipCommand(
+                            "install", "--quiet",
+                            "--disable-pip-version-check", "--no-input", "--upgrade",
+                            "--target", directory,
+                            "--constraint", constraintsFile
+                        )
+                    } + (if (dryRun) listOf("--dry-run") else emptyList()) + installerOptions + missing
+                )
+            }
         }
-        fun installCommand(constraintsFile: String, dryRun: Boolean = false) = if (uv != null) {
-            listOf(
-                uv, "pip", "install", "--quiet",
-                "--python", PythonEnvironment.executable,
-                "--target", directory,
-                "--constraints", constraintsFile
-            )
-        } else {
-            pipCommand(
-                "install", "--quiet",
-                "--disable-pip-version-check", "--no-input", "--upgrade",
-                "--target", directory,
-                "--constraint", constraintsFile
-            )
-        } + (if (dryRun) listOf("--dry-run") else emptyList()) + installerOptions + missing
 
-        val (exitCode, output) = withConstraints(constraints) { runProcess(installCommand(it)) }
+        val (exitCode, output) = runInstaller(requirements)
         if (exitCode == 0) {
             // within the lock, as another process could be installing another version meanwhile
             removeReplacedDistInfo(directory, plan.single { it.first == "dist-info" }.second)
             return
         }
         val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
+        fun resolves(requirements: List<InstalledRequirement>) = runInstaller(requirements, dryRun = true).exitCode == 0
         // the failure is a conflict with the requirements of the installed distributions,
-        // only if the dependencies can be installed without them, and not e.g. because of the network
-        val conflict = requirements.isNotEmpty() &&
-            withConstraints(pinned) { runProcess(installCommand(it, dryRun = true)) }.exitCode == 0
-        if (!conflict) throw PythonDependencyException(message)
-        val reported = output.lowercase().replace(separators, "-")
-        val conflicting = requirements.filter { it.name in reported }.ifEmpty { requirements }
+        // only if the resolution fails with them, unlike e.g. building a wheel, which a dry run does not do,
+        // and succeeds without them, unlike e.g. a dependency not found
+        if (requirements.isEmpty() || resolves(requirements) || !resolves(emptyList())) {
+            throw PythonDependencyException(message)
+        }
+        val conflicting = minimalConflict(emptyList(), requirements, ::resolves)
+        val advice = conflicting.map { "${it.dependent}>${it.version}" }.distinct()
         throw PythonDependencyException(
             message + "\n" +
-                "The dependencies conflict with the requirements of the distributions " +
+                "The dependencies conflict with these requirements of the distributions " +
                 "installed in the dependency directory $directory:\n" +
                 conflicting.joinToString("") { "  $it\n" } +
-                "To upgrade an installed distribution as well, declare it as a dependency too. " +
+                "A later version of such a distribution might not require it, " +
+                "so to upgrade it along, declare it as a dependency in a later version than the installed one:\n" +
+                advice.joinToString("") { "  $it\n" } +
+                "Declared without a version, the installed version satisfies it, and its requirements stay. " +
                 "Otherwise, installing the dependencies would break these distributions, " +
                 "so they need another dependency directory, see PythonEnvironment.dependencyDirectory, " +
                 "or the dependency directory can be deleted, when no Python uses it, to start from scratch."
         )
     }
 
-    /** The separators of the words of a distribution name, which a canonical name replaces with `-`. */
-    private val separators = Regex("[-_.]+")
+    /**
+     * A minimal subset of the [candidates] which, together with the [base], does not [resolve],
+     * with the QuickXplain algorithm, in a number of resolutions logarithmic in the number of the candidates,
+     * given that the [base] resolves, and the [base] with all the [candidates] does not.
+     *
+     * Removing any of the returned candidates makes the rest resolve with the [base],
+     * as a resolution which fails with some constraints also fails with more,
+     * so it names the requirements in conflict precisely, also of several distributions requiring the same one.
+     */
+    internal fun <T> minimalConflict(base: List<T>, candidates: List<T>, resolve: (List<T>) -> Boolean): List<T> {
+        fun conflict(base: List<T>, added: Boolean, candidates: List<T>): List<T> {
+            if (added && !resolve(base)) return emptyList()
+            if (candidates.size == 1) return candidates
+            val first = candidates.subList(0, candidates.size / 2)
+            val second = candidates.subList(candidates.size / 2, candidates.size)
+            val ofSecond = conflict(base + first, first.isNotEmpty(), second)
+            val ofFirst = conflict(base + ofSecond, ofSecond.isNotEmpty(), first)
+            return ofFirst + ofSecond
+        }
+        return conflict(base, false, candidates)
+    }
 
     private fun <T> withConstraints(constraints: List<String>, block: (constraintsFile: String) -> T): T {
         val constraintsFile = createTempFile("python-constraints", ".txt")
@@ -606,19 +636,6 @@ internal object PythonDependencies {
                     # an invalid requirement, or marker, of an installed distribution cannot be honored anyway
                     pass
 
-        def is_installed(distribution):
-            # all the files with a hash in its RECORD are on disk, with that hash
-            hashed = [file for file in distribution.files or [] if file.hash]
-            for file in hashed:
-                try:
-                    content = file.locate().read_bytes()
-                except OSError:
-                    return False
-                digest = hashlib.new(file.hash.mode, content).digest()
-                if base64.urlsafe_b64encode(digest).rstrip(b"=").decode() != file.hash.value:
-                    return False
-            return bool(hashed)
-
         def without_credentials(url):
             # direct_url.json holds the URL without credentials, and without the fragment
             parts = urlsplit(url)
@@ -742,22 +759,18 @@ internal object PythonDependencies {
                 kept = {canonicalize_name(name) for name in constraints}
                 # replaced by the installation, so the requirements of their installed versions do not matter
                 declared = {canonicalize_name(Requirement(dependency).name) for dependency in missing}
-                installed = {}
+                installed = []
+                # all the dist-info of a distribution, when there are several, as it is not known which one
+                # the installed files belong to, so the installation is refused rather than breaking it
                 for distribution in metadata.distributions(path=[directory]):
                     name = distribution.metadata["Name"]
-                    if name and canonicalize_name(name) not in declared:
-                        installed.setdefault(canonicalize_name(name), []).append(distribution)
-                for name, distributions in installed.items():
-                    if len(distributions) > 1:
-                        # pip --target leaves the dist-info of a replaced version behind,
-                        # with the hashes of the files since overwritten by the installed version
-                        distributions = [it for it in distributions if is_installed(it)]
-                    if len(distributions) == 1:
-                        distribution = distributions[0]
-                        for requirement in requirements_of(distribution):
-                            required = canonicalize_name(requirement.name)
-                            if requirement.specifier and required not in kept:
-                                print("requirement", name, distribution.version, required, requirement.specifier)
+                    if name and distribution.version and canonicalize_name(name) not in declared:
+                        installed.append((canonicalize_name(name), version_key(distribution.version), distribution))
+                for name, _, distribution in sorted(installed, key=lambda it: it[:2]):
+                    for requirement in requirements_of(distribution):
+                        required = canonicalize_name(requirement.name)
+                        if requirement.specifier and required not in kept:
+                            print("requirement", name, distribution.version, required, requirement.specifier)
             # the dist-info directories before the installation, to remove the ones it replaced
             print("dist-info", json.dumps(dist_info_snapshot(directory)))
     """.trimIndent()

@@ -192,10 +192,13 @@ otherwise the code can declare it as a dependency, see below.
   but only within the versions the installed distributions require of them,
   e.g. a dependency requiring `attrs>=24` cannot upgrade `attrs` 23,
   installed earlier for a distribution requiring `attrs<24`, which would break the next time it is imported.
-  Only the requirements of the distributions the code declares as its dependencies do not count, as they are replaced,
-  so to upgrade an installed distribution along with the ones it requires, the code declares it as well.
+  Only the requirements of the distributions the code declares as missing dependencies do not count, as they are replaced,
+  so to upgrade an installed distribution along with the ones it requires, the code declares it as well,
+  in a later version than the installed one, e.g. `pkg>1.0` for the installed `pkg` 1.0 —
+  declared without a version, or with one the installed version satisfies, it is not missing, and its requirements stay.
   A dependency conflicting with these requirements fails the call with `PythonDependencyException`,
-  naming the installed distributions and their requirements,
+  naming the requirements in conflict, found by resolving the dependencies with fewer of them (`--dry-run`),
+  and the installed distributions requiring them, to declare in a later version,
   as there can be only one version of a distribution in the directory —
   code with dependencies conflicting with the ones of other code needs its own `PythonEnvironment.dependencyDirectory`,
   in a JVM of its own, as the dependency directory is shared by all the `Python` interpreters of the JVM.
@@ -203,6 +206,8 @@ otherwise the code can declare it as a dependency, see below.
   so other code can change the version of a dependency it declared directly,
   and the next time it runs, it gets the declared version installed again,
   or fails, if an installed distribution requires the other version.
+  Of a distribution with several `dist-info` directories in the dependency directory (see below),
+  the requirements of all of them count, as it is not known which one the installed files belong to.
   The requirements are not protected when the Python environment has neither the `packaging` nor the `pip` package to read them.
   A direct URL dependency, like `pkg @ git+https://host/repo@v1`,
   is installed once for the same URL and revision, or commit, of a VCS repository —
