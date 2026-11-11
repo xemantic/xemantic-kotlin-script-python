@@ -261,11 +261,7 @@ public object PythonEnvironment {
      * @throws CharacterCodingException if a value is not valid in the [filesystemCharset].
      */
     internal fun parseProbeOutput(output: String): PythonProbe? {
-        // the output is trimmed, also of the newline before the first line
-        val lines = "\n$output"
-        val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
-        val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
-        val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
+        val values = framedOutput(output, PROBE_BEGIN, PROBE_END)?.split(' ')
         if (values == null || values.size != 5) return null
         val (executable, cacheTag, prefix, jepLocation, externallyManaged) =
             values.map { it.hexToPath() ?: return null }
@@ -378,6 +374,20 @@ internal fun pythonCommand(python: String, code: String, vararg arguments: Strin
     "import sys\nif sys.path[:1] == ['']: del sys.path[0]\n$code",
     *arguments
 )
+
+/**
+ * The text between the last [begin] line and the following [end] line of the trimmed standard [output]
+ * of a Python process, or `null` if there are no such lines.
+ * The process writes a newline before the [begin] line, so that it starts a line
+ * also after an output without a trailing newline, e.g. of a `sitecustomize` module or a `.pth` file.
+ */
+internal fun framedOutput(output: String, begin: String, end: String): String? {
+    // the output is trimmed, also of the newline before the first line
+    val lines = "\n$output"
+    val start = lines.lastIndexOf("\n$begin\n").takeIf { it != -1 }?.let { it + begin.length + 2 } ?: return null
+    val stop = lines.indexOf("\n$end", start).takeIf { it != -1 } ?: return null
+    return lines.substring(start, stop)
+}
 
 /**
  * The version of the `org.ninia:jep` library in its `pom.properties`, read and closed,

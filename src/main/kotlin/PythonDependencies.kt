@@ -225,8 +225,29 @@ internal object PythonDependencies {
         // the standard error separately, as a write to it, e.g. a warning, could split a line of the plan
         val result = runProcess(command, input = input, mergeErrorStream = false)
         if (result.exitCode != 0) throw PythonDependencyException(result.failureOutput)
-        return result.output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+        return parsePlanOutput(result.output) ?: throw PythonDependencyException(
+            "Cannot read the plan of the Python dependencies from its output" +
+                if (result.failureOutput.isEmpty()) "" else ":\n${result.failureOutput}"
+        )
     }
+
+    /**
+     * The entries of the plan in the standard [output] of the [PLAN],
+     * taken only from between the last [PLAN_BEGIN] and the following [PLAN_END] line,
+     * as anything else run by Python, e.g. a `sitecustomize` module or a `.pth` file,
+     * can write to the standard output as well, before or after them.
+     *
+     * @return the entries, or `null` if the [output] has no plan.
+     */
+    internal fun parsePlanOutput(output: String): List<Pair<String, String>>? =
+        framedOutput(output, PLAN_BEGIN, PLAN_END)
+            ?.lines()
+            ?.filter { it.isNotBlank() }
+            ?.map { it.substringBefore(' ') to it.substringAfter(' ') }
+
+    internal const val PLAN_BEGIN = "--- xemantic-kotlin-script-python plan begin ---"
+
+    internal const val PLAN_END = "--- xemantic-kotlin-script-python plan end ---"
 
     /** The command running the [PLAN] for the dependency [directory]. */
     fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
@@ -300,6 +321,8 @@ internal object PythonDependencies {
      * Prints the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
      * or exits with the error.
+     * The lines are written between the [PLAN_BEGIN] and [PLAN_END] lines, like the ones of the
+     * [PythonEnvironment.probeCommand], with an empty line before them, as bytes, to the original standard output.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
@@ -360,6 +383,7 @@ internal object PythonDependencies {
             return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
 
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
+        plan = []
         if missing:
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
@@ -370,10 +394,14 @@ internal object PythonDependencies {
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
                 if name and (not in_dependencies or name in in_use):
                     constraints.setdefault(name, distribution.version)
-            for dependency in missing:
-                print("install", dependency)
-            for name, version in constraints.items():
-                print("constraint", f"{name}=={version}")
+            plan += [f"install {dependency}" for dependency in missing]
+            plan += [f"constraint {name}=={version}" for name, version in constraints.items()]
+        sys.stdout.flush()
+        sys.__stdout__.flush()
+        sys.__stdout__.buffer.write(
+            ("\n$PLAN_BEGIN\n" + "\n".join(plan) + "\n$PLAN_END\n").encode("utf-8")
+        )
+        sys.__stdout__.flush()
     """.trimIndent()
 
 }

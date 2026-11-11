@@ -542,6 +542,102 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan when Python writes to standard output without line break`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // like a sitecustomize module or a .pth file, run before the plan, writing to the standard output,
+        // which would be joined with the first line of the plan
+        val command = pythonCommand(
+            PythonEnvironment.executable,
+            "import sys; sys.stdout.write('noise')\n" + PythonDependencies.PLAN,
+            directory
+        )
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command
+        )
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
+    }
+
+    @Test
+    fun `should plan when Python replaces standard output with stream without buffer`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // like a sitecustomize module capturing the standard output
+        val command = pythonCommand(
+            PythonEnvironment.executable,
+            "import io, sys; sys.stdout = io.StringIO()\n" + PythonDependencies.PLAN,
+            directory
+        )
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command
+        )
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
+    }
+
+    @Test
+    fun `should fail plan with clear message when its output has no plan`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // like a Python whose sitecustomize module ends the process before the plan
+        val command = pythonCommand(PythonEnvironment.executable, "print('unexpected output')", directory)
+
+        // when
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan("dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command)
+        }
+
+        // then
+        assert(
+            exception.message == "Cannot read the plan of the Python dependencies from its output:\nunexpected output"
+        )
+    }
+
+    @Test
+    fun `should parse plan output with output before and after plan`() {
+        // given
+        val output = "noise\n${PythonDependencies.PLAN_BEGIN}\n" +
+            "install requests\nconstraint numpy==2.0.0\n${PythonDependencies.PLAN_END}\nmore noise"
+
+        // when
+        val plan = PythonDependencies.parsePlanOutput(output)
+
+        // then
+        assert(plan == listOf("install" to "requests", "constraint" to "numpy==2.0.0"))
+    }
+
+    @Test
+    fun `should parse plan output of empty plan`() {
+        // given
+        val output = "noise\n${PythonDependencies.PLAN_BEGIN}\n\n${PythonDependencies.PLAN_END}"
+
+        // when
+        val plan = PythonDependencies.parsePlanOutput(output)
+
+        // then
+        assert(plan == emptyList<Pair<String, String>>())
+    }
+
+    @Test
+    fun `should not parse plan output without plan`() {
+        // when
+        val plan = PythonDependencies.parsePlanOutput("noiseinstall requests")
+
+        // then
+        assert(plan == null)
+    }
+
+    @Test
     fun `should fail plan with message written to standard error`() {
         // given
         PythonEnvironment.initialize()
