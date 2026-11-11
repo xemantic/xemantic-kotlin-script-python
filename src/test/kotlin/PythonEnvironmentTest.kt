@@ -848,7 +848,7 @@ class PythonEnvironmentTest {
 
         try {
             // when
-            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = null)
+            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = { null })
 
             // then
             assert(found)
@@ -868,13 +868,57 @@ class PythonEnvironmentTest {
 
         try {
             // when
-            val found = loaderFinds(library, libraryPath = null, cache = cache)
+            val found = loaderFinds(library, libraryPath = null, cache = { cache })
 
             // then
             assert(found)
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not read cache of dynamic loader when libpython is found in directory of LD_LIBRARY_PATH`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "$directory", cache = { error("cache read") })
+
+            // then
+            assert(found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should keep failure of loading libpython denied by JVM`() {
+        // given
+        // like System.load with --illegal-native-access=deny
+        val denied = IllegalCallerException("Illegal native access from: unnamed module")
+
+        // when
+        val loading = withSystemProperty(NO_FOREIGN_LINKER_PROPERTY, "true") {
+            loadPythonLibrary(Path("/opt/python/lib/libpython3.13.so.1.0"), load = { throw denied })
+        }
+
+        // then
+        assert(loading.failure === denied && !loading.localSymbols)
+    }
+
+    @Test
+    fun `should use foreign linker unless disabled by system property set to true`() {
+        // when
+        val usage = listOf(null, "false", "true", "TRUE").map { value ->
+            withSystemProperty(NO_FOREIGN_LINKER_PROPERTY, value) { foreignLinkerEnabled() }
+        }
+
+        // then
+        assert(usage == listOf(true, true, false, false))
     }
 
     @OptIn(ExperimentalPathApi::class)
@@ -887,7 +931,7 @@ class PythonEnvironmentTest {
 
         try {
             // when
-            val found = loaderFinds(library, libraryPath = "", cache = cache)
+            val found = loaderFinds(library, libraryPath = "", cache = { cache })
 
             // then
             assert(!found)
@@ -908,7 +952,7 @@ class PythonEnvironmentTest {
 
         try {
             // when
-            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = null)
+            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = { null })
 
             // then
             assert(!found)
@@ -920,6 +964,33 @@ class PythonEnvironmentTest {
     @Test
     fun `should advise library directory of libpython when native library of Jep cannot load it`() {
         // given
+        val starter = EmbeddedPythonStarter(
+            "/venv/bin/python", "", pythonLibrary = Path("/opt/python/lib/libpython3.13.so.1.0")
+        )
+        val cause = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
+                "libpython3.13.so.1.0: cannot open shared object file: No such file or directory"
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            exception.cause === cause &&
+                message.startsWith("Cannot initialize the embedded Python /venv/bin/python: ${cause.message}\n") &&
+                "/opt/python/lib" in message &&
+                "LD_LIBRARY_PATH" in message
+        )
+    }
+
+    @Test
+    fun `should tell failure to load libpython instead of advising its directory`() {
+        // given
+        // LD_LIBRARY_PATH would not help, as the loader would fail to load the library the same way
         val preloadFailure = UnsatisfiedLinkError("/opt/python/lib/libpython3.13.so.1.0: wrong ELF class: ELFCLASS32")
         val starter = EmbeddedPythonStarter(
             "/venv/bin/python", "",
@@ -941,9 +1012,8 @@ class PythonEnvironmentTest {
         assert(
             exception.cause === cause &&
                 exception.suppressed.toList() == listOf(preloadFailure) &&
-                message.startsWith("Cannot initialize the embedded Python /venv/bin/python: ${cause.message}\n") &&
-                "/opt/python/lib" in message &&
-                "LD_LIBRARY_PATH" in message
+                message == "Cannot initialize the embedded Python /venv/bin/python: ${cause.message}\n" +
+                "Cannot load the libpython of this Python: ${preloadFailure.message}"
         )
     }
 
@@ -1122,6 +1192,16 @@ class PythonEnvironmentTest {
     }
 
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
+    private fun <T> withSystemProperty(name: String, value: String?, block: () -> T): T {
+        val previous = System.getProperty(name)
+        if (value == null) System.clearProperty(name) else System.setProperty(name, value)
+        try {
+            return block()
+        } finally {
+            if (previous == null) System.clearProperty(name) else System.setProperty(name, previous)
+        }
+    }
+
     private fun probePayload(vararg values: String): String {
         val hexValues = values.joinToString(" ") { it.toByteArray(filesystemCharset).toHexString() }
         return "${PythonEnvironment.PROBE_BEGIN}\n$hexValues\n${PythonEnvironment.PROBE_END}"

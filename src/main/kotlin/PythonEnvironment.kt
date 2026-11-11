@@ -509,7 +509,7 @@ private fun String.hexToPath(): String? {
  * might tell why the embedded CPython, configured the same way, fails.
  * When the native library of Jep cannot load the shared [pythonLibrary] of the Python, see [pythonLibrary],
  * it tells to put its directory on `LD_LIBRARY_PATH`,
- * and keeps the [libraryPreloadFailure] of [loadPythonLibrary], if any, as suppressed.
+ * or the [libraryPreloadFailure] of [loadPythonLibrary], if any, also kept as suppressed.
  * The symbols of the [pythonLibrary] loaded by [loadPythonLibrary], if [libraryLocalSymbols],
  * are made global in the first interpreter, see [makePythonLibraryGlobal].
  */
@@ -620,7 +620,10 @@ internal class EmbeddedPythonStarter(
         // e.g. libjep.so: libpython3.13.so.1.0: cannot open shared object file, or Library not loaded on macOS,
         // also as the cause of the Error of Jep retrying to initialize CPython
         val library = pythonLibrary
-        val libraryAdvice = if (
+        val libraryAdvice = if (libraryPreloadFailure != null) {
+            // LD_LIBRARY_PATH would not help, as the loader would fail to load it the same way, e.g. of another architecture
+            "\nCannot load the libpython of this Python: ${libraryPreloadFailure.message ?: libraryPreloadFailure}"
+        } else if (
             library != null && generateSequence(cause) { it.cause }.any {
                 val message = it.message ?: ""
                 it is UnsatisfiedLinkError && library.fileName.toString() in message &&

@@ -28,10 +28,13 @@ import kotlin.io.path.isSameFileAs
 import kotlin.io.path.readBytes
 
 /**
- * The system property which, set, keeps [loadPythonLibrary] from using the foreign linker of Java 22,
+ * The system property which, set to `true`, keeps [loadPythonLibrary] from using the foreign linker of Java 22,
  * a test seam of loading `libpython` like on Java 17 to 21.
  */
 internal const val NO_FOREIGN_LINKER_PROPERTY = "xemantic.kotlin.script.python.noForeignLinker"
+
+/** Whether [loadPythonLibrary] may use the foreign linker, unless the [NO_FOREIGN_LINKER_PROPERTY] is `true`. */
+internal fun foreignLinkerEnabled(): Boolean = !java.lang.Boolean.getBoolean(NO_FOREIGN_LINKER_PROPERTY)
 
 /**
  * The shared `libpython` of the [soname] in the library [directory] of a Python, see [PythonEnvironment.probeCommand],
@@ -45,7 +48,7 @@ internal fun pythonLibrary(directory: String, soname: String): Path? {
 /**
  * The result of [loadPythonLibrary].
  *
- * @property failure the failure to load the library, e.g. of another architecture,
+ * @property failure the failure to load the library, e.g. of another architecture, or denied by the JVM,
  * kept to tell why Jep cannot load its native library, if it cannot.
  * @property localSymbols whether the library is loaded with local symbols, to be made global once Python runs,
  * see [EmbeddedPythonStarter].
@@ -73,13 +76,21 @@ internal class PythonLibraryLoading(
  * before CPython starts, also for a C extension imported at its startup, e.g. by a `.pth` file of the `site-packages`.
  * On Java 17 to 21, it is loaded with [System.load], and made global in the first interpreter,
  * so only after the startup of CPython.
+ * The [load] of the library is a test seam of [System.load].
  */
-internal fun loadPythonLibrary(library: Path): PythonLibraryLoading {
-    if (System.getProperty(NO_FOREIGN_LINKER_PROPERTY) == null && loadGlobally(library)) return PythonLibraryLoading()
+internal fun loadPythonLibrary(
+    library: Path,
+    load: (String) -> Unit = System::load
+): PythonLibraryLoading {
+    if (foreignLinkerEnabled() && loadGlobally(library)) return PythonLibraryLoading()
     return try {
-        System.load(library.toString())
+        load(library.toString())
         PythonLibraryLoading(localSymbols = true)
     } catch (e: UnsatisfiedLinkError) {
+        PythonLibraryLoading(failure = e)
+    } catch (e: RuntimeException) {
+        // e.g. an IllegalCallerException with --illegal-native-access=deny,
+        // which then fails loading the native library of Jep as well, reported as a failure of the startup
         PythonLibraryLoading(failure = e)
     }
 }
@@ -90,19 +101,19 @@ internal fun loadPythonLibrary(library: Path): PythonLibraryLoading {
  *
  * Like the loader, it takes the first file of the soname in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
  * then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
- * of the directories configured in `/etc/ld.so.conf`, and then in the system directories.
+ * of the directories configured in `/etc/ld.so.conf`, read only if needed, and then in the system directories.
  * It does not know the `RUNPATH` of the native library of Jep, e.g. of conda,
  * with which the library would be loaded when not needed.
  */
 internal fun loaderFinds(
     library: Path,
     libraryPath: String? = System.getenv("LD_LIBRARY_PATH"),
-    cache: ByteArray? = readLoaderCache()
+    cache: () -> ByteArray? = ::readLoaderCache
 ): Boolean {
     val soname = library.fileName.toString()
-    val candidates = libraryPath.orEmpty().split(':').filter { it.isNotEmpty() }.map { Path(it, soname) } +
-        cachedLibraries(cache, soname) +
-        SYSTEM_LIBRARY_DIRECTORIES.map { Path(it, soname) }
+    val candidates = libraryPath.orEmpty().split(':').asSequence().filter { it.isNotEmpty() }.map { Path(it, soname) } +
+        sequence { yieldAll(cachedLibraries(cache(), soname)) } +
+        SYSTEM_LIBRARY_DIRECTORIES.asSequence().map { Path(it, soname) }
     val found = candidates.firstOrNull { it.isRegularFile() } ?: return false
     return try {
         found.isSameFileAs(library)
