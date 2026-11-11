@@ -186,6 +186,8 @@ otherwise the code can declare it as a dependency, see below.
   does not see the dependencies already installed,
   so it installs them again, with all their own dependencies, whenever another dependency requires them,
   and can fail replacing the files of a module already imported, like a `.pyd` file of `numpy` on Windows.
+  So does pip 22.2 or newer with a `target` configured for its `install` command, e.g. in `pip.conf`,
+  while its configured `upgrade`, `ignore-installed` and `force-reinstall` options, and `PIP_TARGET`, are ignored.
   The dependencies are installed
   into `PythonEnvironment.dependencyDirectory`,
   by default the directory of the `xemantic.kotlin.script.python.dependencyDirectory` system property, if set,

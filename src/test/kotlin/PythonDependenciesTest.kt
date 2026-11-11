@@ -129,6 +129,40 @@ class PythonDependenciesTest {
         return output
     }
 
+    /**
+     * A git repository on the `main` branch, also tagged `v1`,
+     * of the project of the distribution [name] 1.0, in the [subdirectory], if given, with its `ANSWER` 42.
+     */
+    private fun gitRepository(name: String, subdirectory: String? = null): Path {
+        val repository = sources.resolve("repository")
+        val project = (if (subdirectory != null) repository.resolve(subdirectory) else repository).createDirectories()
+        project.resolve("pyproject.toml").writeText(
+            """
+            [build-system]
+            requires = ["setuptools"]
+            build-backend = "setuptools.build_meta"
+
+            [project]
+            name = "$name"
+            version = "1.0"
+            """.trimIndent()
+        )
+        project.resolve(name).createDirectories().resolve("__init__.py").writeText("ANSWER = 42\n")
+        val git = listOf(
+            "git", "-C", repository.toString(), "-c", "user.name=test", "-c", "user.email=test@example.com"
+        )
+        listOf(
+            listOf("init", "--quiet", "-b", "main"),
+            listOf("add", "."),
+            listOf("commit", "--quiet", "-m", name),
+            listOf("tag", "v1")
+        ).forEach { command ->
+            val (exitCode, output) = runProcess(git + command)
+            assert(exitCode == 0, output)
+        }
+        return repository
+    }
+
     /** Builds the source archive of the distribution [name] 1.0 into the [directory], built with setuptools. */
     private fun buildSourceArchive(directory: Path, name: String): Path {
         val archive = directory.createDirectories().resolve("$name-1.0.tar.gz")
@@ -256,7 +290,6 @@ class PythonDependenciesTest {
                 }
             }
         } finally {
-            @OptIn(ExperimentalPathApi::class)
             directory.resolve("${distribution.replace('-', '_')}-1.0.dist-info").deleteRecursively()
         }
     }
@@ -343,7 +376,6 @@ class PythonDependenciesTest {
                 }
             }
         } finally {
-            @OptIn(ExperimentalPathApi::class)
             directory.resolve("${distribution.replace('-', '_')}-1.0.dist-info").deleteRecursively()
         }
     }
@@ -719,7 +751,6 @@ class PythonDependenciesTest {
         assert(exception.message == PythonDependencies.NO_TOML_PARSER_MESSAGE)
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan in working directory with modules shadowing the ones it imports`() {
         // given
@@ -937,7 +968,6 @@ class PythonDependenciesTest {
         assert(installs == listOf(dependency))
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan local archive dependency as installed for unchanged content`() {
         // given
@@ -959,7 +989,6 @@ class PythonDependenciesTest {
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan local archive dependency as missing for changed content`() {
         // given
@@ -981,7 +1010,6 @@ class PythonDependenciesTest {
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan local archive dependency installed by uv as installed for unchanged change time`() {
         // given
@@ -1006,7 +1034,6 @@ class PythonDependenciesTest {
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan local archive dependency installed by uv as missing for changed change time`() {
         // given
@@ -1042,7 +1069,6 @@ class PythonDependenciesTest {
         assert(installs == listOf(dependency))
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan hashed local archive dependency installed by uv as installed`() {
         // given
@@ -1120,7 +1146,6 @@ class PythonDependenciesTest {
         assert(installs == listOf(dependency))
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan local archive dependency with unverifiable hash as missing`() {
         // given
@@ -1239,7 +1264,6 @@ class PythonDependenciesTest {
      * and also the `dist-info` directory of its [otherVersion], if given, with the same `direct_url.json`,
      * so that whichever of them `importlib.metadata` finds first matches the [dependency].
      */
-    @OptIn(ExperimentalPathApi::class)
     private fun planEntries(
         dependency: String,
         directUrl: String?,
@@ -1344,31 +1368,7 @@ class PythonDependenciesTest {
     @Test
     fun `should install dependency from subdirectory of git repository with pip`() {
         // given
-        val repository = sources.resolve("repository")
-        val project = repository.resolve("libs").resolve("subpkg").createDirectories()
-        project.resolve("pyproject.toml").writeText(
-            """
-            [build-system]
-            requires = ["setuptools"]
-            build-backend = "setuptools.build_meta"
-
-            [project]
-            name = "subpkg"
-            version = "1.0"
-            """.trimIndent()
-        )
-        project.resolve("subpkg").createDirectories().resolve("__init__.py").writeText("ANSWER = 42\n")
-        val git = listOf(
-            "git", "-C", repository.toString(), "-c", "user.name=test", "-c", "user.email=test@example.com"
-        )
-        listOf(
-            listOf("init", "--quiet", "-b", "main"),
-            listOf("add", "."),
-            listOf("commit", "--quiet", "-m", "subpkg")
-        ).forEach { command ->
-            val (gitExitCode, gitOutput) = runProcess(git + command)
-            assert(gitExitCode == 0, gitOutput)
-        }
+        val repository = gitRepository("subpkg", subdirectory = "libs/subpkg")
 
         // when
         val (exitCode, output) = pipInstall("subpkg @ git+${repository.toUri()}@main#subdirectory=libs/subpkg")
@@ -1376,6 +1376,68 @@ class PythonDependenciesTest {
         // then
         assert(exitCode == 0, output)
         assert(pythonOfDirectory("import subpkg; print(subpkg.ANSWER)") == "42")
+    }
+
+    /**
+     * pip records the requested revision of a git requirement in its `direct_url.json`,
+     * which the plan compares with the one of the dependency,
+     * so it has to be installed from the requirement itself, not pinned to the resolved commit.
+     */
+    @Test
+    fun `should plan git dependency on tag installed with pip as installed`() {
+        // given
+        val dependency = "gitpkg @ git+${gitRepository("gitpkg").toUri().toString().removeSuffix("/")}@v1"
+        pipInstalled(dependency)
+
+        // when
+        val installs = PythonDependencies.plan("dependencies = ['$dependency']\n", directory.toString(), emptyList())
+            .filter { it.first == "install" }
+
+        // then
+        assert(installs.isEmpty())
+    }
+
+    @Test
+    fun `should plan git dependency without revision installed with pip as installed`() {
+        // given
+        val dependency = "gitpkg @ git+${gitRepository("gitpkg").toUri().toString().removeSuffix("/")}"
+        pipInstalled(dependency)
+
+        // when
+        val installs = PythonDependencies.plan("dependencies = ['$dependency']\n", directory.toString(), emptyList())
+            .filter { it.first == "install" }
+
+        // then
+        assert(installs.isEmpty())
+    }
+
+    /**
+     * pip ignores the installed distributions with `--upgrade`, `--ignore-installed`, `--force-reinstall` or `--target`,
+     * which can be configured by the environment variables, and pip.conf, whose options they override.
+     */
+    @Test
+    fun `should keep distribution of dependency directory with pip configured to ignore installed ones`() {
+        // given
+        pipInstalled("idna==3.10")
+        // a reinstalled module would lose the marker
+        val idnaModule = directory.resolve("idna").resolve("__init__.py")
+        idnaModule.appendText("\n# kept\n")
+
+        // when
+        val (exitCode, output) = pipInstall(
+            "requests",
+            environment = mapOf(
+                "PIP_UPGRADE" to "1",
+                "PIP_IGNORE_INSTALLED" to "1",
+                "PIP_FORCE_REINSTALL" to "1",
+                "PIP_TARGET" to sources.resolve("target").toString()
+            )
+        )
+
+        // then
+        assert(exitCode == 0, output)
+        assert(directory.resolve("requests").exists())
+        assert(idnaModule.readText().endsWith("\n# kept\n"))
     }
 
     /**
@@ -1484,7 +1546,6 @@ class PythonDependenciesTest {
     }
 
     /** pip and its subprocesses run with `-c`, which would import a `pip` package of the working directory. */
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should install with pip in working directory with pip package shadowing it`() {
         // given
@@ -1535,6 +1596,15 @@ class PythonDependenciesTest {
             redacted == "pkg @ git+https://****@gitlab.com/org/private.git, " +
                 "authpkg @ http://****@127.0.0.1:8765/authpkg-1.0-py3-none-any.whl, idna"
         )
+    }
+
+    @Test
+    fun `should not redact URL without credentials with at sign in query`() {
+        // when
+        val redacted = PythonDependencies.redactCredentials("pkg @ https://host?token=a@b, other @ https://host#x@y")
+
+        // then
+        assert(redacted == "pkg @ https://host?token=a@b, other @ https://host#x@y")
     }
 
     @Test
@@ -1633,27 +1703,6 @@ class PythonDependenciesTest {
 
         // then
         assert(requirement == "pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git@0123abcd#subdirectory=libs/pkg")
-    }
-
-    /** Each requested URL can have its own credentials, also for the same host as another one. */
-    @Test
-    fun `should pin requested distribution from URL with credentials of its requirement over other one of same host`() {
-        // when
-        val requirement = pinnedRequirement(
-            """
-            {
-              "metadata": {"name": "b", "version": "1.0"},
-              "is_direct": true,
-              "requested": true,
-              "download_info": {"url": "https://host/b-1.0-py3-none-any.whl", "archive_info": {}}
-            }
-            """.trimIndent(),
-            "a @ https://u1:t1@host/a-1.0-py3-none-any.whl",
-            "B @ https://u2:t2@host/b-1.0-py3-none-any.whl"
-        )
-
-        // then
-        assert(requirement == "b @ https://u2:t2@host/b-1.0-py3-none-any.whl")
     }
 
     @Test
