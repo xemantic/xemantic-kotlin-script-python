@@ -26,7 +26,7 @@ import kotlin.io.path.readText
 
 /**
  * Runs the [mainClass] of the test classpath in a new JVM, with the [jvmArguments],
- * and with the [environment] variables added to the inherited ones,
+ * and with the [environment] variables added to the inherited ones, or removed from them, when `null`,
  * unlike [runProcess], which would put Python in UTF-8 mode,
  * writing the [input] to its standard input, as UTF-8.
  *
@@ -38,7 +38,7 @@ import kotlin.io.path.readText
 internal fun runInJvm(
     mainClass: String,
     input: String,
-    environment: Map<String, String>,
+    environment: Map<String, String?>,
     jvmArguments: List<String> = emptyList()
 ): Pair<Int, String> {
     val java = Path(System.getProperty("java.home"), "bin", "java").toString()
@@ -49,7 +49,9 @@ internal fun runInJvm(
             listOf(java, "--enable-native-access=ALL-UNNAMED") + jvmArguments +
                 listOf("-cp", System.getProperty("java.class.path"), mainClass)
         ).redirectErrorStream(true).redirectOutput(outputFile.toFile())
-        builder.environment().putAll(environment)
+        builder.environment().apply {
+            environment.forEach { (name, value) -> if (value == null) remove(name) else put(name, value) }
+        }
         val process = builder.start()
         try {
             process.outputStream.use { it.write(input.toByteArray(Charsets.UTF_8)) }
