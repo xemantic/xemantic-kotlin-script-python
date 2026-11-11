@@ -36,7 +36,6 @@ import kotlin.io.path.Path
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
-import kotlin.io.path.isRegularFile
 import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.name
 import kotlin.io.path.readText
@@ -103,9 +102,14 @@ public object PythonEnvironment {
         val library = jepLibrary(Path(jepLocation), python, probe.externallyManaged)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
-        val preloadFailure = preloadPythonLibrary(pythonLibrary(probe.libraryDirectory, probe.librarySoname))
+        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
+        val loading = if (pythonLibrary != null && System.getProperty("os.name").startsWith("Linux")) {
+            loadPythonLibrary(pythonLibrary)
+        } else PythonLibraryLoading()
         this.executable = executable
-        starter = EmbeddedPythonStarter(executable, probe.error, probe.libraryDirectory, preloadFailure)
+        starter = EmbeddedPythonStarter(
+            executable, probe.error, pythonLibrary, loading.failure, loading.libraryToMakeGlobal
+        )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
         }
@@ -119,70 +123,6 @@ public object PythonEnvironment {
             )
         }
         initialized = true
-    }
-
-    /** The shared `libpython` loaded by [preloadPythonLibrary], whose symbols are not global yet. */
-    @Volatile
-    private var preloadedLibrary: Path? = null
-
-    /**
-     * Loads the shared [library] of Python, if any, before Jep loads its native library, which depends on it.
-     *
-     * On Linux, the dynamic loader finds the `libpython3.X.so.1.0` of the native library of Jep by its soname
-     * only in the system library directories, or the ones of `LD_LIBRARY_PATH`, read when the JVM starts,
-     * so not the one of a Python installed elsewhere, e.g. by uv, pyenv, conda, or `actions/setup-python`;
-     * once loaded by its path, the loader takes the library of the same soname instead,
-     * also over another Python of the same version in the system library directories.
-     *
-     * @return the failure to load the [library], e.g. of another architecture,
-     * kept to tell why Jep cannot load its native library, if it cannot, or `null`.
-     */
-    private fun preloadPythonLibrary(library: Path?): UnsatisfiedLinkError? {
-        if (library == null) return null
-        return try {
-            System.load(library.toString())
-            preloadedLibrary = library
-            null
-        } catch (e: UnsatisfiedLinkError) {
-            e
-        }
-    }
-
-    /**
-     * Makes the symbols of the shared `libpython` loaded by [preloadPythonLibrary], if any, global,
-     * run in the [interpreter], the first one, before any code of the user.
-     *
-     * The JVM loads a native library with `RTLD_LOCAL`, so the symbols of the preloaded `libpython`
-     * are not global, while a C extension module on Linux is not linked to `libpython`,
-     * e.g. the ones of numpy, or of the standard library of most Pythons, `_ctypes` among them,
-     * and would fail to import with `undefined symbol: PyExc_ValueError`.
-     * Jep makes `libpython` global itself, but finds it by its file name,
-     * which the loader cannot find, like its soname.
-     * The JVM of Java 17 cannot load a library with `RTLD_GLOBAL`, but CPython can,
-     * loading an extension module with the flags of `sys.setdlopenflags`:
-     * loading the already loaded `libpython` as one makes it global,
-     * before it fails as an extension module without its initialization function.
-     */
-    internal fun makePythonLibraryGlobal(interpreter: Interpreter) {
-        val library = preloadedLibrary ?: return
-        interpreter.exec(
-            """
-            |def _xemantic_make_python_library_global():
-            |    import _imp, os, sys
-            |    from importlib.machinery import ModuleSpec
-            |    flags = sys.getdlopenflags()
-            |    sys.setdlopenflags(flags | os.RTLD_GLOBAL)
-            |    try:
-            |        _imp.create_dynamic(ModuleSpec('_xemantic_libpython', None, origin=${pythonPath(library.toString())}))
-            |    except ImportError:
-            |        pass
-            |    finally:
-            |        sys.setdlopenflags(flags)
-            |_xemantic_make_python_library_global()
-            |del _xemantic_make_python_library_global
-            |""".trimMargin()
-        )
-        preloadedLibrary = null
     }
 
     /**
@@ -560,38 +500,28 @@ private fun String.hexToPath(): String? {
 }
 
 /**
- * The shared `libpython` of the [soname] in the library [directory] of a Python, see [PythonEnvironment.probeCommand],
- * to be loaded before the native library of Jep, see [PythonEnvironment.preloadPythonLibrary],
- * or `null` if there is none, e.g. of a Python linked to `libpython` statically, with `libpython3.X.a` as its soname.
- *
- * Not on Windows, where the native library of Jep finds the DLL of Python next to the `python.exe`,
- * nor on macOS, where it refers to `libpython` by its path, e.g. in a framework,
- * and the same library loaded by another path, e.g. of a symbolic link, could be loaded twice.
- */
-internal fun pythonLibrary(
-    directory: String,
-    soname: String,
-    osName: String = System.getProperty("os.name")
-): Path? {
-    if (osName.startsWith("Windows") || osName.startsWith("Mac")) return null
-    if (directory.isEmpty() || soname.isEmpty() || soname.endsWith(".a")) return null
-    return Path(directory, soname).takeIf { it.isRegularFile() }
-}
-
-/**
  * Creates the interpreters of the embedded CPython of the Python [executable],
  * telling a failure of its startup with what the probe of the [executable] wrote to the standard error, if anything,
  * as a warning of a successful probe, e.g. `Could not find platform libraries` of a wrong `PYTHONHOME`,
  * might tell why the embedded CPython, configured the same way, fails.
- * When the native library of Jep cannot load `libpython`, it tells the [libraryDirectory] of `libpython`,
- * and keeps the [libraryPreloadFailure] of [PythonEnvironment.preloadPythonLibrary], if any, as suppressed.
+ * When the native library of Jep cannot load the shared [pythonLibrary] of the Python, see [pythonLibrary],
+ * it tells to put its directory on `LD_LIBRARY_PATH`,
+ * and keeps the [libraryPreloadFailure] of [loadPythonLibrary], if any, as suppressed.
+ * The symbols of the `libpython` loaded locally by [loadPythonLibrary], if any,
+ * are made global in the first interpreter, see [makePythonLibraryGlobal].
  */
 internal class EmbeddedPythonStarter(
     private val executable: String,
     private val probeError: String,
-    private val libraryDirectory: String = "",
-    private val libraryPreloadFailure: UnsatisfiedLinkError? = null
+    private val pythonLibrary: Path? = null,
+    private val libraryPreloadFailure: Throwable? = null,
+    libraryToMakeGlobal: Path? = null
 ) {
+
+    /** The `libpython` to make global in the first interpreter, see [makePythonLibraryGlobal]. */
+    @Volatile
+    private var libraryToMakeGlobal: Path? = libraryToMakeGlobal
+
 
     /** Whether an interpreter has been created, so that the embedded CPython has started. */
     @Volatile
@@ -620,6 +550,7 @@ internal class EmbeddedPythonStarter(
         }
         started = true
         try {
+            if (interpreter is Interpreter) makePythonLibraryGlobal(interpreter)
             check(interpreter)
         } catch (e: Throwable) {
             try {
@@ -632,16 +563,65 @@ internal class EmbeddedPythonStarter(
         return interpreter
     }
 
+    /**
+     * Makes the symbols of the `libpython` loaded locally by [loadPythonLibrary], if any, global,
+     * in the first [interpreter], before any code of the user, but after the startup of Python,
+     * see [loadPythonLibrary].
+     *
+     * CPython can load a library with `RTLD_GLOBAL`,
+     * loading an extension module with the flags of `sys.setdlopenflags`:
+     * loading the already loaded `libpython` as one makes it global,
+     * before it fails as an extension module without its initialization function.
+     * It is best-effort: a failure is only logged, as the code of the user might not need any C extension.
+     */
+    private fun makePythonLibraryGlobal(interpreter: Interpreter) {
+        val library = libraryToMakeGlobal ?: return
+        libraryToMakeGlobal = null
+        try {
+            interpreter.exec(
+                """
+                |def _xemantic_make_python_library_global():
+                |    import _imp, os, sys
+                |    from importlib.machinery import ModuleSpec
+                |    flags = sys.getdlopenflags()
+                |    sys.setdlopenflags(flags | os.RTLD_GLOBAL)
+                |    try:
+                |        _imp.create_dynamic(ModuleSpec('_xemantic_libpython', None, origin=${pythonPath(library.toString())}))
+                |    except ImportError:
+                |        pass
+                |    finally:
+                |        sys.setdlopenflags(flags)
+                |try:
+                |    _xemantic_make_python_library_global()
+                |finally:
+                |    del _xemantic_make_python_library_global
+                |""".trimMargin()
+            )
+        } catch (e: Exception) {
+            System.getLogger(EmbeddedPythonStarter::class.java.name).log(
+                System.Logger.Level.WARNING,
+                "Cannot make the symbols of $library global, " +
+                    "a C extension module might fail to import with an undefined symbol, " +
+                    "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts",
+                e
+            )
+        }
+    }
+
     private fun startupFailure(cause: Throwable): IllegalStateException {
         // Jep wraps the failure of initializing CPython in an Error, whose message is its toString()
         val reason = cause.cause?.takeIf { cause.message == it.toString() } ?: cause
         val headline = "Cannot initialize the embedded Python $executable: ${reason.message ?: reason}"
-        // e.g. libjep.so: libpython3.13.so.1.0: cannot open shared object file
+        // e.g. libjep.so: libpython3.13.so.1.0: cannot open shared object file,
+        // also as the cause of the Error of Jep retrying to initialize CPython
+        val library = pythonLibrary
         val libraryAdvice = if (
-            libraryDirectory.isNotEmpty() && reason is UnsatisfiedLinkError && reason.message?.contains("libpython") == true
+            library != null && generateSequence(cause) { it.cause }.any {
+                it is UnsatisfiedLinkError && it.message?.contains(library.fileName.toString()) == true
+            }
         ) {
-            "\nThe dynamic loader cannot find the libpython of this Python in $libraryDirectory, " +
-                "put this directory on LD_LIBRARY_PATH (DYLD_LIBRARY_PATH on macOS) before the JVM starts."
+            "\nThe dynamic loader cannot load ${library.fileName} of this Python, " +
+                "put its directory ${library.parent} on LD_LIBRARY_PATH (DYLD_LIBRARY_PATH on macOS) before the JVM starts."
         } else ""
         val message = headline + libraryAdvice
         return IllegalStateException(

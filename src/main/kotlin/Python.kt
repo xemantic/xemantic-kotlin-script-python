@@ -301,10 +301,7 @@ public class Python private constructor(
                         // assigned only once checked, so that a later call does not use an interpreter failing the check
                         PythonEnvironment.starter.createInterpreter(
                             create = { SharedInterpreter() },
-                            check = {
-                                PythonEnvironment.checkUtf8Mode(it)
-                                PythonEnvironment.makePythonLibraryGlobal(it)
-                            }
+                            check = { PythonEnvironment.checkUtf8Mode(it) }
                         ).also { interpreter = it }
                     }
                     interpreter.block()

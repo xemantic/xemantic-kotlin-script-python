@@ -22,7 +22,8 @@ On Linux, a Python outside the system library directories, e.g. installed by `uv
 does not need its `lib` directory in `LD_LIBRARY_PATH`,
 as `PythonEnvironment` loads its `libpython` before `libjep.so` ([#54](https://github.com/xemantic/xemantic-kotlin-script-python/issues/54)).
 `actions/setup-python` sets `LD_LIBRARY_PATH` on CI anyway,
-so `PythonLibraryTest` removes it in the JVM it starts, to test the loading with such a base Python.
+so `PythonLibraryTest` removes it in the JVM it starts, to test the loading with such a base Python,
+importing a C extension it compiles with `cc`, which tests nothing with a Python of the system library directories.
 `pyenv` builds Python without a shared `libpython` by default,
 build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
 
