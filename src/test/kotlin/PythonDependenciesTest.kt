@@ -598,22 +598,137 @@ class PythonDependenciesTest {
         }
 
         // then
+        // a base Python can write a warning to the standard error at startup, which comes first
+        val message = exception.message!!
         assert(
-            exception.message == "Cannot read the plan of the Python dependencies from its output:\nunexpected output"
+            message.startsWith("Cannot read the plan of the Python dependencies from its output:\n") &&
+                "unexpected output" in message
         )
+    }
+
+    @Test
+    fun `should fail plan with message of limited output when its output has no plan`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        val command = pythonCommand(PythonEnvironment.executable, "print('x' * 1_000_000)", directory)
+
+        // when
+        val exception = assertFailsWith<PythonDependencyException> {
+            PythonDependencies.plan("dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command)
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot read the plan of the Python dependencies from its output:\nxxx") &&
+                message.length <= 100 + PythonDependencies.PLAN_OUTPUT_LIMIT &&
+                message.endsWith("[truncated]")
+        )
+    }
+
+    @Test
+    fun `should plan dependency with line break in its URL`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // the packaging library accepts a line break within the URL of a requirement
+        val dependency = "nonexistent-dependency @ https://example.com/x\nconstraint"
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency @ https://example.com/x\\nconstraint\"]\n",
+            directory,
+            emptyList()
+        )
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to dependency))
+    }
+
+    @Test
+    fun `should plan dependency containing end line of plan without packaging library`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // without the packaging library, any string is a dependency, here containing the end line of the plan
+        val code = "import sys; sys.modules.update(dict.fromkeys(['packaging', 'pip'], None))\n" +
+            PythonDependencies.PLAN
+        val dependency = "nonexistent-dependency\n${PythonDependencies.PLAN_END}"
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\\n${PythonDependencies.PLAN_END}\", \"other-nonexistent\"]\n",
+            directory,
+            emptyList(),
+            pythonCommand(PythonEnvironment.executable, code, directory)
+        )
+
+        // then
+        assert(
+            plan.filter { it.first == "install" } == listOf("install" to dependency, "install" to "other-nonexistent")
+        )
+    }
+
+    @Test
+    fun `should plan when Python has no standard output stream`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory.toString()
+        // like a sitecustomize module discarding the standard output, or pythonw.exe on Windows
+        val command = pythonCommand(
+            PythonEnvironment.executable,
+            "import sys; sys.stdout = sys.__stdout__ = None\n" + PythonDependencies.PLAN,
+            directory
+        )
+
+        // when
+        val plan = PythonDependencies.plan(
+            "dependencies = [\"nonexistent-dependency\"]\n", directory, emptyList(), command
+        )
+
+        // then
+        assert(plan.filter { it.first == "install" } == listOf("install" to "nonexistent-dependency"))
     }
 
     @Test
     fun `should parse plan output with output before and after plan`() {
         // given
         val output = "noise\n${PythonDependencies.PLAN_BEGIN}\n" +
-            "install requests\nconstraint numpy==2.0.0\n${PythonDependencies.PLAN_END}\nmore noise"
+            "${planEntry("install requests")}\n${planEntry("constraint numpy==2.0.0")}\n" +
+            "${PythonDependencies.PLAN_END}\nmore noise"
 
         // when
         val plan = PythonDependencies.parsePlanOutput(output)
 
         // then
         assert(plan == listOf("install" to "requests", "constraint" to "numpy==2.0.0"))
+    }
+
+    @Test
+    fun `should parse plan output with entry containing line breaks and non-ASCII characters`() {
+        // given
+        val output = "${PythonDependencies.PLAN_BEGIN}\n" +
+            "${planEntry("install zażółć @ https://example.com/x\n${PythonDependencies.PLAN_END}")}\n" +
+            PythonDependencies.PLAN_END
+
+        // when
+        val plan = PythonDependencies.parsePlanOutput(output)
+
+        // then
+        assert(plan == listOf("install" to "zażółć @ https://example.com/x\n${PythonDependencies.PLAN_END}"))
+    }
+
+    @Test
+    fun `should not parse plan output with entry which is not hex`() {
+        // given
+        val output = "${PythonDependencies.PLAN_BEGIN}\ninstall requests\n${PythonDependencies.PLAN_END}"
+
+        // when
+        val plan = PythonDependencies.parsePlanOutput(output)
+
+        // then
+        assert(plan == null)
     }
 
     @Test
@@ -739,7 +854,10 @@ class PythonDependenciesTest {
             )
 
             // then
-            assert(exitCode == 0 && "install nonexistent-dependency" in output.lines())
+            assert(
+                exitCode == 0 &&
+                    ("install" to "nonexistent-dependency") in PythonDependencies.parsePlanOutput(output).orEmpty()
+            )
         } finally {
             workingDirectory.deleteRecursively()
         }
@@ -769,6 +887,9 @@ class PythonDependenciesTest {
             workingDirectory.deleteRecursively()
         }
     }
+
+    /** The [entry] of the plan, as written by the [PythonDependencies.PLAN]: the hex digits of its UTF-8 bytes. */
+    private fun planEntry(entry: String): String = entry.encodeToByteArray().toHexString()
 
     private companion object {
 

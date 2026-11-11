@@ -126,6 +126,26 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
+    fun `should probe Python whose sitecustomize discards stdout`() {
+        // given
+        val expected = PythonEnvironment.probePython(venvPython)
+        val directory = createTempDirectory("python-probe")
+        // like pythonw.exe on Windows, which has no standard output stream
+        val python = pythonWithSitecustomize(directory, "import sys\nsys.stdout = sys.__stdout__ = None\n")
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe == expected)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
     fun `should probe Python whose sitecustomize replaces stdout with wrapper without buffer`() {
         // given
         val expected = PythonEnvironment.probePython(venvPython)

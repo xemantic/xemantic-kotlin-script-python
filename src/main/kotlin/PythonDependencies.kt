@@ -24,6 +24,7 @@ import org.intellij.lang.annotations.Language
 import java.io.File
 import java.io.IOException
 import java.nio.channels.FileChannel
+import java.nio.charset.CharacterCodingException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.WRITE
@@ -227,7 +228,7 @@ internal object PythonDependencies {
         if (result.exitCode != 0) throw PythonDependencyException(result.failureOutput)
         return parsePlanOutput(result.output) ?: throw PythonDependencyException(
             "Cannot read the plan of the Python dependencies from its output" +
-                if (result.failureOutput.isEmpty()) "" else ":\n${result.failureOutput}"
+                if (result.failureOutput.isEmpty()) "" else ":\n${limitOutput(result.failureOutput, PLAN_OUTPUT_LIMIT)}"
         )
     }
 
@@ -237,17 +238,29 @@ internal object PythonDependencies {
      * as anything else run by Python, e.g. a `sitecustomize` module or a `.pth` file,
      * can write to the standard output as well, before or after them.
      *
-     * @return the entries, or `null` if the [output] has no plan.
+     * @return the entries, or `null` if the [output] has no plan, or an entry is not the hex digits of UTF-8.
      */
     internal fun parsePlanOutput(output: String): List<Pair<String, String>>? =
         framedOutput(output, PLAN_BEGIN, PLAN_END)
             ?.lines()
             ?.filter { it.isNotBlank() }
-            ?.map { it.substringBefore(' ') to it.substringAfter(' ') }
+            ?.map { line ->
+                val entry = try {
+                    line.hexToByteArray().decodeToString(throwOnInvalidSequence = true)
+                } catch (_: IllegalArgumentException) {
+                    return null
+                } catch (_: CharacterCodingException) {
+                    return null
+                }
+                entry.substringBefore(' ') to entry.substringAfter(' ')
+            }
 
     internal const val PLAN_BEGIN = "--- xemantic-kotlin-script-python plan begin ---"
 
     internal const val PLAN_END = "--- xemantic-kotlin-script-python plan end ---"
+
+    /** The maximum length of the output of the [PLAN] in the message of a failure to read the plan. */
+    internal const val PLAN_OUTPUT_LIMIT = 8192
 
     /** The command running the [PLAN] for the dependency [directory]. */
     fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
@@ -318,17 +331,19 @@ internal object PythonDependencies {
         "Cannot read '# /// script' metadata: Python 3.11+ is required, or the tomli or pip package before 3.11"
 
     /**
-     * Prints the dependencies to install, as `install <requirement>`,
+     * Writes the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
      * or exits with the error.
-     * The lines are written between the [PLAN_BEGIN] and [PLAN_END] lines, like the ones of the
-     * [PythonEnvironment.probeCommand], with an empty line before them, as bytes, to the original standard output.
+     * Each entry is a line of the hex digits of its UTF-8 bytes, so that no requirement can break the lines,
+     * e.g. with a line break within its URL, accepted by the `packaging` library.
+     * The lines are written by the [FRAMED_WRITER] between the [PLAN_BEGIN] and [PLAN_END] lines,
+     * after a newline, in case the output written before does not end with a newline.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
     @Language("python")
-    internal val PLAN = """
+    internal val PLAN = FRAMED_WRITER + """
         import json, sys
 
         # before any import which can fail, so that the input is always read
@@ -396,12 +411,7 @@ internal object PythonDependencies {
                     constraints.setdefault(name, distribution.version)
             plan += [f"install {dependency}" for dependency in missing]
             plan += [f"constraint {name}=={version}" for name, version in constraints.items()]
-        sys.stdout.flush()
-        sys.__stdout__.flush()
-        sys.__stdout__.buffer.write(
-            ("\n$PLAN_BEGIN\n" + "\n".join(plan) + "\n$PLAN_END\n").encode("utf-8")
-        )
-        sys.__stdout__.flush()
+        write_framed("$PLAN_BEGIN", [entry.encode("utf-8").hex() for entry in plan], "$PLAN_END")
     """.trimIndent()
 
 }

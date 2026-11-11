@@ -21,6 +21,7 @@ package com.xemantic.kotlin.script.python
 import jep.Interpreter
 import jep.MainInterpreter
 import jep.PyConfig
+import org.intellij.lang.annotations.Language
 import java.io.IOException
 import java.io.InputStream
 import java.io.Reader
@@ -232,20 +233,8 @@ public object PythonEnvironment {
             "Python cannot tell the path of its executable (sys.executable is empty): $python"
         }
         // limited, as it is kept for the lifetime of the JVM; a warning of Python at startup comes first
-        return probe.copy(error = limitProbeError(result.error))
+        return probe.copy(error = limitOutput(result.error, PROBE_ERROR_LIMIT))
     }
-
-    /** The [error] of the probe, limited to [PROBE_ERROR_LIMIT] characters, including the note of truncation. */
-    private fun limitProbeError(error: String): String {
-        if (error.length <= PROBE_ERROR_LIMIT) return error
-        val end = (PROBE_ERROR_LIMIT - PROBE_ERROR_TRUNCATED.length).let {
-            // not between the two chars of a surrogate pair
-            if (error[it - 1].isHighSurrogate()) it - 1 else it
-        }
-        return error.substring(0, end) + PROBE_ERROR_TRUNCATED
-    }
-
-    private const val PROBE_ERROR_TRUNCATED = "\n[truncated]"
 
     private fun withOutput(headline: String, output: String) =
         if (output.isEmpty()) headline else "$headline\n$output"
@@ -283,14 +272,11 @@ public object PythonEnvironment {
      * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
      * or the [PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE] if the Python is externally managed,
      * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
-     * The lines are written with an empty line before them, in case the standard output written before does not end with a newline,
-     * and as bytes, without the newline translation of the text mode, e.g. on Windows,
-     * to the original standard output, as `sys.stdout` might be replaced, e.g. by a `sitecustomize` module,
-     * with a stream which has no `buffer`, or which does not write to the standard output at all.
+     * The lines are written by the [FRAMED_WRITER].
      */
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
-        """
+        FRAMED_WRITER + """
         |import importlib.util, os, sys, sysconfig
         |externally_managed = sys.prefix == sys.base_prefix and os.path.isfile(
         |    os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
@@ -310,10 +296,7 @@ public object PythonEnvironment {
         |    '1' if externally_managed else '',
         |]
         |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
-        |sys.stdout.flush()
-        |sys.__stdout__.flush()
-        |sys.__stdout__.buffer.write(('\n$PROBE_BEGIN\n' + payload + '\n$PROBE_END\n').encode('utf-8'))
-        |sys.__stdout__.flush()
+        |write_framed('$PROBE_BEGIN', [payload], '$PROBE_END')
         |""".trimMargin()
     )
 
@@ -375,11 +358,46 @@ internal fun pythonCommand(python: String, code: String, vararg arguments: Strin
     *arguments
 )
 
+/** The [output] of a process, limited to [limit] characters, including the note of truncation. */
+internal fun limitOutput(output: String, limit: Int): String {
+    if (output.length <= limit) return output
+    val end = (limit - OUTPUT_TRUNCATED.length).let {
+        // not between the two chars of a surrogate pair
+        if (output[it - 1].isHighSurrogate()) it - 1 else it
+    }
+    return output.substring(0, end) + OUTPUT_TRUNCATED
+}
+
+private const val OUTPUT_TRUNCATED = "\n[truncated]"
+
+/**
+ * The Python code defining `write_framed(begin, lines, end)`, prepended to the code of a process
+ * whose output is read with [framedOutput]: it writes the `lines`, which must not contain a line break,
+ * between the `begin` and `end` lines, after a newline,
+ * in case the output written before does not end with a newline, e.g. of a `sitecustomize` module or a `.pth` file.
+ * It flushes the standard output streams first, so that their output comes before,
+ * and writes the bytes directly to the file descriptor of the standard output:
+ * without the newline translation of the text mode, e.g. on Windows, and also when `sys.stdout` is replaced,
+ * e.g. by a `sitecustomize` module, with a stream which has no `buffer`, writes elsewhere, or is `None`,
+ * like `sys.__stdout__` of `pythonw.exe` on Windows.
+ */
+@Language("python")
+internal val FRAMED_WRITER = """
+    def write_framed(begin, lines, end):
+        import os, sys
+        for stream in (sys.stdout, sys.__stdout__):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        data = ("\n" + begin + "\n" + "\n".join(lines) + "\n" + end + "\n").encode("utf-8")
+        while data:
+            data = data[os.write(1, data):]
+""".trimIndent() + "\n"
+
 /**
  * The text between the last [begin] line and the following [end] line of the trimmed standard [output]
- * of a Python process, or `null` if there are no such lines.
- * The process writes a newline before the [begin] line, so that it starts a line
- * also after an output without a trailing newline, e.g. of a `sitecustomize` module or a `.pth` file.
+ * of a Python process, written by the [FRAMED_WRITER], or `null` if there are no such lines.
  */
 internal fun framedOutput(output: String, begin: String, end: String): String? {
     // the output is trimmed, also of the newline before the first line
