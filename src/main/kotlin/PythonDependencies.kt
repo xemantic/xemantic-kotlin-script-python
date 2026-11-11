@@ -143,10 +143,9 @@ internal object PythonDependencies {
                     val missing = plan.missing()
                     if (missing.isNotEmpty()) {
                         val constraints = plan.filter { it.first == "constraint" }.map { it.second }
-                        val distInfos = distInfoSnapshot(directory.toString())
                         installMissing(missing, constraints, directory.toString())
                         // within the lock, as another process could be installing another version meanwhile
-                        if (distInfos != null) removeReplacedDistInfo(directory.toString(), distInfos)
+                        removeReplacedDistInfo(directory.toString(), plan.single { it.first == "dist-info" }.second)
                     }
                 }
             }
@@ -292,28 +291,17 @@ internal object PythonDependencies {
     private val logger = System.getLogger(PythonDependencies::class.java.name)
 
     /**
-     * The dist-info directories of the dependency [directory], before an installation,
-     * to tell the ones written by the installation in [removeReplacedDistInfo],
-     * or `null`, with a warning, if they cannot be listed.
-     */
-    internal fun distInfoSnapshot(directory: String): String? =
-        runDistInfoCommand(directory, "snapshot", input = null)
-
-    /**
      * Removes from the dependency [directory] the dist-info directories of the distributions
-     * replaced by another version by the installation since the [snapshot] of [distInfoSnapshot],
+     * replaced by another version by the installation since the [snapshot],
+     * the `dist-info` entry of the [PLAN] made before it,
      * which `pip install --target --upgrade` leaves beside the installed one, see [REPLACED_DIST_INFO],
      * or logs a warning, if they cannot be removed, as the installation itself succeeded,
      * and the [PLAN] plans a distribution with several dist-info as missing.
      */
     internal fun removeReplacedDistInfo(directory: String, snapshot: String) {
-        runDistInfoCommand(directory, "remove", input = snapshot)
-    }
-
-    private fun runDistInfoCommand(directory: String, mode: String, input: String?): String? {
         val result = runProcess(
-            pythonCommand(PythonEnvironment.executable, REPLACED_DIST_INFO, directory, mode),
-            input = input,
+            pythonCommand(PythonEnvironment.executable, REPLACED_DIST_INFO, directory),
+            input = snapshot,
             mergeErrorStream = false
         )
         if (result.exitCode != 0) {
@@ -321,9 +309,7 @@ internal object PythonDependencies {
                 System.Logger.Level.WARNING,
                 "Cannot remove the dist-info of replaced distributions from $directory:\n${result.failureOutput}"
             )
-            return null
         }
-        return result.output
     }
 
     private fun findOnPath(name: String): String? = System.getenv("PATH")
@@ -334,6 +320,7 @@ internal object PythonDependencies {
 
     /**
      * The Python functions finding the dist-info directories of the dependency directory by their distribution,
+     * and telling their identity,
      * shared by the [PLAN] and [REPLACED_DIST_INFO], importing only modules of the standard library.
      *
      * `pip install --target --upgrade` replaces the files of a distribution installed in another version,
@@ -360,19 +347,30 @@ internal object PythonDependencies {
                 if entry.lower().endswith(".dist-info") and os.path.isdir(path):
                     found.setdefault(normalized_name(entry[:-len(".dist-info")].partition("-")[0]), []).append(path)
             return found
+
+        def identity(path):
+            # with the change time, against an inode number reused for a directory written again,
+            # or None without inode numbers, e.g. on FAT
+            try:
+                status = os.stat(path)
+            except OSError:
+                return None
+            return [status.st_dev, status.st_ino, status.st_ctime_ns] if status.st_ino else None
+
+        def dist_info_snapshot(directory):
+            return {os.path.basename(path): identity(path) for paths in dist_infos(directory).values() for path in paths}
     """.trimIndent()
 
     /**
-     * Its arguments are the dependency directory and the mode:
-     * `snapshot` prints the identities of the dist-info directories, as a JSON object by their names,
-     * and `remove`, given such a snapshot, taken before an installation, on its standard input,
-     * removes the dist-info directories of a distribution which were there before the installation, unchanged,
-     * when the installation wrote another one of the distribution, and only one,
-     * as the one of the files it installed.
+     * Its argument is the dependency directory, and its standard input the `dist-info` snapshot of the [PLAN],
+     * the identities of the dist-info directories by their names, taken before an installation.
+     * It removes the dist-info directories of a distribution which the installation did not write,
+     * when it wrote one of the distribution, as the one of the files it installed,
+     * as an installation writes at most one dist-info of a distribution.
      *
      * The installer, pip or uv, writes a dist-info as a new directory, also when replacing the same version,
-     * so a dist-info is told written by the installation by its identity,
-     * which is unknown, e.g. on a file system without inode numbers, and then nothing is removed.
+     * so a dist-info is told written by the installation by its name, not in the snapshot,
+     * or by its identity, unless unknown, e.g. on a file system without inode numbers.
      * Nothing is told by the content, e.g. by `RECORD`, whose paths are relative to the layout
      * which the installer used, e.g. `../../bin/` of `pip install --target`, not to the directory.
      */
@@ -380,29 +378,15 @@ internal object PythonDependencies {
     private val REPLACED_DIST_INFO = DIST_INFOS + "\n\n" + """
         import json, shutil, sys
 
-        directory, mode = sys.argv[1], sys.argv[2]
-
-        def identity(path):
-            try:
-                status = os.stat(path)
-            except OSError:
-                return None
-            return [status.st_dev, status.st_ino] if status.st_ino else None
-
-        if mode == "snapshot":
-            print(json.dumps({
-                os.path.basename(path): identity(path)
-                for paths in dist_infos(directory).values() for path in paths
-            }))
-        else:
-            before = json.loads(sys.stdin.read())
-            for paths in dist_infos(directory).values():
-                identities = {path: identity(path) for path in paths}
-                if None in identities.values():
-                    continue
-                unchanged = [path for path in paths if before.get(os.path.basename(path)) == identities[path]]
-                if len(paths) - len(unchanged) == 1:
-                    for path in unchanged:
+        directory, before = sys.argv[1], json.loads(sys.stdin.read())
+        for paths in dist_infos(directory).values():
+            def is_written(path):
+                name = os.path.basename(path)
+                return name not in before or (before[name] is not None and identity(path) != before[name])
+            written = [path for path in paths if is_written(path)]
+            if len(written) == 1:
+                for path in paths:
+                    if path not in written:
                         # a link, not the directory it points to
                         os.unlink(path) if os.path.islink(path) else shutil.rmtree(path)
     """.trimIndent()
@@ -414,6 +398,8 @@ internal object PythonDependencies {
     /**
      * Prints the dependencies to install, as `install <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
+     * and, when something is to be installed, the identities of the dist-info directories,
+     * as `dist-info <JSON object>`, for [removeReplacedDistInfo] after the installation,
      * or exits with the error.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
@@ -453,11 +439,13 @@ internal object PythonDependencies {
 
         try:
             from packaging.requirements import Requirement, InvalidRequirement
+            from packaging.version import Version
         except ImportError:
             try:
                 from pip._vendor.packaging.requirements import Requirement, InvalidRequirement
+                from pip._vendor.packaging.version import Version
             except ImportError:
-                Requirement = None
+                Requirement = Version = None
 
         def is_missing(dependency):
             if Requirement is None:
@@ -497,9 +485,9 @@ internal object PythonDependencies {
                 return None
             return distribution
 
-        def has_imported_files(distribution):
-            # whether the recorded files of the imported top-level modules of the distribution are on disk,
-            # with their recorded hashes, e.g. demo/__init__.py or demo.py of the imported demo;
+        def imported_files(distribution):
+            # the number of the recorded files of the imported top-level modules of the distribution,
+            # e.g. demo/__init__.py or demo.py of the imported demo, if they are all on disk with their recorded hashes;
             # only the paths within the dependency directory, unlike e.g. ../../bin/ of pip install --target;
             # RECORD is read as it is, as Distribution.files leaves out the missing files since Python 3.12
             try:
@@ -511,25 +499,38 @@ internal object PythonDependencies {
                 ]
                 for parts, (algorithm, _, value) in files:
                     if algorithm not in hashlib.algorithms_guaranteed or algorithm.startswith("shake_"):
-                        return False
+                        return None
                     digest = file_digests(os.path.join(directory, *parts), [algorithm])
                     if digest is None:
-                        return False
+                        return None
                     if base64.urlsafe_b64encode(bytes.fromhex(digest[algorithm])).rstrip(b"=").decode() != value:
-                        return False
-                return len(files) > 0
+                        return None
+                return len(files) or None
             except (OSError, ValueError, csv.Error):
-                return False
+                return None
+
+        def version_key(version):
+            if Version is not None:
+                try:
+                    return 1, Version(version)
+                except ValueError:
+                    pass
+            return 0, version
 
         def imported_distribution(name, distribution):
             # of several dist-info of an imported distribution in the dependency directory,
-            # one of the ones whose files of the imported modules are installed, as the constraint keeps them,
-            # otherwise the one importlib.metadata finds first
+            # the one whose files of the imported modules are installed, as the constraint keeps them:
+            # of several such ones, e.g. when a version only added files, the one recording the most of them,
+            # then the highest version, otherwise the one importlib.metadata finds first
+            candidates = []
             for path in dependency_dist_infos.get(normalized_name(name), []):
                 candidate = metadata.PathDistribution(Path(path))
-                if has_imported_files(candidate):
-                    return candidate
-            return distribution
+                count = imported_files(candidate)
+                if count is not None:
+                    candidates.append((count, version_key(candidate.version), candidate))
+            if not candidates:
+                return distribution
+            return max(candidates, key=lambda it: it[:2])[2]
 
         def without_credentials(url):
             # direct_url.json holds the URL without credentials, and without the fragment
@@ -650,6 +651,8 @@ internal object PythonDependencies {
                 print("install", dependency)
             for name, version in constraints.items():
                 print("constraint", f"{name}=={version}")
+            # the dist-info directories before the installation, to remove the ones it replaced
+            print("dist-info", json.dumps(dist_info_snapshot(directory)))
     """.trimIndent()
 
 }

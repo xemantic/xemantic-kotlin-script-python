@@ -204,7 +204,10 @@ otherwise the code can declare it as a dependency, see below.
   it leaves the `dist-info` directory of the replaced version beside the new one,
   which is removed after the installation, as it was not written by it.
   A dependency with several `dist-info` directories in the dependency directory,
-  e.g. left by an earlier version of this library, is installed again, which then removes the other ones.
+  e.g. left by an earlier version of this library, is installed again, which then removes the other ones —
+  except on a file system without inode numbers, like FAT,
+  when it installs the version of one of them again:
+  then they are all kept, and it is installed again on each use, until the dependency directory is deleted.
   The installations into the dependency directory are serialized, also across processes,
   e.g. JVMs sharing the default directory in the user cache,
   with a lock of its `.xemantic-kotlin-script-python.lock` file,

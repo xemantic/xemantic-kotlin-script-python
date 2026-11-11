@@ -1205,11 +1205,83 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should constrain imported distribution to version recording most of its installed modules`() {
+        // given
+        // 2.0 only added a module, so the files recorded by 1.0 are installed too
+        withDistInfos { directory ->
+            val modules = mapOf(
+                "replaced_probe/__init__.py" to "X = 1\n",
+                "replaced_probe/extra.py" to "Y = 2\n"
+            )
+            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
+            writeDistInfo(directory, "2.0", modules)
+            writeDistInfo(directory, "1.0", modules.filterKeys { it.endsWith("__init__.py") })
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==2.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported distribution to highest version recording same installed modules`() {
+        // given
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
+            // neither the first nor the last by name
+            writeDistInfo(directory, "1.0", modules)
+            writeDistInfo(directory, "10.0", modules)
+            writeDistInfo(directory, "2.0", modules)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==10.0"))
+        }
+    }
+
+    @Test
+    fun `should remove dist-info of other version by name when identities are unknown`() {
+        withDistInfos { directory ->
+            // given
+            // e.g. on FAT, without inode numbers
+            writeDistInfo(directory, "1.0")
+            writeDistInfo(directory, "2.0")
+            val snapshot = """{"replaced_probe-1.0.dist-info": null, "replaced_probe-2.0.dist-info": null}"""
+            writeDistInfo(directory, "3.0")
+
+            // when
+            PythonDependencies.removeReplacedDistInfo(directory.toString(), snapshot)
+
+            // then
+            assert(directory.distInfoNames() == listOf("replaced_probe-3.0.dist-info"))
+        }
+    }
+
+    @Test
+    fun `should keep dist-info of other version when identity of version written again is unknown`() {
+        withReplacedVersion(installed = "2.0", replaced = "1.0") { directory ->
+            // given
+            val snapshot = """{"replaced_probe-1.0.dist-info": null, "replaced_probe-2.0.dist-info": null}"""
+
+            // when
+            PythonDependencies.removeReplacedDistInfo(directory.toString(), snapshot)
+
+            // then
+            assert(directory.distInfoNames() == listOf("replaced_probe-1.0.dist-info", "replaced_probe-2.0.dist-info"))
+        }
+    }
+
+    @Test
     fun `should remove dist-info of other version when installation writes new one`() {
         withDistInfos { directory ->
             // given
             writeDistInfo(directory, "1.0")
-            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            val snapshot = distInfoSnapshot(directory)
             writeDistInfo(directory, "2.0")
 
             // when
@@ -1224,7 +1296,7 @@ class PythonDependenciesTest {
     fun `should remove dist-info of other version when installation writes same version again`() {
         withReplacedVersion(installed = "2.0", replaced = "1.0") { directory ->
             // given
-            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            val snapshot = distInfoSnapshot(directory)
             // like pip, which writes it elsewhere, removes the previous one, and moves it into the directory
             val written = directory.resolveSibling("${directory.name}-written").createDirectory()
             writeDistInfo(written, "2.0")
@@ -1246,7 +1318,7 @@ class PythonDependenciesTest {
     fun `should keep dist-info of other versions when installation writes none of distribution`() {
         withReplacedVersion(installed = "2.0", replaced = "1.0") { directory ->
             // given
-            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            val snapshot = distInfoSnapshot(directory)
             writeDistInfo(directory, "1.0", name = "other-probe")
 
             // when
@@ -1268,7 +1340,7 @@ class PythonDependenciesTest {
         withDistInfos { directory ->
             // given
             writeDistInfo(directory, "1.0")
-            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            val snapshot = distInfoSnapshot(directory)
             writeDistInfo(directory, "2.0")
             writeDistInfo(directory, "3.0")
 
@@ -1468,6 +1540,17 @@ class PythonDependenciesTest {
                 .encodeToString(MessageDigest.getInstance("SHA-256").digest(bytes))
             "$path,sha256=$hash,${bytes.size}\n"
         } + "$distInfo/RECORD,,\n"
+
+    /** The `dist-info` snapshot of the plan of the [directory], printed when something is to be installed. */
+    private fun distInfoSnapshot(directory: Path): String =
+        PythonDependencies.plan("dependencies = ['nonexistent-dependency']\n", directory.toString(), emptyList())
+            .single { it.first == "dist-info" }.second
+
+    /** The constraints of `replaced-probe` planned with its module imported, for a missing dependency. */
+    private fun importedConstraints(directory: Path): List<String> =
+        PythonDependencies.plan(
+            "dependencies = ['nonexistent-dependency']\n", directory.toString(), listOf("replaced_probe")
+        ).filter { it.first == "constraint" && it.second.startsWith("replaced-probe==") }.map { it.second }
 
     private fun planInstalls(directory: Path, dependency: String): List<String> =
         PythonDependencies.plan("dependencies = ['$dependency']\n", directory.toString(), emptyList())
