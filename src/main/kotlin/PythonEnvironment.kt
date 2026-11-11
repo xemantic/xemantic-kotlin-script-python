@@ -28,6 +28,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.Properties
@@ -314,7 +315,7 @@ public object PythonEnvironment {
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
         """
-        |import ast, importlib.metadata, importlib.util, os, sys, sysconfig
+        |import importlib.util, os, sys, sysconfig
         |externally_managed = sys.prefix == sys.base_prefix and os.path.isfile(
         |    os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
         |)
@@ -327,6 +328,7 @@ public object PythonEnvironment {
         |    )
         |def jep_package_version(package):
         |    try:
+        |        import ast
         |        with open(os.path.join(package, 'version.py'), 'rb') as file:
         |            module = ast.parse(file.read())
         |        for statement in module.body:
@@ -340,6 +342,7 @@ public object PythonEnvironment {
         |    except Exception:
         |        pass
         |    try:
+        |        import importlib.metadata
         |        distributions = importlib.metadata.distributions(name='jep', path=[os.path.dirname(package)])
         |        versions = {distribution.version for distribution in distributions} - {None}
         |    except Exception:
@@ -494,7 +497,9 @@ internal fun jepInstallAdvice(
  * the version of the `org.ninia:jep` library, see [jepVersionsMatch],
  * as otherwise Jep would fail later, and obscurely, e.g. with a missing native symbol, or behave differently.
  *
- * @throws IllegalStateException if it is not, advising to reinstall it in the [libraryVersion].
+ * @throws IllegalStateException if it is not, advising to reinstall it in the [libraryVersion],
+ * and, if the package is outside the environment of the [python], its [PythonProbe.prefix],
+ * e.g. on `PYTHONPATH`, where an install would not replace it, to remove it first.
  */
 internal fun checkJepPackageVersion(
     python: String,
@@ -502,16 +507,28 @@ internal fun checkJepPackageVersion(
     libraryVersion: String? = PythonEnvironment.jepVersion
 ) {
     check(jepVersionsMatch(probe.jepPackageVersion, libraryVersion)) {
+        val outside = try {
+            !Path(probe.jepLocation).normalize().startsWith(Path(probe.prefix).normalize())
+        } catch (_: InvalidPathException) {
+            false
+        }
         "The jep package of $python, in ${probe.jepLocation}, is version ${probe.jepPackageVersion}, " +
             "but the org.ninia:jep library is version $libraryVersion, which it must match.\n" +
+            (
+                if (outside) "It is outside the environment of this Python, ${probe.prefix}, " +
+                    "e.g. on PYTHONPATH, where installing jep would not replace it: " +
+                    "remove it, or its directory from PYTHONPATH, first.\n"
+                else ""
+            ) +
             jepInstallAdvice(python, probe.externallyManaged, reinstall = true, jepVersion = libraryVersion)
     }
 }
 
 /**
  * Whether the [packageVersion] of the `jep` package matches the [libraryVersion] of the `org.ninia:jep` library,
- * comparing only their release numbers, e.g. `4.3.2` of `4.3.2.dev0`, `4.3.2+local` or `4.3.2-SNAPSHOT`,
- * as PEP 440 does, ignoring trailing zeros, so that a development or a local build of the same release matches.
+ * comparing only their release numbers, ignoring trailing zeros,
+ * so that a development, pre-release or local version of the same release matches,
+ * e.g. `4.3.2.dev0`, `4.3.2rc1`, `4.3.2+local` or `4.3.2-SNAPSHOT` of `4.3.2`.
  * A version which is unknown, empty or `null`, or has no release numbers, matches any, as it is no reason to fail.
  */
 internal fun jepVersionsMatch(packageVersion: String, libraryVersion: String?): Boolean {

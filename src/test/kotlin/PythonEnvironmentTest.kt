@@ -366,7 +366,10 @@ class PythonEnvironmentTest {
                         "but the org.ninia:jep library is version $catalogJepVersion"
                 ) &&
                     // a plain pip install would tell that the requirement is already satisfied
-                    "$python -m pip install --force-reinstall --no-cache-dir jep==$catalogJepVersion" in message
+                    "$python -m pip install --force-reinstall --no-cache-dir jep==$catalogJepVersion" in message &&
+                    // which would not replace this one, outside the environment
+                    "is outside the environment of this Python" in message &&
+                    "PYTHONPATH" in message
             )
         } finally {
             directory.deleteRecursively()
@@ -401,18 +404,21 @@ class PythonEnvironmentTest {
     fun `should not probe version of jep package from stale metadata in another directory`() {
         // given
         val directory = createTempDirectory("python-probe")
-        // metadata left without its package on PYTHONPATH, before the site-packages holding the jep package,
+        // metadata left without its package before the one of the jep package without version module,
         // which importlib.metadata.version('jep') would find first
         val stale = directory.resolve("stale").createDirectory()
         fakeJepMetadata(stale, "4.2.0")
         val python = pythonWithSitecustomize(directory, "import sys\nsys.path.insert(0, ${pythonPath(stale.toString())})\n")
+        val site = directory.resolve("site")
+        fakeJepPackage(site, version = null)
+        fakeJepMetadata(site, catalogJepVersion)
 
         try {
             // when
             val probe = PythonEnvironment.probePython(python)
 
             // then
-            assert(probe.jepPackageVersion == catalogJepVersion)
+            assert(probe.jepLocation == site.resolve("jep").toString() && probe.jepPackageVersion == catalogJepVersion)
         } finally {
             directory.deleteRecursively()
         }
@@ -486,7 +492,9 @@ class PythonEnvironmentTest {
                     "but the org.ninia:jep library is version 4.3.2, which it must match.\n"
             ) &&
                 "-m venv" in message &&
-                "-m pip install jep==4.3.2" in message
+                "-m pip install jep==4.3.2" in message &&
+                // within the environment, /usr
+                "outside the environment" !in message
         )
     }
 
