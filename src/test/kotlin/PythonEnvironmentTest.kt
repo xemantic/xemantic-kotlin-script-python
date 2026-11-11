@@ -254,7 +254,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with output before and after values`() {
         // given
-        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")}\nmore noise"
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")}\nmore noise"
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -268,7 +268,7 @@ class PythonEnvironmentTest {
         // given
         val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
             "${PythonEnvironment.PROBE_BEGIN}\n" +
-            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -280,7 +280,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with empty first value`() {
         // given
-        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "")
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -292,7 +292,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with values containing spaces and non-ASCII`() {
         // given
-        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "")
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -305,7 +305,7 @@ class PythonEnvironmentTest {
     fun `should parse probe output with library directory and soname of libpython`() {
         // given
         val output = probePayload(
-            "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1", "/opt/python/lib", "libpython3.13.so.1.0"
+            "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1", "/opt/python/lib", "libpython3.13.so.1.0", ""
         )
 
         // when
@@ -320,6 +320,196 @@ class PythonEnvironmentTest {
                 librarySoname = "libpython3.13.so.1.0"
             )
         )
+    }
+
+    @Test
+    fun `should parse probe output with version of jep package`() {
+        // given
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "4.3.2")
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(probe == PythonProbe("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", jepPackageVersion = "4.3.2"))
+    }
+
+    @Test
+    fun `should probe version of jep package`() {
+        // when
+        val probe = PythonEnvironment.probePython(venvPython)
+
+        // then
+        assert(probe.jepPackageVersion == catalogJepVersion)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should fail on probe of jep package of another version than org ninia jep library`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, "")
+        // a jep package on PYTHONPATH, before the one of the site-packages
+        val jepPackage = fakeJepPackage(directory.resolve("site"), version = "4.2.0")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                message.startsWith(
+                    "The jep package of $python, in $jepPackage, is version 4.2.0, " +
+                        "but the org.ninia:jep library is version $catalogJepVersion"
+                ) &&
+                    // a plain pip install would tell that the requirement is already satisfied
+                    "$python -m pip install --force-reinstall --no-cache-dir jep==$catalogJepVersion" in message &&
+                    // which would not replace this one, outside the environment
+                    "is outside the environment of this Python" in message &&
+                    "PYTHONPATH" in message
+            )
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe version of jep package without version module from metadata in its directory`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, "")
+        val site = directory.resolve("site")
+        fakeJepPackage(site, version = null)
+        fakeJepMetadata(site, "4.2.0")
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.probePython(python)
+            }
+
+            // then
+            assert(exception.message!!.startsWith("The jep package of $python, in ${site.resolve("jep")}, is version 4.2.0,"))
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not probe version of jep package from stale metadata in another directory`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        // metadata left without its package before the one of the jep package without version module,
+        // which importlib.metadata.version('jep') would find first
+        val stale = directory.resolve("stale").createDirectory()
+        fakeJepMetadata(stale, "4.2.0")
+        val python = pythonWithSitecustomize(directory, "import sys\nsys.path.insert(0, ${pythonPath(stale.toString())})\n")
+        val site = directory.resolve("site")
+        fakeJepPackage(site, version = null)
+        fakeJepMetadata(site, catalogJepVersion)
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe.jepLocation == site.resolve("jep").toString() && probe.jepPackageVersion == catalogJepVersion)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should probe jep package without version module and without metadata in its directory as of unknown version`() {
+        // given
+        val directory = createTempDirectory("python-probe")
+        val python = pythonWithSitecustomize(directory, "")
+        // e.g. copied, not installed, before the site-packages, whose metadata of jep is of another package
+        fakeJepPackage(directory.resolve("site"), version = null)
+
+        try {
+            // when
+            val probe = PythonEnvironment.probePython(python)
+
+            // then
+            assert(probe.jepPackageVersion == "")
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should match versions of jep package and library`() {
+        // when
+        val matches = listOf(
+            "4.3.2" to "4.3.2",
+            // unknown or unparsable, which is no reason to fail
+            "" to "4.3.2",
+            "4.2.0" to null,
+            "unknown" to "4.3.2",
+            // a local or a development build of the same release
+            "4.3.2+local" to "4.3.2",
+            "4.3.2.dev0" to "4.3.2",
+            "4.3.2" to "4.3.2-SNAPSHOT",
+            // the same release, as PEP 440 compares it
+            "4.3" to "4.3.0"
+        ).map { (packageVersion, libraryVersion) -> jepVersionsMatch(packageVersion, libraryVersion) }
+        val mismatches = listOf(
+            "4.2.0" to "4.3.2",
+            "4.3.20" to "4.3.2",
+            "4.3.2" to "4.3.1-SNAPSHOT"
+        ).map { (packageVersion, libraryVersion) -> jepVersionsMatch(packageVersion, libraryVersion) }
+
+        // then
+        assert(matches.all { it } && mismatches.none { it })
+    }
+
+    @Test
+    fun `should advise installing jep of library version into virtual environment when externally managed Python has another`() {
+        // given
+        val probe = PythonProbe(
+            "/usr/bin/python3", "cpython-313", "/usr", "/usr/lib/python3/dist-packages/jep",
+            externallyManaged = true,
+            jepPackageVersion = "4.2.0"
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            checkJepPackageVersion("/usr/bin/python3", probe, libraryVersion = "4.3.2")
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith(
+                "The jep package of /usr/bin/python3, in /usr/lib/python3/dist-packages/jep, is version 4.2.0, " +
+                    "but the org.ninia:jep library is version 4.3.2, which it must match.\n"
+            ) &&
+                "-m venv" in message &&
+                "-m pip install jep==4.3.2" in message &&
+                // within the environment, /usr
+                "outside the environment" !in message
+        )
+    }
+
+    @Test
+    fun `should accept jep package of unknown version or matching library`() {
+        // given
+        val probe = PythonProbe("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", jepPackageVersion = "4.3.2")
+
+        // when
+        checkJepPackageVersion("/venv/bin/python", probe, libraryVersion = "4.3.2")
+        checkJepPackageVersion("/venv/bin/python", probe.copy(jepPackageVersion = ""), libraryVersion = "4.3.2")
+        checkJepPackageVersion("/venv/bin/python", probe.copy(jepPackageVersion = "4.2.0"), libraryVersion = null)
+
+        // then
+        // no failure
     }
 
     @Test
@@ -351,7 +541,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
             .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
@@ -362,10 +552,10 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should not parse probe output without exactly seven values`() {
+    fun `should not parse probe output without exactly eight values`() {
         // given
-        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "")
-        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "extra")
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "extra")
 
         // when
         val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
@@ -1222,6 +1412,26 @@ class PythonEnvironmentTest {
             |    ${pythonPath(stdlib.toString())} if name == 'stdlib' else get_path(name, *args, **kwargs)
             |)
             |""".trimMargin()
+    }
+
+    /**
+     * A `jep` package in the [directory], whose `version.py` tells the [version], like the one of a real jep, if any,
+     * without its native library, which the probe does not need.
+     */
+    private fun fakeJepPackage(directory: Path, version: String?): Path {
+        val jepPackage = directory.resolve("jep").createDirectory()
+        jepPackage.resolve("__init__.py").writeText("raise ImportError('Jep is not supported in standalone Python')\n")
+        if (version != null) {
+            jepPackage.resolve("version.py").writeText("# comment\n\n__VERSION__ = '$version'\nVERSION = __VERSION__\n")
+        }
+        return jepPackage
+    }
+
+    /** The metadata of a `jep` distribution of the [version] installed in the [directory]. */
+    private fun fakeJepMetadata(directory: Path, version: String) {
+        directory.resolve("jep-$version.dist-info").createDirectory()
+            .resolve("METADATA")
+            .writeText("Metadata-Version: 2.1\nName: jep\nVersion: $version\n")
     }
 
     /**
