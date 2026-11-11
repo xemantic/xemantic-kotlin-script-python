@@ -528,8 +528,8 @@ class PythonCloseTest {
             // then
             assert(!interrupted.isAlive)
             assert(interruptedFailure is InterruptedException)
-            // restored, as Java code cannot catch the undeclared InterruptedException
-            assert(interruptedFlag == true)
+            // cleared, like by any blocking method throwing InterruptedException
+            assert(interruptedFlag == false)
             assert(!running.isAlive)
             assert(runningResult == 42L)
             // the queued call would have run before this one
@@ -570,8 +570,8 @@ class PythonCloseTest {
         // then
         assert(!closer.isAlive)
         assert(closerFailure is InterruptedException)
-        // restored, as Java code cannot catch the undeclared InterruptedException
-        assert(closerInterruptedFlag == true)
+        // cleared, like by any blocking method throwing InterruptedException
+        assert(closerInterruptedFlag == false)
         assert(closeTaskRan.await(DEADLOCK_TIMEOUT, MILLISECONDS))
     }
 

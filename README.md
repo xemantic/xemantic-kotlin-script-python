@@ -173,6 +173,8 @@ otherwise the code can declare it as a dependency, see below.
   then it returns at once, and the interpreter is closed after the call returns,
   as the call might itself wait for this `close()`, e.g. one made by a Kotlin function called from Python.
   Calling `close()` again returns at once, also while the interpreter is still being closed.
+  An interrupted `close()` throws an `InterruptedException` at once,
+  while the interpreter is still closed later, in the background.
 * The code passed to `exec`, or `python(code)`, can declare its dependencies,
   like a `@file:DependsOn` of a Kotlin snippet,
   with [inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/),
