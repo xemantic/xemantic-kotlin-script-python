@@ -143,9 +143,10 @@ internal object PythonDependencies {
                     val missing = plan.missing()
                     if (missing.isNotEmpty()) {
                         val constraints = plan.filter { it.first == "constraint" }.map { it.second }
+                        val distInfos = distInfoSnapshot(directory.toString())
                         installMissing(missing, constraints, directory.toString())
                         // within the lock, as another process could be installing another version meanwhile
-                        removeReplacedDistInfo(directory.toString())
+                        if (distInfos != null) removeReplacedDistInfo(directory.toString(), distInfos)
                     }
                 }
             }
@@ -288,23 +289,41 @@ internal object PythonDependencies {
         }
     }
 
+    private val logger = System.getLogger(PythonDependencies::class.java.name)
+
+    /**
+     * The dist-info directories of the dependency [directory], before an installation,
+     * to tell the ones written by the installation in [removeReplacedDistInfo],
+     * or `null`, with a warning, if they cannot be listed.
+     */
+    internal fun distInfoSnapshot(directory: String): String? =
+        runDistInfoCommand(directory, "snapshot", input = null)
+
     /**
      * Removes from the dependency [directory] the dist-info directories of the distributions
-     * replaced by another version, which `pip install --target --upgrade` leaves beside the installed one,
-     * so that the [PLAN] does not judge a requirement by them, see [INSTALLED_DIST_INFO].
-     *
-     * @throws PythonDependencyException if they cannot be removed.
+     * replaced by another version by the installation since the [snapshot] of [distInfoSnapshot],
+     * which `pip install --target --upgrade` leaves beside the installed one, see [REPLACED_DIST_INFO],
+     * or logs a warning, if they cannot be removed, as the installation itself succeeded,
+     * and the [PLAN] plans a distribution with several dist-info as missing.
      */
-    internal fun removeReplacedDistInfo(directory: String) {
+    internal fun removeReplacedDistInfo(directory: String, snapshot: String) {
+        runDistInfoCommand(directory, "remove", input = snapshot)
+    }
+
+    private fun runDistInfoCommand(directory: String, mode: String, input: String?): String? {
         val result = runProcess(
-            pythonCommand(PythonEnvironment.executable, REMOVE_REPLACED_DIST_INFO, directory),
+            pythonCommand(PythonEnvironment.executable, REPLACED_DIST_INFO, directory, mode),
+            input = input,
             mergeErrorStream = false
         )
         if (result.exitCode != 0) {
-            throw PythonDependencyException(
+            logger.log(
+                System.Logger.Level.WARNING,
                 "Cannot remove the dist-info of replaced distributions from $directory:\n${result.failureOutput}"
             )
+            return null
         }
+        return result.output
     }
 
     private fun findOnPath(name: String): String? = System.getenv("PATH")
@@ -314,34 +333,16 @@ internal object PythonDependencies {
         ?.toString()
 
     /**
-     * The Python functions telling which of several dist-info directories of a distribution in the dependency directory
-     * belongs to its installed files, shared by the [PLAN] and [REMOVE_REPLACED_DIST_INFO].
+     * The Python functions finding the dist-info directories of the dependency directory by their distribution,
+     * shared by the [PLAN] and [REPLACED_DIST_INFO], importing only modules of the standard library.
      *
      * `pip install --target --upgrade` replaces the files of a distribution installed in another version,
      * but leaves its dist-info beside the one of the new version,
      * and `importlib.metadata` would find whichever of them the directory lists first.
-     * The installed one is the one whose recorded files are all on disk with their recorded hashes,
-     * and of several such ones, when the files are the same in both versions, e.g. of a metapackage,
-     * the one whose `RECORD` was written last, as it was installed last;
-     * otherwise, e.g. without `RECORD`, it cannot be told.
      */
     @Language("python")
-    private val INSTALLED_DIST_INFO = """
-        import base64, hashlib, os, re
-        import importlib.metadata as metadata
-        from pathlib import Path
-
-        def file_digests(path, algorithms):
-            # in one pass over the file for all the algorithms
-            try:
-                digests = {algorithm: hashlib.new(algorithm) for algorithm in algorithms}
-                with open(path, "rb") as file:
-                    for chunk in iter(lambda: file.read(1 << 20), b""):
-                        for digest in digests.values():
-                            digest.update(chunk)
-                return {algorithm: digest.hexdigest() for algorithm, digest in digests.items()}
-            except (OSError, ValueError):
-                return None
+    private val DIST_INFOS = """
+        import os, re
 
         def normalized_name(name):
             return re.sub(r"[-_.]+", "_", name).lower()
@@ -359,60 +360,49 @@ internal object PythonDependencies {
                 if entry.lower().endswith(".dist-info") and os.path.isdir(path):
                     found.setdefault(normalized_name(entry[:-len(".dist-info")].partition("-")[0]), []).append(path)
             return found
-
-        def has_recorded_files(path):
-            try:
-                files = metadata.PathDistribution(Path(path)).files
-                if not files:
-                    return False
-                for file in files:
-                    # the bytecode is recorded without a hash, or can be compiled again
-                    if file.hash is None or file.suffix == ".pyc":
-                        continue
-                    algorithm = file.hash.mode
-                    if algorithm not in hashlib.algorithms_guaranteed or algorithm.startswith("shake_"):
-                        return False
-                    digest = file_digests(file.locate(), [algorithm])
-                    if digest is None:
-                        return False
-                    encoded = base64.urlsafe_b64encode(bytes.fromhex(digest[algorithm])).rstrip(b"=").decode()
-                    if encoded != file.hash.value:
-                        return False
-                return True
-            except (OSError, ValueError):
-                return False
-
-        def record_time(path):
-            try:
-                return os.stat(os.path.join(path, "RECORD")).st_mtime_ns
-            except OSError:
-                return None
-
-        def installed_dist_info(paths):
-            # the one of the dist-info directories of a distribution which belongs to its installed files,
-            # or None, if it cannot be told
-            if len(paths) == 1:
-                return paths[0]
-            times = {path: record_time(path) for path in paths if has_recorded_files(path)}
-            times = {path: time for path, time in times.items() if time is not None}
-            latest = [path for path, time in times.items() if time == max(times.values())]
-            return latest[0] if len(latest) == 1 else None
     """.trimIndent()
 
     /**
-     * Removes the dist-info directories of the dependency directory, its argument,
-     * which do not belong to the installed files of their distribution, see [INSTALLED_DIST_INFO],
-     * keeping all of them when it cannot be told, and never the files of a distribution.
+     * Its arguments are the dependency directory and the mode:
+     * `snapshot` prints the identities of the dist-info directories, as a JSON object by their names,
+     * and `remove`, given such a snapshot, taken before an installation, on its standard input,
+     * removes the dist-info directories of a distribution which were there before the installation, unchanged,
+     * when the installation wrote another one of the distribution, and only one,
+     * as the one of the files it installed.
+     *
+     * The installer, pip or uv, writes a dist-info as a new directory, also when replacing the same version,
+     * so a dist-info is told written by the installation by its identity,
+     * which is unknown, e.g. on a file system without inode numbers, and then nothing is removed.
+     * Nothing is told by the content, e.g. by `RECORD`, whose paths are relative to the layout
+     * which the installer used, e.g. `../../bin/` of `pip install --target`, not to the directory.
      */
     @Language("python")
-    private val REMOVE_REPLACED_DIST_INFO = INSTALLED_DIST_INFO + "\n\n" + """
-        import shutil, sys
+    private val REPLACED_DIST_INFO = DIST_INFOS + "\n\n" + """
+        import json, shutil, sys
 
-        for paths in dist_infos(sys.argv[1]).values():
-            installed = installed_dist_info(paths)
-            if installed is not None:
-                for path in paths:
-                    if path != installed:
+        directory, mode = sys.argv[1], sys.argv[2]
+
+        def identity(path):
+            try:
+                status = os.stat(path)
+            except OSError:
+                return None
+            return [status.st_dev, status.st_ino] if status.st_ino else None
+
+        if mode == "snapshot":
+            print(json.dumps({
+                os.path.basename(path): identity(path)
+                for paths in dist_infos(directory).values() for path in paths
+            }))
+        else:
+            before = json.loads(sys.stdin.read())
+            for paths in dist_infos(directory).values():
+                identities = {path: identity(path) for path in paths}
+                if None in identities.values():
+                    continue
+                unchanged = [path for path in paths if before.get(os.path.basename(path)) == identities[path]]
+                if len(paths) - len(unchanged) == 1:
+                    for path in unchanged:
                         # a link, not the directory it points to
                         os.unlink(path) if os.path.islink(path) else shutil.rmtree(path)
     """.trimIndent()
@@ -430,13 +420,15 @@ internal object PythonDependencies {
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
     @Language("python")
-    internal val PLAN = INSTALLED_DIST_INFO + "\n\n" + """
+    internal val PLAN = DIST_INFOS + "\n\n" + """
         import json, sys
 
-        # before any import which can fail, so that the input is always read
+        # before any import which can fail, so that the input is always read,
+        # while the ones of DIST_INFOS above, of the standard library, cannot
         request = json.loads(sys.stdin.read())
 
-        import importlib
+        import base64, csv, hashlib, importlib, importlib.metadata as metadata
+        from pathlib import Path
         from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
         directory, imported = sys.argv[1], set(request["modules"])
@@ -492,24 +484,69 @@ internal object PythonDependencies {
             return not requirement.specifier.contains(distribution.version, prereleases=True)
 
         def find_distribution(name):
-            # like importlib.metadata, but of several dist-info of the name in the dependency directory,
-            # the one of the installed files, or None, when it cannot be told
+            # like importlib.metadata, but None for several dist-info of the name in the dependency directory,
+            # when it is not known which of them the installed files belong to,
+            # so that the installation writes a new one, and removes the others
             try:
                 distribution = metadata.distribution(name)
             except metadata.PackageNotFoundError:
                 return None
             if os.path.realpath(distribution.locate_file("")) != dependency_location:
                 return distribution
-            paths = dependency_dist_infos.get(normalized_name(name), [])
-            if len(paths) < 2:
-                return distribution
-            path = installed_dist_info(paths)
-            return None if path is None else metadata.PathDistribution(Path(path))
+            if len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
+                return None
+            return distribution
+
+        def has_imported_files(distribution):
+            # whether the recorded files of the imported top-level modules of the distribution are on disk,
+            # with their recorded hashes, e.g. demo/__init__.py or demo.py of the imported demo;
+            # only the paths within the dependency directory, unlike e.g. ../../bin/ of pip install --target;
+            # RECORD is read as it is, as Distribution.files leaves out the missing files since Python 3.12
+            try:
+                files = [
+                    (row[0].split("/"), row[1].partition("="))
+                    for row in csv.reader((distribution.read_text("RECORD") or "").splitlines())
+                    if len(row) > 1 and row[1] and not row[0].endswith(".pyc")
+                    and row[0].split("/")[0].partition(".")[0] in imported
+                ]
+                for parts, (algorithm, _, value) in files:
+                    if algorithm not in hashlib.algorithms_guaranteed or algorithm.startswith("shake_"):
+                        return False
+                    digest = file_digests(os.path.join(directory, *parts), [algorithm])
+                    if digest is None:
+                        return False
+                    if base64.urlsafe_b64encode(bytes.fromhex(digest[algorithm])).rstrip(b"=").decode() != value:
+                        return False
+                return len(files) > 0
+            except (OSError, ValueError, csv.Error):
+                return False
+
+        def imported_distribution(name, distribution):
+            # of several dist-info of an imported distribution in the dependency directory,
+            # one of the ones whose files of the imported modules are installed, as the constraint keeps them,
+            # otherwise the one importlib.metadata finds first
+            for path in dependency_dist_infos.get(normalized_name(name), []):
+                candidate = metadata.PathDistribution(Path(path))
+                if has_imported_files(candidate):
+                    return candidate
+            return distribution
 
         def without_credentials(url):
             # direct_url.json holds the URL without credentials, and without the fragment
             parts = urlsplit(url)
             return urlunsplit((parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path, parts.query, ""))
+
+        def file_digests(path, algorithms):
+            # in one pass over the file for all the algorithms
+            try:
+                digests = {algorithm: hashlib.new(algorithm) for algorithm in algorithms}
+                with open(path, "rb") as file:
+                    for chunk in iter(lambda: file.read(1 << 20), b""):
+                        for digest in digests.values():
+                            digest.update(chunk)
+                return {algorithm: digest.hexdigest() for algorithm, digest in digests.items()}
+            except (OSError, ValueError):
+                return None
 
         def is_unmodified_since_uv_install(path, distribution):
             # uv records the change time of a local archive in uv_cache.json, the last write time on Windows,
@@ -605,11 +642,10 @@ internal object PythonDependencies {
                 name = distribution.metadata["Name"]
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
                 if name and name not in constraints and (not in_dependencies or name in in_use):
-                    if in_dependencies:
+                    if in_dependencies and len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
                         # not the version of a dist-info left by a replaced version
-                        distribution = find_distribution(name)
-                    if distribution is not None:
-                        constraints[name] = distribution.version
+                        distribution = imported_distribution(name, distribution)
+                    constraints[name] = distribution.version
             for dependency in missing:
                 print("install", dependency)
             for name, version in constraints.items():

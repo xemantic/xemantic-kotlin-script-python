@@ -1177,83 +1177,64 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should plan version dependency as installed next to dist-info of version it replaced`() {
+    fun `should plan version dependency as missing next to dist-info of other version`() {
+        // given
+        // it is not known which of them the installed files belong to, so the installation writes a new one
         withReplacedVersion(installed = "1.0", replaced = "2.0") { directory ->
             // when
-            val installs = planInstalls(directory, "replaced-probe==1.0")
+            val installs = planInstalls(directory, "replaced-probe")
 
             // then
-            assert(installs.isEmpty())
+            assert(installs == listOf("replaced-probe"))
         }
     }
 
     @Test
-    fun `should plan version dependency by dist-info written last when files of both versions are installed`() {
-        // given
-        // e.g. of a metapackage, without files of its own
+    fun `should constrain imported distribution to version of its installed modules next to dist-info of other version`() {
+        // when
+        val constraints = listOf("1.0" to "2.0", "2.0" to "1.0").map { (installed, replaced) ->
+            withReplacedVersion(installed = installed, replaced = replaced) { directory ->
+                PythonDependencies.plan(
+                    "dependencies = ['nonexistent-dependency']\n", directory.toString(), listOf("replaced_probe")
+                ).filter { it.first == "constraint" && it.second.startsWith("replaced-probe==") }.map { it.second }
+            }
+        }
+
+        // then
+        assert(constraints == listOf(listOf("replaced-probe==1.0"), listOf("replaced-probe==2.0")))
+    }
+
+    @Test
+    fun `should remove dist-info of other version when installation writes new one`() {
         withDistInfos { directory ->
-            writeDistInfo(directory, "1.0").setRecordTime(Instant.parse("2026-01-02T00:00:00Z"))
-            writeDistInfo(directory, "2.0").setRecordTime(Instant.parse("2026-01-01T00:00:00Z"))
+            // given
+            writeDistInfo(directory, "1.0")
+            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            writeDistInfo(directory, "2.0")
 
             // when
-            val installs = planInstalls(directory, "replaced-probe==1.0")
+            PythonDependencies.removeReplacedDistInfo(directory.toString(), snapshot)
 
             // then
-            assert(installs.isEmpty())
+            assert(directory.distInfoNames() == listOf("replaced_probe-2.0.dist-info"))
         }
     }
 
     @Test
-    fun `should plan version dependency as missing when installed dist-info cannot be told`() {
-        // given
-        // without RECORD, it cannot be known which of them the files on disk belong to
-        withDistInfos { directory ->
-            writeDistInfo(directory, "1.0", record = false)
-            writeDistInfo(directory, "2.0", record = false)
-
-            // when
-            val installs = planInstalls(directory, "replaced-probe==1.0")
-
-            // then
-            assert(installs == listOf("replaced-probe==1.0"))
-        }
-    }
-
-    @Test
-    fun `should plan archive dependency as installed next to dist-info of version it replaced`() {
-        // given
-        val url = "https://example.com/replaced_probe-1.0-py3-none-any.whl"
-        withReplacedVersion(
-            installed = "1.0",
-            replaced = "2.0",
-            directUrl = """{"url": "$url", "archive_info": {"hashes": {"sha256": "$HASH"}}}"""
-        ) { directory ->
-            // when
-            val installs = planInstalls(directory, "replaced-probe @ $url")
-
-            // then
-            assert(installs.isEmpty())
-        }
-    }
-
-    @Test
-    fun `should constrain imported distribution to version of installed files next to dist-info of version it replaced`() {
+    fun `should remove dist-info of other version when installation writes same version again`() {
         withReplacedVersion(installed = "2.0", replaced = "1.0") { directory ->
-            // when
-            val constraints = PythonDependencies.plan(
-                "dependencies = ['nonexistent-dependency']\n", directory.toString(), listOf("replaced_probe")
-            ).filter { it.first == "constraint" }.map { it.second }
+            // given
+            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            // like pip, which writes it elsewhere, removes the previous one, and moves it into the directory
+            val written = directory.resolveSibling("${directory.name}-written").createDirectory()
+            writeDistInfo(written, "2.0")
+            @OptIn(ExperimentalPathApi::class)
+            directory.resolve("replaced_probe-2.0.dist-info").deleteRecursively()
+            Files.move(written.resolve("replaced_probe-2.0.dist-info"), directory.resolve("replaced_probe-2.0.dist-info"))
+            written.deleteIfExists()
 
-            // then
-            assert("replaced-probe==2.0" in constraints && "replaced-probe==1.0" !in constraints)
-        }
-    }
-
-    @Test
-    fun `should remove dist-info of version replaced by installed one`() {
-        withReplacedVersion(installed = "2.0", replaced = "1.0") { directory ->
             // when
-            PythonDependencies.removeReplacedDistInfo(directory.toString())
+            PythonDependencies.removeReplacedDistInfo(directory.toString(), snapshot)
 
             // then
             assert(directory.distInfoNames() == listOf("replaced_probe-2.0.dist-info"))
@@ -1262,51 +1243,44 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should remove dist-info of newer version replaced by installed older one`() {
-        withReplacedVersion(installed = "1.0", replaced = "2.0") { directory ->
-            // when
-            PythonDependencies.removeReplacedDistInfo(directory.toString())
-
-            // then
-            assert(directory.distInfoNames() == listOf("replaced_probe-1.0.dist-info"))
-        }
-    }
-
-    @Test
-    fun `should keep dist-info written last when files of both versions are installed`() {
-        // given
-        withDistInfos { directory ->
-            writeDistInfo(directory, "1.0").setRecordTime(Instant.parse("2026-01-01T00:00:00Z"))
-            writeDistInfo(directory, "2.0").setRecordTime(Instant.parse("2026-01-02T00:00:00Z"))
+    fun `should keep dist-info of other versions when installation writes none of distribution`() {
+        withReplacedVersion(installed = "2.0", replaced = "1.0") { directory ->
+            // given
+            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            writeDistInfo(directory, "1.0", name = "other-probe")
 
             // when
-            PythonDependencies.removeReplacedDistInfo(directory.toString())
-
-            // then
-            assert(directory.distInfoNames() == listOf("replaced_probe-2.0.dist-info"))
-        }
-    }
-
-    @Test
-    fun `should keep all dist-info when installed one cannot be told`() {
-        // given
-        withDistInfos { directory ->
-            writeDistInfo(directory, "1.0", record = false)
-            writeDistInfo(directory, "2.0", record = false)
-            val time = Instant.parse("2026-01-01T00:00:00Z")
-            writeDistInfo(directory, "3.0", name = "other-probe").setRecordTime(time)
-            writeDistInfo(directory, "4.0", name = "other-probe").setRecordTime(time)
-
-            // when
-            PythonDependencies.removeReplacedDistInfo(directory.toString())
+            PythonDependencies.removeReplacedDistInfo(directory.toString(), snapshot)
 
             // then
             assert(
                 directory.distInfoNames() == listOf(
-                    "other_probe-3.0.dist-info",
-                    "other_probe-4.0.dist-info",
+                    "other_probe-1.0.dist-info",
                     "replaced_probe-1.0.dist-info",
                     "replaced_probe-2.0.dist-info"
+                )
+            )
+        }
+    }
+
+    @Test
+    fun `should keep dist-info of other version when installation writes several of distribution`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0")
+            val snapshot = PythonDependencies.distInfoSnapshot(directory.toString())!!
+            writeDistInfo(directory, "2.0")
+            writeDistInfo(directory, "3.0")
+
+            // when
+            PythonDependencies.removeReplacedDistInfo(directory.toString(), snapshot)
+
+            // then
+            assert(
+                directory.distInfoNames() == listOf(
+                    "replaced_probe-1.0.dist-info",
+                    "replaced_probe-2.0.dist-info",
+                    "replaced_probe-3.0.dist-info"
                 )
             )
         }
@@ -1335,7 +1309,64 @@ class PythonDependenciesTest {
             // then
             assert(directory.distInfoNames().filter { it.startsWith("pip_replaced_probe-") } == listOf("pip_replaced_probe-2.0.dist-info"))
             assert(planInstalls(directory, "pip-replaced-probe==1.0") == listOf("pip-replaced-probe==1.0"))
-            assert(planInstalls(directory, "pip-replaced-probe @ $version2").isEmpty())
+            assert(planInstalls(directory, "pip-replaced-probe==2.0").isEmpty())
+        } finally {
+            wheels.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should remove dist-info of version with scripts and data replaced by pip install of other distribution`() {
+        // given
+        // pip install --target records the scripts and the data files outside the directory, e.g. ../../bin/
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory!!
+        val wheels = createTempDirectory("python-wheels")
+        try {
+            val version1 = writeWheel(wheels, "pip-scripts-probe", "1.0", scriptsAndData = true)
+            val version2 = writeWheel(wheels, "pip-scripts-probe", "2.0", scriptsAndData = true)
+            val dependent = writeWheel(
+                wheels, "pip-scripts-probe-dependent", "1.0", requires = listOf("pip-scripts-probe @ $version2")
+            )
+            Python().use { python ->
+                python.exec("# /// script\n# dependencies = [\"pip-scripts-probe @ $version1\"]\n# ///\nx = 1\n")
+
+                // when
+                python.exec("# /// script\n# dependencies = [\"pip-scripts-probe-dependent @ $dependent\"]\n# ///\nx = 1\n")
+            }
+
+            // then
+            assert(directory.distInfoNames().filter { it.startsWith("pip_scripts_probe-") } == listOf("pip_scripts_probe-2.0.dist-info"))
+            assert(planInstalls(directory, "pip-scripts-probe").isEmpty())
+            assert(planInstalls(directory, "pip-scripts-probe==1.0") == listOf("pip-scripts-probe==1.0"))
+        } finally {
+            wheels.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should remove dist-info of other version left by earlier installation when installing again`() {
+        // given
+        PythonEnvironment.initialize()
+        val directory = PythonEnvironment.dependencyDirectory!!
+        val wheels = createTempDirectory("python-wheels")
+        try {
+            val wheel = writeWheel(wheels, "pip-left-probe", "1.0", scriptsAndData = true)
+            val code = "# /// script\n# dependencies = [\"pip-left-probe @ $wheel\"]\n# ///\nx = 1\n"
+            Python().use { python ->
+                python.exec(code)
+                // e.g. by an earlier version of this library
+                writeDistInfo(directory, "0.9", name = "pip-left-probe")
+
+                // when
+                python.exec(code)
+            }
+
+            // then
+            assert(directory.distInfoNames().filter { it.startsWith("pip_left_probe-") } == listOf("pip_left_probe-1.0.dist-info"))
+            assert(planInstalls(directory, "pip-left-probe==1.0").isEmpty())
         } finally {
             wheels.deleteRecursively()
         }
@@ -1344,27 +1375,30 @@ class PythonDependenciesTest {
     /**
      * Runs the [block] with a dependency directory holding the files of `replaced-probe` [installed] version,
      * with its dist-info, and the dist-info of the [replaced] version, recording files of other content,
-     * as `pip install --target --upgrade` leaves it, both with the [directUrl], if given.
+     * as `pip install --target --upgrade` leaves it, both also recording a script outside the directory,
+     * like `pip install --target` does.
      */
-    private fun withReplacedVersion(
+    private fun <T> withReplacedVersion(
         installed: String,
         replaced: String,
-        directUrl: String? = null,
-        block: (Path) -> Unit
-    ) = withDistInfos { directory ->
+        block: (Path) -> T
+    ): T = withDistInfos { directory ->
         val module = "replaced_probe/__init__.py"
         directory.resolve(module).createParentDirectories().writeText("VERSION = '$installed'\n")
-        writeDistInfo(directory, replaced, mapOf(module to "VERSION = '$replaced'\n"), directUrl = directUrl)
-        writeDistInfo(directory, installed, mapOf(module to "VERSION = '$installed'\n"), directUrl = directUrl)
+        listOf(replaced, installed).forEach { version ->
+            writeDistInfo(
+                directory, version, mapOf(module to "VERSION = '$version'\n", "../../bin/replaced-probe" to version)
+            )
+        }
         block(directory)
     }
 
     @OptIn(ExperimentalPathApi::class)
-    private fun withDistInfos(block: (Path) -> Unit) {
+    private fun <T> withDistInfos(block: (Path) -> T): T {
         PythonEnvironment.initialize()
         val directory = createTempDirectory("python-dependencies")
         try {
-            block(directory)
+            return block(directory)
         } finally {
             directory.deleteRecursively()
         }
@@ -1372,50 +1406,49 @@ class PythonDependenciesTest {
 
     /**
      * Writes the dist-info directory of the [name] [version] into the [directory],
-     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds, if [record],
-     * and with the [directUrl] as `direct_url.json`, if given.
-     *
-     * @return the `RECORD` file.
+     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds.
      */
     private fun writeDistInfo(
         directory: Path,
         version: String,
         files: Map<String, String> = emptyMap(),
-        name: String = "replaced-probe",
-        record: Boolean = true,
-        directUrl: String? = null
-    ): Path {
+        name: String = "replaced-probe"
+    ) {
         val distInfo = "${name.replace('-', '_')}-$version.dist-info"
-        val metadata = mapOf("$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n") +
-            (if (directUrl != null) mapOf("$distInfo/direct_url.json" to directUrl) else emptyMap())
+        val metadata = mapOf(
+            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n",
+            // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
+            "$distInfo/top_level.txt" to "${name.replace('-', '_')}\n"
+        )
         metadata.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
-        val recordFile = directory.resolve("$distInfo/RECORD")
-        if (record) recordFile.writeText(record(files + metadata, distInfo))
-        return recordFile
-    }
-
-    private fun Path.setRecordTime(time: Instant) {
-        setLastModifiedTime(FileTime.from(time))
+        directory.resolve("$distInfo/RECORD").writeText(record(files + metadata, distInfo))
     }
 
     private fun Path.distInfoNames(): List<String> =
         listDirectoryEntries("*.dist-info").map { it.name }.sorted()
 
-    /** The URL of the wheel of the [name] [version], written into the [directory], with a module of the version. */
+    /**
+     * The URL of the wheel of the [name] [version], written into the [directory], with a module of the version,
+     * and with a console script and a data file, if [scriptsAndData].
+     */
     private fun writeWheel(
         directory: Path,
         name: String,
         version: String,
-        requires: List<String> = emptyList()
+        requires: List<String> = emptyList(),
+        scriptsAndData: Boolean = false
     ): String {
         val distribution = name.replace('-', '_')
         val distInfo = "$distribution-$version.dist-info"
         val files = mapOf(
-            "$distribution/__init__.py" to "VERSION = '$version'\n",
+            "$distribution/__init__.py" to "VERSION = '$version'\ndef main():\n    print(VERSION)\n",
             "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n" +
                 requires.joinToString("") { "Requires-Dist: $it\n" },
             "$distInfo/WHEEL" to "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
-        )
+        ) + if (scriptsAndData) mapOf(
+            "$distInfo/entry_points.txt" to "[console_scripts]\n$name = $distribution:main\n",
+            "$distribution-$version.data/data/share/$distribution/version.txt" to "$version\n"
+        ) else emptyMap()
         val wheel = directory.resolve("$distribution-$version-py3-none-any.whl")
         ZipOutputStream(wheel.outputStream()).use { zip ->
             (files + ("$distInfo/RECORD" to record(files, distInfo))).forEach { (path, content) ->

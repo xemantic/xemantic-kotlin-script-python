@@ -202,9 +202,9 @@ otherwise the code can declare it as a dependency, see below.
   change the URL — for example, pin the commit — or delete the dependency directory.
   When pip replaces a distribution with another version of it,
   it leaves the `dist-info` directory of the replaced version beside the new one,
-  which is removed after the installation:
-  the installed version is the one whose recorded files are on disk with their recorded hashes,
-  and when the files of both versions are the same, the one installed last.
+  which is removed after the installation, as it was not written by it.
+  A dependency with several `dist-info` directories in the dependency directory,
+  e.g. left by an earlier version of this library, is installed again, which then removes the other ones.
   The installations into the dependency directory are serialized, also across processes,
   e.g. JVMs sharing the default directory in the user cache,
   with a lock of its `.xemantic-kotlin-script-python.lock` file,
