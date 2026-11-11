@@ -684,10 +684,41 @@ class PythonDependenciesTest {
         val path = listOf("", absolute.toString(), ".", "bin", "").joinToString(separator)
 
         // when
-        val candidates = PythonDependencies.executableCandidates("uv", path)
+        val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
 
         // then
-        assert(candidates == listOf(absolute.resolve("uv"), absolute.resolve("uv.exe")))
+        assert(candidates == listOf(absolute.resolve("uv")))
+    }
+
+    @Test
+    fun `should consider only exe files for executable candidates on Windows`() {
+        // given
+        val absolute = Path("").toAbsolutePath()
+
+        // when
+        val candidates = PythonDependencies.executableCandidates("uv", absolute.toString(), windows = true)
+
+        // then
+        assert(candidates == listOf(absolute.resolve("uv.exe")))
+    }
+
+    @Test
+    fun `should not find directory named as executable in PATH directory`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        val name = "planted-${UUID.randomUUID()}"
+        val executableDirectory = directory.resolve(name).createDirectory()
+
+        try {
+            // when
+            val found = PythonDependencies.findOnPath(name, directory.toString(), windows = false)
+
+            // then
+            assert(found == null)
+        } finally {
+            executableDirectory.deleteIfExists()
+            directory.deleteIfExists()
+        }
     }
 
     @Test
@@ -700,7 +731,7 @@ class PythonDependenciesTest {
         try {
             // when
             val found = PythonDependencies.findOnPath(
-                executable.fileName.toString(), "${File.pathSeparator}$directory"
+                executable.fileName.toString(), "${File.pathSeparator}$directory", windows = false
             )
 
             // then
@@ -722,7 +753,7 @@ class PythonDependenciesTest {
         try {
             for (path in listOf("/nonexistent${File.pathSeparator}", "", ".", "./")) {
                 // when
-                val found = PythonDependencies.findOnPath(name, path)
+                val found = PythonDependencies.findOnPath(name, path, windows = false)
 
                 // then
                 assert(found == null)
@@ -741,9 +772,7 @@ class PythonDependenciesTest {
         val candidates = PythonDependencies.executableCandidates("uv", path, windows = true)
 
         // then
-        assert(candidates == listOf("/opt/tool;s", "/usr/bin", "/opt/other").flatMap {
-            listOf(Path(it, "uv"), Path(it, "uv.exe"))
-        })
+        assert(candidates == listOf("/opt/tool;s", "/usr/bin", "/opt/other").map { Path(it, "uv.exe") })
     }
 
     @Test
@@ -755,21 +784,20 @@ class PythonDependenciesTest {
         val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
 
         // then
-        assert(candidates == listOf(Path("/opt/\"quoted\"", "uv"), Path("/opt/\"quoted\"", "uv.exe")))
+        assert(candidates == listOf(Path("/opt/\"quoted\"", "uv")))
     }
 
     @Test
     fun `should skip PATH entry which is not a valid path`() {
         // given
-        val separator = File.pathSeparator
         val absolute = Path("").toAbsolutePath()
-        val path = listOf("/opt/in\u0000valid", absolute.toString()).joinToString(separator)
+        val path = listOf("/opt/in\u0000valid", absolute.toString()).joinToString(File.pathSeparator)
 
         // when
-        val candidates = PythonDependencies.executableCandidates("uv", path)
+        val candidates = PythonDependencies.executableCandidates("uv", path, windows = false)
 
         // then
-        assert(candidates == listOf(absolute.resolve("uv"), absolute.resolve("uv.exe")))
+        assert(candidates == listOf(absolute.resolve("uv")))
     }
 
     private companion object {

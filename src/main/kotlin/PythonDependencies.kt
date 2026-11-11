@@ -38,6 +38,7 @@ import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.isExecutable
+import kotlin.io.path.isRegularFile
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeLines
 
@@ -287,17 +288,23 @@ internal object PythonDependencies {
         }
     }
 
-    /** The first executable of [executableCandidates] in the [path], or `null`. */
-    internal fun findOnPath(name: String, path: String? = System.getenv("PATH")): String? = path
-        ?.let { executableCandidates(name, it) }
-        ?.firstOrNull { it.isExecutable() }
+    /** The first executable regular file of [executableCandidates] in the [path], or `null`. */
+    internal fun findOnPath(
+        name: String,
+        path: String? = System.getenv("PATH"),
+        windows: Boolean = System.getProperty("os.name").startsWith("Windows")
+    ): String? = path
+        ?.let { executableCandidates(name, it, windows) }
+        ?.firstOrNull { it.isRegularFile() && it.isExecutable() }
         ?.toString()
 
     /**
-     * The files named [name], or `$name.exe`, in the directories of the [path], in their order.
-     * An empty or relative entry is skipped, as it would resolve against the working directory,
-     * whose files must not run as a tool,
-     * and so is an entry which is not a valid path, instead of failing every lookup.
+     * The files named [name], or `$name.exe` on [windows], in the directories of the [path], in their order —
+     * only `$name.exe` on Windows, where an extension-less file is a shell script, which cannot be run directly.
+     * A relative entry is skipped, as it resolves against a directory which can change, and whose files must not run as a tool:
+     * the working directory for an empty entry or `.`,
+     * and on Windows the current directory of a drive for `C:tools`, or the root of the current drive for `\tools`.
+     * An entry which is not a valid path is skipped as well, instead of failing every lookup.
      * On [windows], the entries are split as Windows does:
      * a double-quoted part of an entry may contain the `;` separator, and the quotes are removed —
      * `"` is illegal in a Windows path, while on POSIX it is a legal file name character, kept as is.
@@ -305,7 +312,7 @@ internal object PythonDependencies {
     internal fun executableCandidates(
         name: String,
         path: String,
-        windows: Boolean = File.pathSeparatorChar == ';'
+        windows: Boolean
     ): List<Path> = (if (windows) splitWindowsPath(path) else path.split(File.pathSeparatorChar))
         .mapNotNull { entry ->
             try {
@@ -315,7 +322,7 @@ internal object PythonDependencies {
             }
         }
         .filter { it.isAbsolute }
-        .flatMap { listOf(it.resolve(name), it.resolve("$name.exe")) }
+        .map { it.resolve(if (windows) "$name.exe" else name) }
 
     /** The entries of the Windows [path], separated by `;` outside of double quotes, with the quotes removed. */
     private fun splitWindowsPath(path: String): List<String> = buildList {
