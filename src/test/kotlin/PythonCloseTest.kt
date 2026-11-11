@@ -26,8 +26,13 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Future
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit.MILLISECONDS
 import java.util.concurrent.TimeUnit.SECONDS
+import java.util.logging.Handler
+import java.util.logging.Level
+import java.util.logging.LogRecord
+import java.util.logging.Logger
 import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlinx.coroutines.Dispatchers
@@ -588,14 +593,106 @@ class PythonCloseTest {
         }
         python.exec("x = 1")
 
+        val log = LogCapture()
+
         // when
-        val firstFailure = runCatching { python.close() }.exceptionOrNull()
-        val secondFailure = runCatching { python.close() }.exceptionOrNull()
+        val (firstFailure, secondFailure) = log.use {
+            runCatching { python.close() }.exceptionOrNull() to runCatching { python.close() }.exceptionOrNull()
+        }
 
         // then
         assert(firstFailure is JepException)
         assert(firstFailure.message == "close failed")
         assert(secondFailure == null)
+        // reported by close(), so not logged as well
+        assert(log.records.isEmpty())
+    }
+
+    @Test
+    fun `should log failure of closing interpreter after close interrupted while waiting for it`() {
+        // given
+        val closingEntered = CountDownLatch(1)
+        val releaseClosing = CountDownLatch(1)
+        val python = Python.withInterpreterFactory {
+            object : SharedInterpreter() {
+                override fun close() {
+                    closingEntered.countDown()
+                    assert(releaseClosing.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+                    super.close()
+                    throw JepException("close failed")
+                }
+            }
+        }
+        python.exec("x = 1")
+        val log = LogCapture()
+        log.use {
+            var closerFailure: Throwable? = null
+            val closer = thread(isDaemon = true, name = "closer") {
+                closerFailure = runCatching { python.close() }.exceptionOrNull()
+            }
+            assert(closingEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+
+            // when
+            closer.interrupt()
+            closer.join(DEADLOCK_TIMEOUT)
+            releaseClosing.countDown()
+            val record = log.records.poll(DEADLOCK_TIMEOUT, MILLISECONDS)
+            val laterFailure = runCatching { python.close() }.exceptionOrNull()
+
+            // then
+            assert(!closer.isAlive)
+            assert(closerFailure is InterruptedException)
+            assert(record?.level == Level.WARNING)
+            assert(record?.thrown is JepException)
+            assert(record?.thrown?.message == "close failed")
+            // already reported by the log, see close()
+            assert(laterFailure == null)
+            assert(log.records.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should log failure of closing interpreter after close returned while call is running`() {
+        // given
+        val python = Python.withInterpreterFactory {
+            object : SharedInterpreter() {
+                override fun close() {
+                    super.close()
+                    throw JepException("close failed")
+                }
+            }
+        }
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        python["block"] = { n: Long ->
+            callbackEntered.countDown()
+            assert(releaseCallback.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+            n
+        }
+        val log = LogCapture()
+        log.use {
+            var runningResult: Long? = null
+            val running = thread(isDaemon = true, name = "running") {
+                runningResult = python.eval<Long>("block(42)")
+            }
+            assert(callbackEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+
+            // when
+            // returns at once, as the call is running
+            val closerFailure = runCatching { python.close() }.exceptionOrNull()
+            releaseCallback.countDown()
+            running.join(DEADLOCK_TIMEOUT)
+            val record = log.records.poll(DEADLOCK_TIMEOUT, MILLISECONDS)
+
+            // then
+            assert(closerFailure == null)
+            assert(!running.isAlive)
+            assert(runningResult == 42L)
+            assert(record?.level == Level.WARNING)
+            assert(record?.thrown is JepException)
+            assert(record?.thrown?.message == "close failed")
+            assert(log.records.isEmpty())
+        }
     }
 
     @Test
@@ -671,6 +768,34 @@ class PythonCloseTest {
         assert(!closer.isAlive)
         assert(failure == null)
         assert(stopCalled)
+    }
+
+    /**
+     * Captures the records logged by [Python], through `java.util.logging`, the default backend of `System.Logger`,
+     * while it is open.
+     */
+    private class LogCapture : AutoCloseable {
+
+        val records = LinkedBlockingQueue<LogRecord>()
+
+        private val logger = Logger.getLogger(Python::class.java.name)
+
+        private val handler = object : Handler() {
+            override fun publish(record: LogRecord) {
+                records.add(record)
+            }
+            override fun flush() {}
+            override fun close() {}
+        }
+
+        init {
+            logger.addHandler(handler)
+        }
+
+        override fun close() {
+            logger.removeHandler(handler)
+        }
+
     }
 
     /**

@@ -175,6 +175,8 @@ otherwise the code can declare it as a dependency, see below.
   Calling `close()` again returns at once, also while the interpreter is still being closed.
   An interrupted `close()` throws an `InterruptedException` at once,
   while the interpreter is still closed later, in the background.
+  A failure of closing the interpreter is thrown by the `close()` waiting for it,
+  or, when none waits, logged as a `WARNING` of the `System.Logger` named `com.xemantic.kotlin.script.python.Python`.
 * The code passed to `exec`, or `python(code)`, can declare its dependencies,
   like a `@file:DependsOn` of a Kotlin snippet,
   with [inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/),

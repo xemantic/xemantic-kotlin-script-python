@@ -32,6 +32,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * A stateful CPython interpreter, embedded with [Jep](https://github.com/ninia/jep).
@@ -111,6 +112,12 @@ public class Python private constructor(
     })
 
     private val closed = AtomicBoolean(false)
+
+    /**
+     * The failure of closing the interpreter, or [CLOSING_ABANDONED] once [close] no longer waits for it,
+     * whichever is set first, see [abandonClosing].
+     */
+    private val closingFailure = AtomicReference<Any?>(null)
 
     /** Whether a call is running on the thread of this `Python`, written only by this thread, see [close]. */
     @Volatile
@@ -266,7 +273,9 @@ public class Python private constructor(
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
      * If closing the interpreter fails, its exception is thrown by this `close()`, which waits for it.
      * If the waiting is interrupted, it throws an [InterruptedException] at once, clearing the interrupt flag of the thread,
-     * and the interpreter is still closed afterward, in the background, but a failure of closing it is not reported.
+     * and the interpreter is still closed afterward, in the background.
+     * Whenever no `close()` waits for the closing of the interpreter, an exception thrown by it is logged instead,
+     * as a `WARNING` of the [System.Logger] named after this class, so that it is never lost.
      *
      * @throws InterruptedException if the waiting is interrupted.
      *
@@ -283,7 +292,7 @@ public class Python private constructor(
      * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
      * still able to call back this `Python`, and the interpreter is closed after it returns.
-     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is not reported,
+     * Then nobody waits for the closing, so an exception thrown by closing the interpreter is only logged,
      * and if the JVM exits before the running call returns, e.g. at the end of `main`,
      * the interpreter is never closed, as its thread is a daemon one.
      * Waiting would deadlock, when the running call waits for `close()`:
@@ -300,6 +309,10 @@ public class Python private constructor(
             executor.submit(Runnable {
                 try {
                     interpreter?.close()
+                } catch (e: Throwable) {
+                    // logged here, if close() no longer waits for it, see abandonClosing
+                    if (!closingFailure.compareAndSet(null, e)) logClosingFailure(e)
+                    throw e
                 } finally {
                     // defensive only: nothing can use the interpreter afterward, as the executor is shut down
                     interpreter = null
@@ -312,15 +325,28 @@ public class Python private constructor(
         // called by a Kotlin function, called from Python, or by a thread it waits for, so waiting here could deadlock;
         // read after setting closed, so that a call, which is not running yet, sees it closed before running any code,
         // and then the task of close() runs right after it
-        if (running) return
+        if (running) {
+            abandonClosing()
+            return
+        }
         try {
             closing.get()
         } catch (e: ExecutionException) {
             throw e.cause ?: e
         } catch (e: InterruptedException) {
             // the interpreter is still closed by its task, which is not cancelled
+            abandonClosing()
             throw e
         }
+    }
+
+    /**
+     * Tells the task of [close] that nobody waits for it, so that a failure of closing the interpreter is logged,
+     * here, if the task has failed already, or by the task otherwise, exactly once.
+     */
+    private fun abandonClosing() {
+        val failure = closingFailure.getAndSet(CLOSING_ABANDONED)
+        if (failure is Throwable) logClosingFailure(failure)
     }
 
     private fun <T> call(block: SharedInterpreter.() -> T): T {
@@ -574,6 +600,19 @@ public class Python private constructor(
         ): Python = Python({ it }, newInterpreter)
 
         private val threadCounter = AtomicInteger()
+
+        private val logger = System.getLogger(Python::class.java.name)
+
+        /** Set by [close] instead of the failure of closing the interpreter, when it no longer waits for it. */
+        private val CLOSING_ABANDONED = Any()
+
+        private fun logClosingFailure(failure: Throwable) {
+            logger.log(
+                System.Logger.Level.WARNING,
+                "Closing the interpreter failed, with no close() waiting to throw it",
+                failure
+            )
+        }
 
         /**
          * Returns this value as a [PyObject], also when it is a proxy of a Java interface,
