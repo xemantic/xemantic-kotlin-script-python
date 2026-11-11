@@ -205,8 +205,10 @@ otherwise the code can declare it as a dependency, see below.
   left in the dependency directory by `pip install --target --upgrade` ([#59](https://github.com/xemantic/xemantic-kotlin-script-python/issues/59)),
   or a remote archive with a requested hash of an algorithm which pip does not record, like `#sha3_256=` or `#blake2b=`
   (pip records only `sha512`, `sha384`, `sha256`, `sha224`, `sha1` and `md5`),
-  and any direct URL dependency is installed again together with another missing dependency of the same code,
-  so that pip does not replace it with a distribution from the index required by the other one.
+  and, with uv or a pip older than 22.2,
+  any direct URL dependency is installed again together with another missing dependency of the same code,
+  so that the installer, not seeing the dependency directory,
+  does not replace it with a distribution from the index required by the other one.
   To update a branch, or a remote archive changing its content under the same URL,
   change the URL — for example, pin the commit — or delete the dependency directory.
   The installations into the dependency directory are serialized, also across processes,

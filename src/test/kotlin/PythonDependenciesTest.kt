@@ -26,7 +26,6 @@ import java.lang.reflect.Proxy
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
@@ -38,6 +37,7 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.appendText
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createDirectory
 import kotlin.io.path.createFile
@@ -50,8 +50,8 @@ import kotlin.io.path.getLastModifiedTime
 import kotlin.io.path.getPosixFilePermissions
 import kotlin.io.path.isWritable
 import kotlin.io.path.listDirectoryEntries
-import kotlin.io.path.readAttributes
 import kotlin.io.path.readBytes
+import kotlin.io.path.readText
 import kotlin.io.path.setLastModifiedTime
 import kotlin.io.path.writeText
 import kotlin.test.AfterTest
@@ -129,7 +129,21 @@ class PythonDependenciesTest {
         return output
     }
 
-    private fun Path.fileKey(): Any? = readAttributes<BasicFileAttributes>().fileKey()
+    /** Builds the source archive of the distribution [name] 1.0 into the [directory], built with setuptools. */
+    private fun buildSourceArchive(directory: Path, name: String): Path {
+        val archive = directory.createDirectories().resolve("$name-1.0.tar.gz")
+        val (exitCode, output) = runProcess(listOf(python, "-c", BUILD_SOURCE_ARCHIVE, archive.toString(), name))
+        assert(exitCode == 0, output)
+        return archive
+    }
+
+    /** Builds the wheel of the distribution [name] 1.0 into the [directory], with the [answer] as its `ANSWER`. */
+    private fun buildWheel(directory: Path, name: String, answer: Int = 42): Path {
+        val wheel = directory.createDirectories().resolve("$name-1.0-py3-none-any.whl")
+        val (exitCode, output) = runProcess(listOf(python, "-c", BUILD_WHEEL, wheel.toString(), name, answer.toString()))
+        assert(exitCode == 0, output)
+        return wheel
+    }
 
     @Test
     fun `should find no metadata in code without metadata block`() {
@@ -732,31 +746,6 @@ class PythonDependenciesTest {
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
-    @Test
-    fun `should run pip in working directory with pip package shadowing it`() {
-        // given
-        PythonEnvironment.initialize()
-        val workingDirectory = createTempDirectory("python-shadowing")
-        val pip = workingDirectory.resolve("pip").createDirectory()
-        pip.resolve("__init__.py").writeText("raise SystemExit('shadowing pip imported')\n")
-        pip.resolve("__main__.py").writeText("raise SystemExit('shadowing pip run')\n")
-
-        try {
-            // when
-            val (exitCode, output) = runProcess(
-                PythonDependencies.pipCommand("--version"),
-                mergeErrorStream = false,
-                directory = workingDirectory
-            )
-
-            // then
-            assert(exitCode == 0 && output.startsWith("pip "))
-        } finally {
-            workingDirectory.deleteRecursively()
-        }
-    }
-
     @Test
     fun `should plan git dependency as installed for the same URL and revision`() {
         // given
@@ -1157,16 +1146,16 @@ class PythonDependenciesTest {
     @Test
     fun `should plan installed URL dependency for installation with missing dependency`() {
         // given
-        // pip resolves the missing dependency without the dependency directory,
+        // uv resolves the missing dependency without the dependency directory,
         // so a distribution required by it would be installed from the index over the one installed from the URL
         val directUrl = """{"url": "https://example.com/probe.git", "vcs_info": {"vcs": "git", "commit_id": "$COMMIT", "requested_revision": "v1"}}"""
         val dependency = "direct-url-probe @ git+https://example.com/probe.git@v1"
 
         // when
-        val installs = planInstalls(dependency, directUrl, otherDependencies = listOf("nonexistent-dependency"))
+        val entries = planEntries(dependency, directUrl, otherDependencies = listOf("nonexistent-dependency"))
 
         // then
-        assert(installs == listOf(dependency, "nonexistent-dependency"))
+        assert(entries == listOf("installed" to dependency, "install" to "nonexistent-dependency"))
     }
 
     @Test
@@ -1233,21 +1222,31 @@ class PythonDependenciesTest {
         assert(installs.isEmpty())
     }
 
+    /** The requirements to install, the `install` entries of [planEntries]. */
+    private fun planInstalls(
+        dependency: String,
+        directUrl: String?,
+        uvCache: String? = null,
+        otherVersion: String? = null
+    ): List<String> = planEntries(dependency, directUrl, uvCache, otherVersion = otherVersion)
+        .filter { it.first == "install" }
+        .map { it.second }
+
     /**
-     * The requirements to install, planned for the [dependency]
+     * The entries of the plan, other than the constraints, for the [dependency], and the [otherDependencies],
      * with the dependency directory holding `direct-url-probe 1.0` installed from the [directUrl] (PEP 610),
      * or from an index when `null`,
      * and also the `dist-info` directory of its [otherVersion], if given, with the same `direct_url.json`,
      * so that whichever of them `importlib.metadata` finds first matches the [dependency].
      */
     @OptIn(ExperimentalPathApi::class)
-    private fun planInstalls(
+    private fun planEntries(
         dependency: String,
         directUrl: String?,
         uvCache: String? = null,
         otherDependencies: List<String> = emptyList(),
         otherVersion: String? = null
-    ): List<String> {
+    ): List<Pair<String, String>> {
         PythonEnvironment.initialize()
         val directory = createTempDirectory("python-dependencies")
         try {
@@ -1263,8 +1262,7 @@ class PythonDependenciesTest {
             }
             val dependencies = (listOf(dependency) + otherDependencies).joinToString(", ") { "'$it'" }
             return PythonDependencies.plan("dependencies = [$dependencies]\n", directory.toString(), emptyList())
-                .filter { it.first == "install" }
-                .map { it.second }
+                .filter { it.first != "constraint" }
         } finally {
             directory.deleteRecursively()
         }
@@ -1287,8 +1285,9 @@ class PythonDependenciesTest {
     fun `should keep distribution of dependency directory when pip installs dependency requiring it`() {
         // given
         pipInstalled("idna==3.10")
+        // a reinstalled module would lose the marker
         val idnaModule = directory.resolve("idna").resolve("__init__.py")
-        val idnaKey = idnaModule.fileKey()
+        idnaModule.appendText("\n# kept\n")
 
         // when
         val (exitCode, output) = pipInstall("requests")
@@ -1296,7 +1295,7 @@ class PythonDependenciesTest {
         // then
         assert(exitCode == 0, output)
         assert(directory.resolve("requests").exists())
-        assert(idnaModule.fileKey() == idnaKey)
+        assert(idnaModule.readText().endsWith("\n# kept\n"))
     }
 
     /**
@@ -1386,10 +1385,8 @@ class PythonDependenciesTest {
     @Test
     fun `should install dependency from URL requiring credentials with pip`() {
         // given
-        val wheels = sources.resolve("wheels").createDirectories()
-        val wheel = wheels.resolve("authpkg-1.0-py3-none-any.whl")
-        val (wheelExitCode, wheelOutput) = runProcess(listOf(python, "-c", BUILD_WHEEL, wheel.toString()))
-        assert(wheelExitCode == 0, wheelOutput)
+        val wheels = sources.resolve("wheels")
+        val wheel = buildWheel(wheels, "authpkg")
         val server = ProcessBuilder(python, "-c", AUTHENTICATING_SERVER, wheels.toString(), "user:secret")
             .redirectErrorStream(true)
             .start()
@@ -1406,6 +1403,108 @@ class PythonDependenciesTest {
             server.destroy()
             server.waitFor()
         }
+    }
+
+    /**
+     * pip does not install a distribution from a URL in the version already installed, unless from a local archive,
+     * while a missing one, planned so by its `direct_url.json`, is another revision of it, e.g. of a git branch.
+     */
+    @Test
+    fun `should install dependency from other URL in the version already in dependency directory with pip`() {
+        // given
+        val first = buildWheel(sources.resolve("first"), "urlpkg", answer = 1)
+        val second = buildWheel(sources.resolve("second"), "urlpkg", answer = 2)
+        pipInstalled("urlpkg @ ${first.toUri()}")
+
+        // when
+        val (exitCode, output) = pipInstall("urlpkg @ ${second.toUri()}")
+
+        // then
+        assert(exitCode == 0, output)
+        assert(pythonOfDirectory("import urlpkg; print(urlpkg.ANSWER)") == "2")
+    }
+
+    /**
+     * An installed dependency from a URL is passed to the installer along with the missing ones,
+     * so that pip resolves with it, but does not reinstall it, also from a local archive.
+     */
+    @Test
+    fun `should keep installed dependency from URL passed with missing one to pip`() {
+        // given
+        // pip reinstalls a local source archive in the version already installed
+        val archive = buildSourceArchive(sources.resolve("archives"), "urlpkg")
+        val installed = "urlpkg @ ${archive.toUri()}"
+        pipInstalled(installed)
+        val module = directory.resolve("urlpkg").resolve("__init__.py")
+        // a reinstalled module would lose the marker
+        module.appendText("\n# kept\n")
+        val other = buildWheel(sources.resolve("wheels"), "otherpkg")
+
+        // when
+        val (exitCode, output) = runProcess(
+            PythonDependencies.pipInstallCommand(
+                python, directory.toString(), constraints.toString(),
+                requirements = listOf("otherpkg @ ${other.toUri()}"),
+                installed = listOf(installed)
+            )
+        )
+
+        // then
+        assert(exitCode == 0, output)
+        assert(pythonOfDirectory("import otherpkg; print(otherpkg.ANSWER)") == "42")
+        assert(module.readText().endsWith("\n# kept\n"))
+    }
+
+    /** pip keeps the credentials per host, while each URL in the requirements can have its own. */
+    @Test
+    fun `should install dependencies from URLs of the same host with different credentials with pip`() {
+        // given
+        val wheels = sources.resolve("wheels")
+        val first = buildWheel(wheels, "authpkg")
+        val second = buildWheel(wheels, "otherpkg")
+        val server = ProcessBuilder(
+            python, "-c", AUTHENTICATING_SERVER, wheels.toString(), "authpkg-=user1:secret1", "otherpkg-=user2:secret2"
+        ).redirectErrorStream(true).start()
+        try {
+            val port = server.inputStream.bufferedReader().readLine()
+
+            // when
+            val (exitCode, output) = pipInstall(
+                "authpkg @ http://user1:secret1@127.0.0.1:$port/${first.fileName}",
+                "otherpkg @ http://user2:secret2@127.0.0.1:$port/${second.fileName}"
+            )
+
+            // then
+            assert(exitCode == 0, output)
+            assert(pythonOfDirectory("import authpkg, otherpkg; print(authpkg.ANSWER, otherpkg.ANSWER)") == "42 42")
+        } finally {
+            server.destroy()
+            server.waitFor()
+        }
+    }
+
+    /** pip and its subprocesses run with `-c`, which would import a `pip` package of the working directory. */
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should install with pip in working directory with pip package shadowing it`() {
+        // given
+        val workingDirectory = sources.resolve("working").createDirectories()
+        val pip = workingDirectory.resolve("pip").createDirectory()
+        pip.resolve("__init__.py").writeText("raise SystemExit('shadowing pip imported')\n")
+        pip.resolve("__main__.py").writeText("raise SystemExit('shadowing pip run')\n")
+        val wheel = buildWheel(sources.resolve("wheels"), "urlpkg")
+
+        // when
+        val (exitCode, output) = runProcess(
+            PythonDependencies.pipInstallCommand(
+                python, directory.toString(), constraints.toString(), listOf("urlpkg @ ${wheel.toUri()}")
+            ),
+            directory = workingDirectory
+        )
+
+        // then
+        assert(exitCode == 0, output)
+        assert(pythonOfDirectory("import urlpkg; print(urlpkg.ANSWER)") == "42")
     }
 
     @Test
@@ -1534,6 +1633,27 @@ class PythonDependenciesTest {
 
         // then
         assert(requirement == "pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git@0123abcd#subdirectory=libs/pkg")
+    }
+
+    /** Each requested URL can have its own credentials, also for the same host as another one. */
+    @Test
+    fun `should pin requested distribution from URL with credentials of its requirement over other one of same host`() {
+        // when
+        val requirement = pinnedRequirement(
+            """
+            {
+              "metadata": {"name": "b", "version": "1.0"},
+              "is_direct": true,
+              "requested": true,
+              "download_info": {"url": "https://host/b-1.0-py3-none-any.whl", "archive_info": {}}
+            }
+            """.trimIndent(),
+            "a @ https://u1:t1@host/a-1.0-py3-none-any.whl",
+            "B @ https://u2:t2@host/b-1.0-py3-none-any.whl"
+        )
+
+        // then
+        assert(requirement == "b @ https://u2:t2@host/b-1.0-py3-none-any.whl")
     }
 
     @Test
@@ -1706,38 +1826,75 @@ class PythonDependenciesTest {
             fcntl.lockf(fd, fcntl.LOCK_UN)
         """.trimIndent()
 
-        /** Builds the wheel of the `authpkg` distribution, to the path of its argument. */
+        /**
+         * Builds the wheel of the distribution named by its second argument, in version 1.0,
+         * to the path of its first argument, with the `ANSWER` of its third argument.
+         */
         @Language("python")
         val BUILD_WHEEL = """
             import base64, hashlib, sys, zipfile
 
+            path, name, answer = sys.argv[1:]
             files = {
-                "authpkg/__init__.py": b"ANSWER = 42\n",
-                "authpkg-1.0.dist-info/METADATA": b"Metadata-Version: 2.1\nName: authpkg\nVersion: 1.0\n",
-                "authpkg-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                f"{name}/__init__.py": f"ANSWER = {answer}\n".encode(),
+                f"{name}-1.0.dist-info/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n".encode(),
+                f"{name}-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
             }
             record = "".join(
-                f"{name},sha256={base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()},{len(data)}\n"
-                for name, data in files.items()
-            ) + "authpkg-1.0.dist-info/RECORD,,\n"
-            with zipfile.ZipFile(sys.argv[1], "w") as wheel:
-                for name, data in files.items():
-                    wheel.writestr(name, data)
-                wheel.writestr("authpkg-1.0.dist-info/RECORD", record)
+                f"{file},sha256={base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()},{len(data)}\n"
+                for file, data in files.items()
+            ) + f"{name}-1.0.dist-info/RECORD,,\n"
+            with zipfile.ZipFile(path, "w") as wheel:
+                for file, data in files.items():
+                    wheel.writestr(file, data)
+                wheel.writestr(f"{name}-1.0.dist-info/RECORD", record)
+        """.trimIndent()
+
+        /** Builds the source archive of the distribution named by its second argument, to the path of its first one. */
+        @Language("python")
+        val BUILD_SOURCE_ARCHIVE = """
+            import io, sys, tarfile
+
+            path, name = sys.argv[1:]
+            files = {
+                "pyproject.toml": (
+                    '[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n\n'
+                    f'[project]\nname = "{name}"\nversion = "1.0"\n'
+                ),
+                "PKG-INFO": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n",
+                f"{name}/__init__.py": "ANSWER = 42\n",
+            }
+            with tarfile.open(path, "w:gz") as archive:
+                for file, text in files.items():
+                    data = text.encode()
+                    info = tarfile.TarInfo(f"{name}-1.0/{file}")
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
         """.trimIndent()
 
         /**
-         * Serves the directory of its first argument, only with the basic authentication of its second argument,
+         * Serves the directory of its first argument, only with basic authentication,
          * printing its port.
+         * Each following argument is `<prefix>=<user>:<password>`,
+         * the credentials of the files whose names start with the prefix, the first matching one,
+         * or just `<user>:<password>`, the credentials of all the files.
          */
         @Language("python")
         val AUTHENTICATING_SERVER = """
             import base64, functools, http.server, sys
 
-            directory, authorization = sys.argv[1], "Basic " + base64.b64encode(sys.argv[2].encode()).decode()
+            directory = sys.argv[1]
+            authorizations = [
+                (prefix, "Basic " + base64.b64encode(credentials.encode()).decode())
+                for prefix, _, credentials in (
+                    argument.partition("=") if "=" in argument else ("", "", argument) for argument in sys.argv[2:]
+                )
+            ]
 
             class Handler(http.server.SimpleHTTPRequestHandler):
                 def authorized(self):
+                    name = self.path.lstrip("/")
+                    authorization = next(value for prefix, value in authorizations if name.startswith(prefix))
                     if self.headers.get("Authorization") == authorization:
                         return True
                     self.send_response(401)

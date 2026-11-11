@@ -142,8 +142,9 @@ internal object PythonDependencies {
                     val plan = plan(metadata, directory.toString(), imported)
                     val missing = plan.missing()
                     if (missing.isNotEmpty()) {
+                        val installed = plan.filter { it.first == "installed" }.map { it.second }
                         val constraints = plan.filter { it.first == "constraint" }.map { it.second }
-                        installMissing(missing, constraints, directory.toString())
+                        installMissing(missing, installed, constraints, directory.toString())
                     }
                 }
             }
@@ -211,7 +212,7 @@ internal object PythonDependencies {
      * Runs the [PLAN] for the [metadata], found by [scriptMetadata], the dependency [directory],
      * and the [imported] top-level modules, with the [command], by default the [planCommand].
      *
-     * @return the `install` and `constraint` entries of the plan, as pairs of the kind and the value.
+     * @return the `install`, `installed` and `constraint` entries of the plan, as pairs of the kind and the value.
      * @throws PythonDependencyException if the plan cannot be made.
      */
     fun plan(
@@ -231,16 +232,6 @@ internal object PythonDependencies {
     /** The command running the [PLAN] for the dependency [directory]. */
     fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
 
-    /**
-     * The command running `pip` of the environment with the [arguments],
-     * like `python -m pip`, which would import from the working directory, also `pip` itself.
-     */
-    fun pipCommand(vararg arguments: String): List<String> = pythonCommand(
-        PythonEnvironment.executable,
-        "import runpy\nrunpy.run_module('pip', run_name='__main__', alter_sys=True)",
-        *arguments
-    )
-
     /** This string as a JSON string, with every character outside printable ASCII escaped, so it is ASCII only. */
     private fun String.toJson(): String = buildString(length + 2) {
         append('"')
@@ -255,7 +246,12 @@ internal object PythonDependencies {
         append('"')
     }
 
-    private fun installMissing(missing: List<String>, constraints: List<String>, directory: String) {
+    private fun installMissing(
+        missing: List<String>,
+        installed: List<String>,
+        constraints: List<String>,
+        directory: String
+    ) {
         val constraintsFile = createTempFile("python-constraints", ".txt")
         try {
             constraintsFile.writeLines(constraints)
@@ -266,9 +262,9 @@ internal object PythonDependencies {
                     "--python", PythonEnvironment.executable,
                     "--target", directory,
                     "--constraints", constraintsFile.toString()
-                ) + missing
+                ) + missing + installed
             } else {
-                pipInstallCommand(PythonEnvironment.executable, directory, constraintsFile.toString(), missing)
+                pipInstallCommand(PythonEnvironment.executable, directory, constraintsFile.toString(), missing, installed)
             }
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
@@ -282,59 +278,72 @@ internal object PythonDependencies {
     }
 
     /**
-     * The command installing the [requirements] with pip of the [python] executable into the [directory],
+     * The command installing the missing [requirements] with pip of the [python] executable into the [directory],
      * keeping the distributions of the [constraints] file in their versions,
-     * and the ones already in the [directory], if they satisfy the [requirements].
+     * and the ones already in the [directory], if they satisfy the [requirements],
+     * also the [installed] direct URL requirements, which pip resolves with, but does not install again.
      */
     internal fun pipInstallCommand(
         python: String,
         directory: String,
         constraints: String,
-        requirements: List<String>
-    ): List<String> = listOf(python, "-c", PIP_INSTALL, directory, constraints) + requirements
+        requirements: List<String>,
+        installed: List<String> = emptyList()
+    ): List<String> = pythonCommand(
+        python, PIP_INSTALL, directory, constraints, *requirements.toTypedArray(), "--installed", *installed.toTypedArray()
+    )
 
     /**
      * The `pinned_requirement` Python function,
      * returning the requirement of exactly the distribution resolved in an installation report of pip,
      * like `direct_url_as_pep440_direct_reference` of pip,
-     * and the `url_credentials` function, returning the credentials of the URLs of the requirements by their hosts.
+     * and the `url_credentials` function, returning the credentials of the URLs of the requirements,
+     * by their canonical names, and by their hosts.
      *
      * The report has the URLs without their credentials,
-     * which are taken back from the URL of a requirement with the same host,
-     * also for a distribution required by a requested one, like pip reuses the credentials of a host for all its URLs.
+     * which are taken back from the URL of the requirement of the distribution,
+     * as each URL can have its own credentials, also for the same host,
+     * or otherwise from the first URL of a requirement with the same host,
+     * also for a distribution required by a requested one, like pip reuses the credentials of a host for its other URLs.
      */
     @Language("python")
     internal val PIP_PINNED_REQUIREMENT = """
         def url_credentials(requirements):
             from urllib.parse import urlsplit
             from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
-            credentials = {}
+            from pip._vendor.packaging.utils import canonicalize_name
+            by_name, by_host = {}, {}
             for requirement in requirements:
                 try:
-                    url = Requirement(requirement).url
+                    parsed = Requirement(requirement)
                 except InvalidRequirement:
                     continue
-                if url:
+                if parsed.url:
                     # the password can contain "@" too
-                    user_info, at, host = urlsplit(url).netloc.rpartition("@")
+                    user_info, at, host = urlsplit(parsed.url).netloc.rpartition("@")
                     if at:
-                        credentials.setdefault(host, user_info)
-            return credentials
+                        by_name.setdefault(canonicalize_name(parsed.name), user_info)
+                        by_host.setdefault(host, user_info)
+            return by_name, by_host
 
-        def with_credentials(url, credentials):
+        def with_credentials(url, user_info):
             from urllib.parse import urlsplit, urlunsplit
             parts = urlsplit(url)
             # pip before 26 removes the credentials only up to the first "@", leaving the rest of the password
             host = parts.netloc.rpartition("@")[2]
-            if host not in credentials:
+            if user_info is None:
                 return url
-            return urlunsplit(parts._replace(netloc=f"{credentials[host]}@{host}"))
+            return urlunsplit(parts._replace(netloc=f"{user_info}@{host}"))
 
         def pinned_requirement(distribution, credentials):
+            from urllib.parse import urlsplit
+            from pip._vendor.packaging.utils import canonicalize_name
             name, download = distribution["metadata"]["name"], distribution["download_info"]
             if not distribution["is_direct"]:
                 return f"{name}=={distribution['metadata']['version']}"
-            url = with_credentials(download["url"], credentials)
+            by_name, by_host = credentials
+            host = urlsplit(download["url"]).netloc.rpartition("@")[2]
+            url = with_credentials(download["url"], by_name.get(canonicalize_name(name), by_host.get(host)))
             fragments = []
             if "vcs_info" in download:
                 vcs = download["vcs_info"]
@@ -352,8 +361,10 @@ internal object PythonDependencies {
     """.trimIndent()
 
     /**
-     * Installs the requirements with pip into the dependency directory, its first argument,
+     * Installs the missing requirements with pip into the dependency directory, its first argument,
      * keeping the versions of the constraints file, its second argument.
+     * The missing requirements follow, then `--installed`, followed by the installed direct URL requirements,
+     * which the [PLAN] passes along with the missing ones, so that pip resolves with them.
      *
      * pip ignores the distributions already installed in a `--target` directory,
      * so it would install them again, also with their own dependencies, replacing the files of the loaded modules.
@@ -361,6 +372,11 @@ internal object PythonDependencies {
      * and then only these are installed, without their dependencies, into an empty staging directory.
      * Its files are merged into the dependency directory, after removing the files of the replaced distributions,
      * so that a directory shared with other distributions, like a namespace package, is kept.
+     *
+     * The resolution skips a direct URL requirement in the version already installed, unless from a local source,
+     * which it would install again, also an installed one.
+     * Therefore, a missing one is installed anyway, as the [PLAN] knows it is another revision, e.g. of a git branch,
+     * while an installed one is never installed again.
      *
      * pip older than 22.2 has no installation report to resolve with,
      * so it installs and upgrades the requirements directly, also the distributions already in the dependency directory.
@@ -371,7 +387,9 @@ internal object PythonDependencies {
         from importlib import metadata
         from pathlib import Path
 
-        directory, constraints, requirements = sys.argv[1], sys.argv[2], sys.argv[3:]
+        directory, constraints = sys.argv[1], sys.argv[2]
+        separator = sys.argv.index("--installed", 3)
+        requirements, installed = sys.argv[3:separator], sys.argv[separator + 1:]
 
         try:
             from pip import __version__ as pip_version
@@ -380,11 +398,23 @@ internal object PythonDependencies {
 
         options = ["--quiet", "--disable-pip-version-check", "--no-input"]
 
+        def pip(*path):
+            # like -c, -m would put the working directory first on sys.path, also to import pip from
+            return [
+                sys.executable, "-c",
+                "import runpy, sys\n"
+                "if sys.path[:1] == ['']: del sys.path[0]\n"
+                "sys.path.extend(sys.argv[1:sys.argv.index('--', 1)])\n"
+                "del sys.argv[1:sys.argv.index('--', 1) + 1]\n"
+                "runpy.run_module('pip', run_name='__main__', alter_sys=True)",
+                *path, "--"
+            ]
+
         if tuple(int(part) for part in re.findall(r"\d+", pip_version)[:2]) < (22, 2):
             # without the installation report, the distributions of the directory are installed again
             sys.exit(subprocess.run(
-                [sys.executable, "-m", "pip", "install"] + options
-                + ["--upgrade", "--target", directory, "--constraint", constraints] + requirements
+                pip() + ["install"] + options + ["--upgrade", "--target", directory, "--constraint", constraints]
+                + requirements + installed
             ).returncode)
 
         from pip._vendor.packaging.utils import canonicalize_name
@@ -393,23 +423,40 @@ internal object PythonDependencies {
         for stale in Path(directory).glob(".staging-*"):
             shutil.rmtree(stale, ignore_errors=True)
 
-        pip_seeing_directory = [
-            sys.executable, "-c",
-            "import runpy, sys; sys.path.append(sys.argv.pop(1)); runpy.run_module('pip', run_name='__main__', alter_sys=True)",
-            directory
-        ] + options
         with tempfile.TemporaryDirectory() as temp:
             report = os.path.join(temp, "report.json")
             resolution = subprocess.run(
-                pip_seeing_directory + ["install", "--dry-run", "--report", report, "--constraint", constraints] + requirements
+                pip(directory) + ["install"] + options + ["--dry-run", "--report", report, "--constraint", constraints]
+                + requirements + installed
             )
             if resolution.returncode != 0:
                 sys.exit(resolution.returncode)
             with open(report, encoding="utf-8") as file:
                 resolved = json.load(file)["install"]
-        if not resolved:
+
+        def direct_requirements(requirements):
+            # the direct URL requirements whose markers apply, by their canonical names
+            from pip._vendor.packaging.requirements import Requirement
+            found = {}
+            for requirement in requirements:
+                parsed = Requirement(requirement)
+                if parsed.url and (parsed.marker is None or parsed.marker.evaluate()):
+                    found[canonicalize_name(parsed.name)] = requirement
+            return found
+
+        resolved_names = {canonicalize_name(it["metadata"]["name"]) for it in resolved}
+        kept = direct_requirements(installed)
+        credentials = url_credentials(requirements + installed)
+        to_install = [
+            pinned_requirement(distribution, credentials) for distribution in resolved
+            # pip installs a local source again, also in the installed version
+            if canonicalize_name(distribution["metadata"]["name"]) not in kept
+        ] + [
+            # skipped by pip in the installed version, while it is another revision, as planned
+            requirement for name, requirement in direct_requirements(requirements).items() if name not in resolved_names
+        ]
+        if not to_install:
             sys.exit()
-        credentials = url_credentials(requirements)
 
         def distributions(path):
             found = {}
@@ -441,11 +488,7 @@ internal object PythonDependencies {
         os.makedirs(directory, exist_ok=True)
         staging = tempfile.mkdtemp(prefix=".staging-", dir=directory)
         try:
-            installation = subprocess.run(
-                [sys.executable, "-m", "pip"] + options
-                + ["install", "--no-deps", "--target", staging]
-                + [pinned_requirement(distribution, credentials) for distribution in resolved]
-            )
+            installation = subprocess.run(pip() + ["install"] + options + ["--no-deps", "--target", staging] + to_install)
             if installation.returncode != 0:
                 sys.exit(installation.returncode)
             staged = {
@@ -483,6 +526,7 @@ internal object PythonDependencies {
 
     /**
      * Prints the dependencies to install, as `install <requirement>`,
+     * the installed direct URL dependencies to install along with them, as `installed <requirement>`,
      * and the distributions to keep in their versions, as `constraint <name>==<version>`,
      * or exits with the error.
      * Its argument is the dependency directory,
@@ -657,9 +701,6 @@ internal object PythonDependencies {
         url_dependencies = set()
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
-            # pip resolves the missing ones without the dependency directory, so it would install a distribution
-            # required by them from the index over the one installed from a URL, also in the same version
-            missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)
@@ -669,8 +710,14 @@ internal object PythonDependencies {
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
                 if name and (not in_dependencies or name in in_use):
                     constraints.setdefault(name, distribution.version)
-            for dependency in missing:
-                print("install", dependency)
+            for dependency in dependencies:
+                if dependency in missing:
+                    print("install", dependency)
+                elif dependency in url_dependencies:
+                    # an installer resolving the missing ones without the dependency directory, like uv,
+                    # would install a distribution required by them from the index over the one installed from a URL,
+                    # also in the same version, so it is passed along with them
+                    print("installed", dependency)
             for name, version in constraints.items():
                 print("constraint", f"{name}=={version}")
     """.trimIndent()
