@@ -30,9 +30,12 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.io.path.ExperimentalPathApi
+import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createDirectory
 import kotlin.io.path.createFile
@@ -42,6 +45,9 @@ import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
 import kotlin.io.path.getPosixFilePermissions
 import kotlin.io.path.isWritable
+import kotlin.io.path.outputStream
+import kotlin.io.path.readLines
+import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -672,6 +678,112 @@ class PythonDependenciesTest {
         } finally {
             workingDirectory.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `should run uv in root directory, where it finds no configuration of working directory`() {
+        // given
+        PythonEnvironment.initialize()
+        val dependencyDirectory = PythonEnvironment.dependencyDirectory!!
+
+        // when
+        val (workingDirectory, _) = runFakeUv(dependencyDirectory.toString())
+
+        // then
+        // uv reads a uv.toml, or a pyproject.toml with a [tool.uv] section, of its working directory and its parents
+        assert(workingDirectory == dependencyDirectory.toAbsolutePath().root.toRealPath())
+    }
+
+    @Test
+    fun `should run uv with absolute target of relative dependency directory`() {
+        // when
+        val (_, arguments) = runFakeUv("relative-dependencies")
+
+        // then
+        val target = arguments[arguments.indexOf("--target") + 1]
+        assert(target == Path("relative-dependencies").toAbsolutePath().toString())
+    }
+
+    /**
+     * Installs a dependency into the dependency [directory] with a fake `uv`,
+     * which only records its working directory and arguments, so that uv need not be installed.
+     *
+     * @return the working directory and the arguments of the fake `uv`.
+     */
+    @OptIn(ExperimentalPathApi::class)
+    private fun runFakeUv(directory: String): Pair<Path, List<String>> {
+        assumeFalse(System.getProperty("os.name").startsWith("Windows"), "the fake uv is a shell script")
+        PythonEnvironment.initialize()
+        val uvDirectory = createTempDirectory("python-fake-uv")
+        try {
+            val record = uvDirectory.resolve("record.txt")
+            val uv = uvDirectory.resolve("uv")
+            uv.writeText("#!/bin/sh\npwd -P > '$record'\nprintf '%s\\n' \"$@\" >> '$record'\n")
+            uv.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+            PythonDependencies.installMissing(listOf("fake-dependency"), emptyList(), directory, uv = uv.toString())
+            val lines = record.readLines()
+            return Path(lines.first()) to lines.drop(1)
+        } finally {
+            uvDirectory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should install with uv in working directory with uv configuration`() {
+        // given
+        assumeTrue(PythonDependencies.findOnPath("uv") != null, "uv is not on the PATH")
+        val directory = createTempDirectory("python-uv-config")
+        try {
+            val workingDirectory = directory.resolve("work").createDirectory()
+            // uv fails whenever it reads this configuration
+            workingDirectory.resolve("uv.toml").writeText("index-url = 42\n")
+            val wheel = writeFakeWheel(directory)
+            val code = """
+                |# /// script
+                |# dependencies = ["fake-dependency @ ${wheel.toUri()}"]
+                |# ///
+                |import fake_dependency
+                |print(fake_dependency.VALUE, flush=True)
+                |""".trimMargin()
+
+            // when
+            val (exitCode, output) = runInJvm(
+                EmbeddedPythonMain::class.java.name,
+                input = code,
+                environment = emptyMap(),
+                jvmArguments = listOf(
+                    "-Dxemantic.kotlin.script.python.dependencyDirectory=${directory.resolve("dependencies")}"
+                ),
+                directory = workingDirectory
+            )
+
+            // then
+            assert(output == "installed")
+            assert(exitCode == 0)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    /** Writes the wheel of the `fake-dependency` distribution, of the `fake_dependency` module, into the [directory]. */
+    private fun writeFakeWheel(directory: Path): Path {
+        val wheel = directory.resolve("fake_dependency-1.0-py3-none-any.whl")
+        ZipOutputStream(wheel.outputStream()).use { zip ->
+            mapOf(
+                "fake_dependency.py" to "VALUE = 'installed'\n",
+                "fake_dependency-1.0.dist-info/METADATA" to
+                    "Metadata-Version: 2.1\nName: fake-dependency\nVersion: 1.0\n",
+                "fake_dependency-1.0.dist-info/WHEEL" to
+                    "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                "fake_dependency-1.0.dist-info/RECORD" to ""
+            ).forEach { (name, content) ->
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(content.toByteArray())
+                zip.closeEntry()
+            }
+        }
+        return wheel
     }
 
     private companion object {

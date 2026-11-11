@@ -18,6 +18,7 @@
 
 package com.xemantic.kotlin.script.python
 
+import java.nio.file.Path
 import java.util.concurrent.TimeUnit
 import kotlin.io.path.Path
 import kotlin.io.path.createTempFile
@@ -26,6 +27,7 @@ import kotlin.io.path.readText
 
 /**
  * Runs the [mainClass] of the test classpath in a new JVM, with the [jvmArguments],
+ * in the working [directory], by default the one of this JVM,
  * and with the [environment] variables added to the inherited ones,
  * unlike [runProcess], which would put Python in UTF-8 mode,
  * writing the [input] to its standard input, as UTF-8.
@@ -39,7 +41,8 @@ internal fun runInJvm(
     mainClass: String,
     input: String,
     environment: Map<String, String>,
-    jvmArguments: List<String> = emptyList()
+    jvmArguments: List<String> = emptyList(),
+    directory: Path? = null
 ): Pair<Int, String> {
     val java = Path(System.getProperty("java.home"), "bin", "java").toString()
     // a file, unlike a pipe, does not block the JVM when nobody reads it, so that it can be awaited with a timeout
@@ -48,7 +51,7 @@ internal fun runInJvm(
         val builder = ProcessBuilder(
             listOf(java, "--enable-native-access=ALL-UNNAMED") + jvmArguments +
                 listOf("-cp", System.getProperty("java.class.path"), mainClass)
-        ).redirectErrorStream(true).redirectOutput(outputFile.toFile())
+        ).directory(directory?.toFile()).redirectErrorStream(true).redirectOutput(outputFile.toFile())
         builder.environment().putAll(environment)
         val process = builder.start()
         try {

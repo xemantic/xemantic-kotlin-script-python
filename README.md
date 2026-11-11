@@ -185,6 +185,10 @@ otherwise the code can declare it as a dependency, see below.
   by default the directory of the `xemantic.kotlin.script.python.dependencyDirectory` system property, if set,
   or otherwise `~/.cache/xemantic-kotlin-script-python/<python>-<hash of the environment>`,
   which becomes importable once any code declares its dependencies.
+  The installer runs in the root directory of the file system,
+  so that uv does not read a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]` section,
+  of the working directory of the JVM, or of its parents, e.g. one written by an agent, which could change the package index —
+  only the user and system configuration of uv apply, and its environment variables, like `UV_CONFIG_FILE` or `UV_DEFAULT_INDEX`.
   The installed dependencies are shared by all the `Python` interpreters of the JVM,
   and they cannot change the versions of the distributions of the Python environment itself,
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.
