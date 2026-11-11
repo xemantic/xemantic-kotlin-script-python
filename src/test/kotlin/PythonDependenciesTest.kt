@@ -1190,6 +1190,219 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan installed dependency as missing when its requirement is replaced by unsatisfying version`() {
+        withDistInfos { directory ->
+            // given
+            // required-probe 2.0 installed for requiring-probe, then replaced by 1.0 declared by another snippet
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("required-probe>=2"))
+            writeDistInfo(directory, "1.0", name = "required-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs == listOf("requiring-probe"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as installed when its requirements are satisfied`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("required-probe>=2"))
+            writeDistInfo(directory, "2.0", name = "required-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe==1.0")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when its requirement is not installed`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("required-probe"))
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs == listOf("requiring-probe"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when requirement of its requirement is not satisfied`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("middle-probe"))
+            writeDistInfo(directory, "1.0", name = "middle-probe", requires = listOf("required-probe>=2"))
+            writeDistInfo(directory, "1.0", name = "required-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs == listOf("requiring-probe"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as installed with requirements whose markers do not apply`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(
+                directory, "1.0", name = "requiring-probe",
+                requires = listOf("required-probe>=2; python_version < \"3\"", "other-probe; extra == \"fast\"")
+            )
+            writeDistInfo(directory, "1.0", name = "required-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when requirement of requested extra is not installed`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("other-probe; extra == \"fast\""))
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe[fast]")
+
+            // then
+            assert(installs == listOf("requiring-probe[fast]"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when requirement of extra requested by its requirement is not installed`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("required-probe[fast]"))
+            writeDistInfo(directory, "1.0", name = "required-probe", requires = listOf("other-probe; extra == \"fast\""))
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs == listOf("requiring-probe"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependencies requiring each other as installed`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("required-probe"))
+            writeDistInfo(directory, "1.0", name = "required-probe", requires = listOf("requiring-probe>=1"))
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as installed with requirement satisfied by environment`() {
+        withDistInfos { directory ->
+            // given
+            // jep is installed in the environment of the tests, not in the dependency directory
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("jep>=1"))
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when its URL requirement is installed from other URL`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(
+                directory, "1.0", name = "requiring-probe",
+                requires = listOf("required-probe @ https://example.com/required_probe-2.0-py3-none-any.whl")
+            )
+            writeDistInfo(
+                directory, "1.0", name = "required-probe",
+                directUrl = """{"url": "https://example.com/required_probe-1.0-py3-none-any.whl", "archive_info": {}}"""
+            )
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs == listOf("requiring-probe"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when its URL requirement is installed from index`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(
+                directory, "1.0", name = "requiring-probe",
+                requires = listOf("required-probe @ https://example.com/required_probe-1.0-py3-none-any.whl")
+            )
+            writeDistInfo(directory, "1.0", name = "required-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs == listOf("requiring-probe"))
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as installed when its URL requirements are installed from same URLs`() {
+        withDistInfos { directory ->
+            // given
+            // whatever the revision, the content or the credentials, as the declared dependency installed again
+            // would install them again also when they cannot change, e.g. from a local directory,
+            // or from an archive with a hash not recorded on installation, so on every use
+            writeDistInfo(
+                directory, "1.0", name = "requiring-probe",
+                requires = listOf(
+                    "required-probe @ git+https://user@example.com/probe.git@main#subdirectory=python",
+                    "directory-probe @ file:///home/user/probe",
+                    "archive-probe @ https://example.com/archive_probe-1.0.tar.gz#md5=0123456789abcdef0123456789abcdef"
+                )
+            )
+            writeDistInfo(
+                directory, "1.0", name = "required-probe",
+                directUrl = """{"url": "https://example.com/probe.git", "subdirectory": "python", "vcs_info": {"vcs": "git", "commit_id": "$COMMIT", "requested_revision": "v1"}}"""
+            )
+            writeDistInfo(
+                directory, "1.0", name = "directory-probe",
+                directUrl = """{"url": "file:///home/user/probe", "dir_info": {}}"""
+            )
+            writeDistInfo(
+                directory, "1.0", name = "archive-probe",
+                directUrl = """{"url": "https://example.com/archive_probe-1.0.tar.gz", "archive_info": {"hashes": {"sha256": "$HASH"}}}"""
+            )
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
     fun `should constrain imported distribution to version of its installed modules next to dist-info of other version`() {
         // when
         val constraints = listOf("1.0" to "2.0", "2.0" to "1.0").map { (installed, replaced) ->
@@ -1447,6 +1660,38 @@ class PythonDependenciesTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
+    fun `should install again dependency whose requirement was replaced by pip install of other version`() {
+        // given
+        PythonEnvironment.initialize()
+        val wheels = createTempDirectory("python-wheels")
+        try {
+            val version1 = writeWheel(wheels, "pip-required-probe", "1.0")
+            val version2 = writeWheel(wheels, "pip-required-probe", "2.0")
+            val requiring = writeWheel(
+                wheels, "pip-requiring-probe", "1.0", requires = listOf("pip-required-probe @ $version2")
+            )
+            val code = "# /// script\n# dependencies = [\"pip-requiring-probe @ $requiring\"]\n# ///\nx = 1\n"
+            Python().use { python ->
+                python.exec(code)
+                python.exec("# /// script\n# dependencies = [\"pip-required-probe @ $version1\"]\n# ///\nx = 1\n")
+
+                // when
+                python.exec(code)
+            }
+
+            // then
+            val version = Python().use { python ->
+                python.exec("import pip_required_probe")
+                python.eval<String>("pip_required_probe.VERSION")
+            }
+            assert(version == "2.0")
+        } finally {
+            wheels.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
     fun `should remove dist-info of version with scripts and data replaced by pip install of other distribution`() {
         // given
         // pip install --target records the scripts and the data files outside the directory, e.g. ../../bin/
@@ -1536,19 +1781,23 @@ class PythonDependenciesTest {
 
     /**
      * Writes the dist-info directory of the [name] [version] into the [directory],
-     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds.
+     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds,
+     * with a `Requires-Dist` of each of the [requires], and the `direct_url.json` of the [directUrl], if given.
      */
     private fun writeDistInfo(
         directory: Path,
         version: String,
         files: Map<String, String> = emptyMap(),
         name: String = "replaced-probe",
-        topLevel: Boolean = true
+        topLevel: Boolean = true,
+        requires: List<String> = emptyList(),
+        directUrl: String? = null
     ) {
         val distInfo = "${name.replace('-', '_')}-$version.dist-info"
         val metadata = mapOf(
-            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n"
-        ) + if (topLevel) mapOf(
+            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n" +
+                requires.joinToString("") { "Requires-Dist: $it\n" }
+        ) + (if (directUrl != null) mapOf("$distInfo/direct_url.json" to directUrl) else emptyMap()) + if (topLevel) mapOf(
             // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
             "$distInfo/top_level.txt" to "${name.replace('-', '_')}\n"
         ) else emptyMap()
