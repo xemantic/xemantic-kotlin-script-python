@@ -114,10 +114,10 @@ public class Python private constructor(
     private val closed = AtomicBoolean(false)
 
     /**
-     * The failure of closing the interpreter, or [CLOSING_ABANDONED] once [close] no longer waits for it,
+     * The failure of closing the interpreter, or [ClosingState.Abandoned] once [close] no longer waits for it,
      * whichever is set first, see [abandonClosing].
      */
-    private val closingFailure = AtomicReference<Any?>(null)
+    private val closingState = AtomicReference<ClosingState?>(null)
 
     /** Whether a call is running on the thread of this `Python`, written only by this thread, see [close]. */
     @Volatile
@@ -277,8 +277,6 @@ public class Python private constructor(
      * Whenever no `close()` waits for the closing of the interpreter, an exception thrown by it is logged instead,
      * as a `WARNING` of the [System.Logger] named after this class, so that it is never lost.
      *
-     * @throws InterruptedException if the waiting is interrupted.
-     *
      * Only the first `close()` can wait.
      * Calling it again has no effect, and returns immediately,
      * also while the interpreter is not closed yet: while the first `close()` waits for it,
@@ -298,6 +296,8 @@ public class Python private constructor(
      * Waiting would deadlock, when the running call waits for `close()`:
      * when it is called by a Kotlin function called from Python, or by another thread, which this function,
      * or the Python code, waits for, and it cannot be told apart from a `close()` which the running call does not wait for.
+     *
+     * @throws InterruptedException if the waiting is interrupted.
      */
     @Throws(InterruptedException::class)
     override fun close() {
@@ -311,7 +311,7 @@ public class Python private constructor(
                     interpreter?.close()
                 } catch (e: Throwable) {
                     // logged here, if close() no longer waits for it, see abandonClosing
-                    if (!closingFailure.compareAndSet(null, e)) logClosingFailure(e)
+                    if (!closingState.compareAndSet(null, ClosingState.Failed(e))) logClosingFailure(e)
                     throw e
                 } finally {
                     // defensive only: nothing can use the interpreter afterward, as the executor is shut down
@@ -332,6 +332,8 @@ public class Python private constructor(
         try {
             closing.get()
         } catch (e: ExecutionException) {
+            // thrown here, so not to be kept
+            closingState.set(ClosingState.Abandoned)
             throw e.cause ?: e
         } catch (e: InterruptedException) {
             // the interpreter is still closed by its task, which is not cancelled
@@ -345,8 +347,17 @@ public class Python private constructor(
      * here, if the task has failed already, or by the task otherwise, exactly once.
      */
     private fun abandonClosing() {
-        val failure = closingFailure.getAndSet(CLOSING_ABANDONED)
-        if (failure is Throwable) logClosingFailure(failure)
+        val state = closingState.getAndSet(ClosingState.Abandoned)
+        if (state is ClosingState.Failed) logClosingFailure(state.failure)
+    }
+
+    private sealed interface ClosingState {
+
+        /** [close] no longer waits for closing the interpreter, or has thrown its failure already. */
+        object Abandoned : ClosingState
+
+        class Failed(val failure: Throwable) : ClosingState
+
     }
 
     private fun <T> call(block: SharedInterpreter.() -> T): T {
@@ -601,17 +612,21 @@ public class Python private constructor(
 
         private val threadCounter = AtomicInteger()
 
-        private val logger = System.getLogger(Python::class.java.name)
+        // only needed on the rare failure path
+        private val logger by lazy { System.getLogger(Python::class.java.name) }
 
-        /** Set by [close] instead of the failure of closing the interpreter, when it no longer waits for it. */
-        private val CLOSING_ABANDONED = Any()
-
+        /**
+         * Logs the [failure], never throwing, so that a failing logging backend
+         * neither replaces the exception thrown afterward, nor stops it from being thrown.
+         */
         private fun logClosingFailure(failure: Throwable) {
-            logger.log(
-                System.Logger.Level.WARNING,
-                "Closing the interpreter failed, with no close() waiting to throw it",
-                failure
-            )
+            runCatching {
+                logger.log(
+                    System.Logger.Level.WARNING,
+                    "Closing the interpreter failed, with no close() waiting to throw it",
+                    failure
+                )
+            }
         }
 
         /**

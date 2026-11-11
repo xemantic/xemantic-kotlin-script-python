@@ -583,17 +583,17 @@ class PythonCloseTest {
     @Test
     fun `should throw failure of closing interpreter only from close waiting for it`() {
         // given
+        val closeFailure = JepException("close failed")
         val python = Python.withInterpreterFactory {
             object : SharedInterpreter() {
                 override fun close() {
                     super.close()
-                    throw JepException("close failed")
+                    throw closeFailure
                 }
             }
         }
         python.exec("x = 1")
-
-        val log = LogCapture()
+        val log = LogCapture(closeFailure)
 
         // when
         val (firstFailure, secondFailure) = log.use {
@@ -601,8 +601,7 @@ class PythonCloseTest {
         }
 
         // then
-        assert(firstFailure is JepException)
-        assert(firstFailure.message == "close failed")
+        assert(firstFailure === closeFailure)
         assert(secondFailure == null)
         // reported by close(), so not logged as well
         assert(log.records.isEmpty())
@@ -613,18 +612,19 @@ class PythonCloseTest {
         // given
         val closingEntered = CountDownLatch(1)
         val releaseClosing = CountDownLatch(1)
+        val closeFailure = JepException("close failed")
         val python = Python.withInterpreterFactory {
             object : SharedInterpreter() {
                 override fun close() {
                     closingEntered.countDown()
                     assert(releaseClosing.await(DEADLOCK_TIMEOUT, MILLISECONDS))
                     super.close()
-                    throw JepException("close failed")
+                    throw closeFailure
                 }
             }
         }
         python.exec("x = 1")
-        val log = LogCapture()
+        val log = LogCapture(closeFailure)
         log.use {
             var closerFailure: Throwable? = null
             val closer = thread(isDaemon = true, name = "closer") {
@@ -643,8 +643,7 @@ class PythonCloseTest {
             assert(!closer.isAlive)
             assert(closerFailure is InterruptedException)
             assert(record?.level == Level.WARNING)
-            assert(record?.thrown is JepException)
-            assert(record?.thrown?.message == "close failed")
+            assert(record?.thrown === closeFailure)
             // already reported by the log, see close()
             assert(laterFailure == null)
             assert(log.records.isEmpty())
@@ -654,11 +653,12 @@ class PythonCloseTest {
     @Test
     fun `should log failure of closing interpreter after close returned while call is running`() {
         // given
+        val closeFailure = JepException("close failed")
         val python = Python.withInterpreterFactory {
             object : SharedInterpreter() {
                 override fun close() {
                     super.close()
-                    throw JepException("close failed")
+                    throw closeFailure
                 }
             }
         }
@@ -669,7 +669,7 @@ class PythonCloseTest {
             assert(releaseCallback.await(DEADLOCK_TIMEOUT, MILLISECONDS))
             n
         }
-        val log = LogCapture()
+        val log = LogCapture(closeFailure)
         log.use {
             var runningResult: Long? = null
             val running = thread(isDaemon = true, name = "running") {
@@ -689,8 +689,7 @@ class PythonCloseTest {
             assert(!running.isAlive)
             assert(runningResult == 42L)
             assert(record?.level == Level.WARNING)
-            assert(record?.thrown is JepException)
-            assert(record?.thrown?.message == "close failed")
+            assert(record?.thrown === closeFailure)
             assert(log.records.isEmpty())
         }
     }
@@ -771,18 +770,21 @@ class PythonCloseTest {
     }
 
     /**
-     * Captures the records logged by [Python], through `java.util.logging`, the default backend of `System.Logger`,
-     * while it is open.
+     * Captures the records logged by [Python] with the [failure], through `java.util.logging`,
+     * the default backend of `System.Logger`, while it is open,
+     * ignoring the ones of other `Python` instances, and not passing them on to the console.
      */
-    private class LogCapture : AutoCloseable {
+    private class LogCapture(private val failure: Throwable) : AutoCloseable {
 
         val records = LinkedBlockingQueue<LogRecord>()
 
         private val logger = Logger.getLogger(Python::class.java.name)
 
+        private val useParentHandlers = logger.useParentHandlers
+
         private val handler = object : Handler() {
             override fun publish(record: LogRecord) {
-                records.add(record)
+                if (record.thrown === failure) records.add(record)
             }
             override fun flush() {}
             override fun close() {}
@@ -790,9 +792,11 @@ class PythonCloseTest {
 
         init {
             logger.addHandler(handler)
+            logger.useParentHandlers = false
         }
 
         override fun close() {
+            logger.useParentHandlers = useParentHandlers
             logger.removeHandler(handler)
         }
 
