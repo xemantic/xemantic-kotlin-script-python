@@ -36,14 +36,33 @@ An environment without `pip`, like the one of `uv venv`, can get `tomli` with `p
 
 Jep is a native CPython extension:
 the Java library comes from Maven Central,
-but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use:
+but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use.
+The version of the `jep` package must match the version of the `org.ninia:jep` Java library, 4.3.2 in these examples:
 
 ```shell
-pip install jep==4.3.2
+python -m pip install jep==4.3.2
 ```
 
-The version of the `jep` Python package must match the version of the `org.ninia:jep` Java library.
-Building it requires a JDK, found through `JAVA_HOME`.
+A virtual environment without `pip`, like the one of `uv venv`, can get it with `uv pip install --python <python> jep==4.3.2`.
+
+An externally managed Python ([PEP 668](https://peps.python.org/pep-0668/)),
+like the one of Homebrew or of most Linux distributions,
+refuses `pip install`, so install it into a virtual environment instead:
+
+```shell
+python3 -m venv ~/.venvs/jep
+~/.venvs/jep/bin/python -m pip install jep==4.3.2
+```
+
+and point to it with an absolute path, as `~` is expanded only by a shell, not by an IDE:
+either with the `VIRTUAL_ENV` environment variable set to the virtual environment, e.g. `/home/me/.venvs/jep`,
+or with `PythonEnvironment.pythonExecutable` set to its Python, e.g. `/home/me/.venvs/jep/bin/python`,
+which is `Scripts\python.exe` of the virtual environment on Windows.
+
+PyPI has no wheels of `jep`, so pip always builds it from its source,
+which requires a C compiler, the Python headers,
+and a JDK, found through `JAVA_HOME`, which is optional on Linux and macOS, where `javac` on the `PATH` is found as well.
+On Debian/Ubuntu, the Python headers, and the `venv` module, come with `apt install python3-dev python3-venv`.
 
 The Python executable is, in this order:
 1. `PythonEnvironment.pythonExecutable`, if set before the first use of `Python`,
@@ -53,6 +72,21 @@ The Python executable is, in this order:
 The Python code imports the modules from the same paths as this executable,
 e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
 
+The embedded Python, like every Python process started by this library, e.g. `pip`,
+runs in the [UTF-8 mode](https://peps.python.org/pep-0540/),
+whatever the locale, e.g. cp1252 on Windows, or `C` on Linux:
+the standard streams, and `open` without an `encoding`, use UTF-8.
+Only a `PYTHONIOENCODING` environment variable of the JVM, if set, still takes precedence over it,
+for the standard streams of the embedded Python.
+
+On Linux, or another POSIX system, with a locale whose encoding is not UTF-8, e.g. ISO-8859-1,
+the path of the Python executable, e.g. of the virtual environment, must be ASCII:
+Jep passes it to the embedded Python as JNI modified UTF-8, which is then another path,
+so that the embedded Python would not find the virtual environment,
+and fail with `ModuleNotFoundError: No module named 'jep'`.
+It does not apply to macOS and Windows, where Python decodes a path as UTF-8, whatever the locale.
+Other paths, like the one of the dependency directory in a home directory like `/home/josé`, can be non-ASCII.
+
 ## Usage
 
 In `build.gradle.kts` add:
@@ -61,24 +95,34 @@ In `build.gradle.kts` add:
 dependencies {
     implementation("com.xemantic.kotlin:xemantic-kotlin-script-python:0.1.0")
     // only for running Python in a ScriptSession, like below, as Python does not depend on it
-    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.0")
+    implementation("com.xemantic.kotlin:xemantic-kotlin-script:0.2.1")
 }
 ```
 
 Then:
 
 ```kotlin
-Python().use { python ->
-    ScriptSession {
-        "python" provides python
-    }.use { session ->
-        session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
-        session.execute("""python["factor"] = 3""")
-        val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
-        println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+import com.xemantic.kotlin.script.ScriptResult
+import com.xemantic.kotlin.script.ScriptSession
+import com.xemantic.kotlin.script.python.Python
+
+suspend fun main() {
+    Python().use { python ->
+        ScriptSession {
+            "python" provides python
+        }.use { session ->
+            session.execute("""python.exec("import numpy as np; a = np.arange(10)")""")
+            session.execute("""python["factor"] = 3""")
+            val result = session.execute("""python.eval<List<Long>>("(a * factor).tolist()")""")
+            println((result as ScriptResult.Value).value) // [0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
+        }
     }
 }
 ```
+
+`ScriptSession.execute` is a suspending function,
+called here from a `suspend fun main()`,
+and otherwise from any coroutine, e.g. within `runBlocking`.
 
 The examples assume `numpy` installed in the Python environment,
 otherwise the code can declare it as a dependency, see below.
@@ -96,8 +140,17 @@ otherwise the code can declare it as a dependency, see below.
   python("import numpy as np; a = np.arange(10)") // null
   python("a.sum()")                                 // 45L
   ```
-  The value is converted by Jep to its default Java type,
-  and a value which Jep cannot convert is returned as its Python `repr`.
+  The value is converted by Jep to its default Java type.
+* A value returned by `python(code)`, `eval` or `python["name"]`, which Jep cannot convert,
+  like a module, a function or an instance of a Python class,
+  is returned as its Python `repr`, also when nested in a `List`, a `Set`, a `Map` or an array,
+  as a Python object can be used only on the thread of its `Python`:
+  ```kotlin
+  python("[len, 1]") // listOf("<built-in function len>", 1L)
+  ```
+  If different keys of a `dict`, or elements of a `Set`, have the same `repr`,
+  an `IllegalStateException` is thrown, not to drop an entry silently,
+  and `eval<PyObject>` (or an array of them) fails with an `IllegalArgumentException`.
 * For an AI agent, the `Python` can be started lazily, only when a script uses it,
   as the first one initializes the Python environment:
   ```kotlin
@@ -145,6 +198,11 @@ otherwise the code can declare it as a dependency, see below.
   so that pip does not replace it with a distribution from the index required by the other one.
   To update a branch, or a remote archive changing its content under the same URL,
   change the URL — for example, pin the commit — or delete the dependency directory.
+  The installations into the dependency directory are serialized, also across processes,
+  e.g. JVMs sharing the default directory in the user cache,
+  with a lock of its `.xemantic-kotlin-script-python.lock` file,
+  so a call with missing dependencies can wait for an installation of another process,
+  and the directory must be writable when something has to be installed.
   A dependency which cannot be installed fails the call with `PythonDependencyException`, with the output of the installer.
 * A Python exception fails the call with `jep.JepException`,
   reported by the `ScriptSession` as an `ExecutionPhase.EVALUATION` error, like:
@@ -156,7 +214,9 @@ otherwise the code can declare it as a dependency, see below.
 ## Development
 
 The tests run in the `.venv` Python virtual environment of the project,
-created by Gradle with `python3`, with only the `jep` package of the version of the library installed,
+created by Gradle with `python3`, or another base Python set with the `basePython` Gradle property
+(see [DEVELOPMENT.md](DEVELOPMENT.md#the-python-of-the-tests)),
+with only the `jep` package of the version of the library installed,
 like a clean environment of an agent.
 The tests declare the Python packages they use, like `numpy`, as dependencies,
 installed from PyPI into `build/python-dependencies`, which Gradle cleans before every test run,
