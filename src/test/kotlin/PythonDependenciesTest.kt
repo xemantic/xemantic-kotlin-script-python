@@ -113,16 +113,13 @@ class PythonDependenciesTest {
         return output
     }
 
-    private fun pinnedRequirement(
-        @Language("json") distribution: String,
-        vararg requirements: String
-    ): String {
+    private fun pinnedRequirement(@Language("json") distribution: String): String {
         val (exitCode, output) = runProcess(
             listOf(
                 python, "-c",
                 PythonDependencies.PIP_PINNED_REQUIREMENT +
-                    "\nimport json, sys\nprint(pinned_requirement(json.load(sys.stdin), url_credentials(sys.argv[1:])))"
-            ) + requirements,
+                    "\nimport json, sys\nprint(pinned_requirement(json.load(sys.stdin)))"
+            ),
             input = distribution
         )
         assert(exitCode == 0, output)
@@ -136,7 +133,16 @@ class PythonDependenciesTest {
     private fun gitRepository(name: String, subdirectory: String? = null): Path {
         val repository = sources.resolve("repository")
         val project = (if (subdirectory != null) repository.resolve(subdirectory) else repository).createDirectories()
-        project.resolve("pyproject.toml").writeText(
+        writeProject(project, name)
+        git(repository, "init", "--quiet", "-b", "main")
+        commit(repository, name)
+        git(repository, "tag", "v1")
+        return repository
+    }
+
+    /** Writes the project of the distribution [name] 1.0 into the [directory], requiring the [dependencies]. */
+    private fun writeProject(directory: Path, name: String, dependencies: List<String> = emptyList()) {
+        directory.resolve("pyproject.toml").writeText(
             """
             [build-system]
             requires = ["setuptools"]
@@ -145,22 +151,23 @@ class PythonDependenciesTest {
             [project]
             name = "$name"
             version = "1.0"
+            dependencies = [${dependencies.joinToString(", ") { "'$it'" }}]
             """.trimIndent()
         )
-        project.resolve(name).createDirectories().resolve("__init__.py").writeText("ANSWER = 42\n")
-        val git = listOf(
-            "git", "-C", repository.toString(), "-c", "user.name=test", "-c", "user.email=test@example.com"
+        directory.resolve(name).createDirectories().resolve("__init__.py").writeText("ANSWER = 42\n")
+    }
+
+    private fun commit(repository: Path, message: String) {
+        git(repository, "add", ".")
+        git(repository, "commit", "--quiet", "-m", message)
+    }
+
+    private fun git(repository: Path, vararg command: String) {
+        val (exitCode, output) = runProcess(
+            listOf("git", "-C", repository.toString(), "-c", "user.name=test", "-c", "user.email=test@example.com") +
+                command
         )
-        listOf(
-            listOf("init", "--quiet", "-b", "main"),
-            listOf("add", "."),
-            listOf("commit", "--quiet", "-m", name),
-            listOf("tag", "v1")
-        ).forEach { command ->
-            val (exitCode, output) = runProcess(git + command)
-            assert(exitCode == 0, output)
-        }
-        return repository
+        assert(exitCode == 0, output)
     }
 
     /** Builds the source archive of the distribution [name] 1.0 into the [directory], built with setuptools. */
@@ -172,9 +179,16 @@ class PythonDependenciesTest {
     }
 
     /** Builds the wheel of the distribution [name] 1.0 into the [directory], with the [answer] as its `ANSWER`. */
-    private fun buildWheel(directory: Path, name: String, answer: Int = 42): Path {
+    private fun buildWheel(
+        directory: Path,
+        name: String,
+        answer: Int = 42,
+        dependencies: List<String> = emptyList()
+    ): Path {
         val wheel = directory.createDirectories().resolve("$name-1.0-py3-none-any.whl")
-        val (exitCode, output) = runProcess(listOf(python, "-c", BUILD_WHEEL, wheel.toString(), name, answer.toString()))
+        val (exitCode, output) = runProcess(
+            listOf(python, "-c", BUILD_WHEEL, wheel.toString(), name, answer.toString()) + dependencies
+        )
         assert(exitCode == 0, output)
         return wheel
     }
@@ -1441,6 +1455,70 @@ class PythonDependenciesTest {
     }
 
     /**
+     * An installed dependency from a git branch is resolved as installed, at its installed commit,
+     * as it is not installed again, so the later commits of the branch, requiring other dependencies, are ignored.
+     */
+    @Test
+    fun `should resolve installed dependency from git branch at installed commit with pip`() {
+        // given
+        val repository = gitRepository("gitpkg")
+        val installed = "gitpkg @ git+${repository.toUri().toString().removeSuffix("/")}@main"
+        pipInstalled(installed)
+        val required = buildWheel(sources.resolve("wheels"), "requiredpkg")
+        writeProject(repository, "gitpkg", dependencies = listOf("requiredpkg @ ${required.toUri()}"))
+        commit(repository, "requiring requiredpkg")
+        val other = buildWheel(sources.resolve("wheels"), "otherpkg")
+
+        // when
+        val (exitCode, output) = runProcess(
+            PythonDependencies.pipInstallCommand(
+                python, directory.toString(), constraints.toString(),
+                requirements = listOf("otherpkg @ ${other.toUri()}"),
+                installed = listOf(installed)
+            )
+        )
+
+        // then
+        assert(exitCode == 0, output)
+        assert(directory.resolve("otherpkg").exists())
+        assert(!directory.resolve("requiredpkg").exists())
+    }
+
+    /**
+     * pip reuses the last credentials of a host for a URL of the host without them,
+     * so a distribution from a URL required by a requested one is installed with the requested URLs, like resolved.
+     */
+    @Test
+    fun `should install required dependency from URL with last credentials of its host with pip`() {
+        // given
+        val wheels = sources.resolve("wheels")
+        val server = ProcessBuilder(python, "-c", AUTHENTICATING_SERVER, wheels.toString(), "a/=u1:t1", "b/=u2:p@ss2")
+            .redirectErrorStream(true)
+            .start()
+        try {
+            val port = server.inputStream.bufferedReader().readLine()
+            val required = buildWheel(wheels.resolve("a"), "pkga")
+            val first = buildWheel(wheels.resolve("b"), "pkgb")
+            val second = buildWheel(
+                wheels.resolve("a"), "pkgc", dependencies = listOf("pkga @ http://127.0.0.1:$port/a/${required.fileName}")
+            )
+
+            // when
+            val (exitCode, output) = pipInstall(
+                "pkgb @ http://u2:p%40ss2@127.0.0.1:$port/b/${first.fileName}",
+                "pkgc @ http://u1:t1@127.0.0.1:$port/a/${second.fileName}"
+            )
+
+            // then
+            assert(exitCode == 0, output)
+            assert(pythonOfDirectory("import pkga, pkgb, pkgc; print(pkga.ANSWER)") == "42")
+        } finally {
+            server.destroy()
+            server.waitFor()
+        }
+    }
+
+    /**
      * pip strips the credentials from the URL in its installation report,
      * so the distribution resolved from it would be installed without them.
      */
@@ -1616,12 +1694,9 @@ class PythonDependenciesTest {
         assert(redacted == "pkg @ https://****@host/pkg.whl")
     }
 
-    /**
-     * pip reuses the credentials of a host for all its URLs,
-     * so a direct reference required by a requested one, from the same host, has to be pinned with them too.
-     */
+    /** A credential of a requested URL must not be sent anywhere else, e.g. to an SSH URL of the same host. */
     @Test
-    fun `should pin required distribution from URL with credentials of requirement from the same host`() {
+    fun `should pin required distribution from URL to its URL of installation report`() {
         // when
         val requirement = pinnedRequirement(
             """
@@ -1629,80 +1704,13 @@ class PythonDependenciesTest {
               "metadata": {"name": "b", "version": "1.0"},
               "is_direct": true,
               "requested": false,
-              "download_info": {"url": "https://host/b-1.0-py3-none-any.whl", "archive_info": {}}
+              "download_info": {"url": "ssh://git@github.com/org/b.git", "vcs_info": {"vcs": "git", "commit_id": "$COMMIT"}}
             }
-            """.trimIndent(),
-            "a @ https://user:tok@host/a-1.0-py3-none-any.whl"
+            """.trimIndent()
         )
 
         // then
-        assert(requirement == "b @ https://user:tok@host/b-1.0-py3-none-any.whl")
-    }
-
-    /**
-     * pip before 26 removes the credentials from the URL in its installation report only up to the first `@`,
-     * leaving the rest of a password with `@` as the user.
-     */
-    @Test
-    fun `should pin distribution from URL with password tail left by pip as user with credentials of requirement`() {
-        // when
-        val requirement = pinnedRequirement(
-            """
-            {
-              "metadata": {"name": "x", "version": "1.0"},
-              "is_direct": true,
-              "requested": true,
-              "download_info": {"url": "http://ss@127.0.0.1:8765/x-1.0-py3-none-any.whl", "archive_info": {}}
-            }
-            """.trimIndent(),
-            "x @ http://user:p@ss@127.0.0.1:8765/x-1.0-py3-none-any.whl"
-        )
-
-        // then
-        assert(requirement == "x @ http://user:p@ss@127.0.0.1:8765/x-1.0-py3-none-any.whl")
-    }
-
-    @Test
-    fun `should pin distribution from URL without credentials of requirement from other host`() {
-        // when
-        val requirement = pinnedRequirement(
-            """
-            {
-              "metadata": {"name": "b", "version": "1.0"},
-              "is_direct": true,
-              "requested": false,
-              "download_info": {"url": "https://other/b-1.0-py3-none-any.whl", "archive_info": {}}
-            }
-            """.trimIndent(),
-            "a @ https://user:tok@host/a-1.0-py3-none-any.whl"
-        )
-
-        // then
-        assert(requirement == "b @ https://other/b-1.0-py3-none-any.whl")
-    }
-
-    @Test
-    fun `should pin requested distribution from URL with credentials of its requirement`() {
-        // when
-        val requirement = pinnedRequirement(
-            """
-            {
-              "metadata": {"name": "pkg", "version": "1.0"},
-              "is_direct": true,
-              "requested": true,
-              "download_info": {
-                "url": "https://gitlab.com/org/private.git",
-                "vcs_info": {"vcs": "git", "requested_revision": "main", "commit_id": "0123abcd"},
-                "subdirectory": "libs/pkg"
-              }
-            }
-            """.trimIndent(),
-            "idna",
-            "Pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git@main#subdirectory=libs/pkg"
-        )
-
-        // then
-        assert(requirement == "pkg @ git+https://oauth2:TOKEN@gitlab.com/org/private.git@0123abcd#subdirectory=libs/pkg")
+        assert(requirement == "b @ git+ssh://git@github.com/org/b.git@$COMMIT")
     }
 
     @Test
@@ -1877,16 +1885,18 @@ class PythonDependenciesTest {
 
         /**
          * Builds the wheel of the distribution named by its second argument, in version 1.0,
-         * to the path of its first argument, with the `ANSWER` of its third argument.
+         * to the path of its first argument, with the `ANSWER` of its third argument,
+         * requiring the dependencies of the following ones.
          */
         @Language("python")
         val BUILD_WHEEL = """
             import base64, hashlib, sys, zipfile
 
-            path, name, answer = sys.argv[1:]
+            path, name, answer, dependencies = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+            requires = "".join(f"Requires-Dist: {dependency}\n" for dependency in dependencies)
             files = {
                 f"{name}/__init__.py": f"ANSWER = {answer}\n".encode(),
-                f"{name}-1.0.dist-info/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n".encode(),
+                f"{name}-1.0.dist-info/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: 1.0\n{requires}".encode(),
                 f"{name}-1.0.dist-info/WHEEL": b"Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
             }
             record = "".join(

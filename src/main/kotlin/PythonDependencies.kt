@@ -256,6 +256,8 @@ internal object PythonDependencies {
         try {
             constraintsFile.writeLines(constraints)
             val uv = findOnPath("uv")
+            // pip resolves with the installed ones, but does not install them again, unless older than 22.2
+            val installing = if (uv != null) missing + installed else missing
             val command = if (uv != null) {
                 listOf(
                     uv, "pip", "install", "--quiet",
@@ -269,7 +271,7 @@ internal object PythonDependencies {
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
-                    redactCredentials("Cannot install Python dependencies ${(missing + installed).joinToString(", ")}:\n$output")
+                    redactCredentials("Cannot install Python dependencies ${installing.joinToString(", ")}:\n$output")
                 )
             }
         } finally {
@@ -296,45 +298,19 @@ internal object PythonDependencies {
     /**
      * The `pinned_requirement` Python function,
      * returning the requirement of exactly the distribution resolved in an installation report of pip,
-     * like `direct_url_as_pep440_direct_reference` of pip,
-     * and the `url_credentials` function, returning the credentials of the URLs of the requirements by their hosts.
+     * like `direct_url_as_pep440_direct_reference` of pip.
      *
-     * The report has the URLs without their credentials,
-     * which are taken back from the URL of a requirement with the same host,
-     * for a distribution from a URL required by a requested one, like pip reuses the credentials of a host for its URLs.
+     * The report has the URLs without their credentials, which are not taken back from any other URL,
+     * as pip installs the distribution required by a requested one with the credentials it learned for the host,
+     * when the requested ones are installed with it, in the same pip process.
      */
     @Language("python")
     internal val PIP_PINNED_REQUIREMENT = """
-        def url_credentials(requirements):
-            from urllib.parse import urlsplit
-            from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
-            credentials = {}
-            for requirement in requirements:
-                try:
-                    url = Requirement(requirement).url
-                except InvalidRequirement:
-                    continue
-                if url:
-                    # the password can contain "@" too
-                    user_info, at, host = urlsplit(url).netloc.rpartition("@")
-                    if at:
-                        credentials.setdefault(host, user_info)
-            return credentials
-
-        def with_credentials(url, credentials):
-            from urllib.parse import urlsplit, urlunsplit
-            parts = urlsplit(url)
-            # pip before 26 removes the credentials only up to the first "@", leaving the rest of the password
-            host = parts.netloc.rpartition("@")[2]
-            if host not in credentials:
-                return url
-            return urlunsplit(parts._replace(netloc=f"{credentials[host]}@{host}"))
-
-        def pinned_requirement(distribution, credentials):
+        def pinned_requirement(distribution):
             name, download = distribution["metadata"]["name"], distribution["download_info"]
             if not distribution["is_direct"]:
                 return f"{name}=={distribution['metadata']['version']}"
-            url = with_credentials(download["url"], credentials)
+            url = download["url"]
             fragments = []
             if "vcs_info" in download:
                 vcs = download["vcs_info"]
@@ -355,7 +331,8 @@ internal object PythonDependencies {
      * Installs the missing requirements with pip into the dependency directory, its first argument,
      * keeping the versions of the constraints file, its second argument.
      * The missing requirements follow, then `--installed`, followed by the installed direct URL requirements,
-     * which the [PLAN] passes along with the missing ones, so that pip resolves with them.
+     * which the [PLAN] passes along with the missing ones, so that pip resolves with them,
+     * in their installed versions, as they are not installed again.
      *
      * pip ignores the distributions already installed in a `--target` directory,
      * so it would install them again, also with their own dependencies, replacing the files of the loaded modules.
@@ -367,6 +344,8 @@ internal object PythonDependencies {
      * A requested direct URL requirement is installed from the requirement itself, not pinned to what was resolved,
      * so that pip records its requested revision of a VCS, which the [PLAN] compares, and keeps its credentials,
      * which can differ for URLs of the same host.
+     * A distribution from a URL required by a requested one is pinned to what was resolved, without credentials,
+     * which pip takes from the requested URLs of the same host, like in the resolution.
      * The resolution skips it in the version already installed, unless from a local source archive or directory,
      * so a missing one is installed anyway, as the [PLAN] knows it is another revision, e.g. of a git branch,
      * while an installed one is never installed again, also from a local source archive.
@@ -420,6 +399,16 @@ internal object PythonDependencies {
         for stale in Path(directory).glob(".staging-*"):
             shutil.rmtree(stale, ignore_errors=True)
 
+        from pip._vendor.packaging.requirements import Requirement
+
+        def installed_version(requirement):
+            # the installed distribution, not its URL, which can lead to another revision, e.g. of a git branch,
+            # with other requirements, while the distribution is not installed again
+            name = Requirement(requirement).name
+            for distribution in metadata.distributions(name=name, path=sys.path + [directory]):
+                return f"{name}=={distribution.version}"
+            return requirement
+
         # an environment variable overrides the configuration files, but an empty one is ignored
         resolution_environment = {
             **{name: value for name, value in os.environ.items() if name != "PIP_TARGET"},
@@ -429,7 +418,7 @@ internal object PythonDependencies {
             report = os.path.join(temp, "report.json")
             resolution = subprocess.run(
                 pip(directory) + ["install"] + options + ["--dry-run", "--report", report, "--constraint", constraints]
-                + requirements + installed,
+                + requirements + [installed_version(requirement) for requirement in installed],
                 env=resolution_environment
             )
             if resolution.returncode != 0:
@@ -439,7 +428,6 @@ internal object PythonDependencies {
 
         def direct_requirements(requirements):
             # the direct URL requirements whose markers apply, by their canonical names
-            from pip._vendor.packaging.requirements import Requirement
             found = {}
             for requirement in requirements:
                 parsed = Requirement(requirement)
@@ -448,13 +436,14 @@ internal object PythonDependencies {
             return found
 
         requested = direct_requirements(requirements)
-        # pip installs a local source archive or directory again, also in the installed version
+        # never installed again, as planned
         kept = direct_requirements(installed)
-        credentials = url_credentials(requirements + installed)
-        to_install = [
-            pinned_requirement(distribution, credentials) for distribution in resolved
+        # the requested ones first, as pip uses the credentials of a host learned from them, like in the resolution,
+        # for a URL of the host without credentials, which a requested distribution can require
+        to_install = list(requested.values()) + [
+            pinned_requirement(distribution) for distribution in resolved
             if canonicalize_name(distribution["metadata"]["name"]) not in requested.keys() | kept.keys()
-        ] + list(requested.values())
+        ]
         if not to_install:
             sys.exit()
 
@@ -469,12 +458,12 @@ internal object PythonDependencies {
                     found.setdefault(canonicalize_name(name), []).append(entry)
             return found
 
-        def remove(distribution, kept):
+        def remove(distribution, staged):
             emptied = set()
             for file in metadata.PathDistribution(distribution).files or []:
                 relative = os.path.normpath(str(file))
                 path = os.path.join(directory, relative)
-                if relative.startswith(os.pardir) or os.path.isabs(relative) or relative in kept:
+                if relative.startswith(os.pardir) or os.path.isabs(relative) or relative in staged:
                     continue
                 if os.path.isfile(path) or os.path.islink(path):
                     os.remove(path)
