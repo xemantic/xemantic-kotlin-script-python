@@ -22,11 +22,22 @@ import jep.Interpreter
 import jep.python.PyCallable
 import org.intellij.lang.annotations.Language
 import java.io.File
+import java.io.IOException
+import java.nio.channels.FileChannel
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.Path
+import java.nio.file.StandardOpenOption.WRITE
+import java.nio.file.attribute.PosixFilePermissions
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
+import kotlin.io.path.createFile
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
+import kotlin.io.path.exists
 import kotlin.io.path.isExecutable
+import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeLines
 
 /**
@@ -48,6 +59,15 @@ public class PythonDependencyException(message: String) : RuntimeException(messa
  * so that a new dependency does not break the installed ones.
  */
 internal object PythonDependencies {
+
+    /**
+     * The file in the dependency directory, locked by every JVM while it installs into the directory.
+     *
+     * Not `.lock`, which `uv pip install --target` locks itself while this JVM waits for it,
+     * where the locks of both interact, e.g. on Windows, macOS, or NFS,
+     * so uv would wait for its timeout, and then install without locking.
+     */
+    internal const val LOCK_FILE_NAME = ".xemantic-kotlin-script-python.lock"
 
     private val blockStart = Regex("# /// [a-zA-Z0-9-]+")
 
@@ -100,46 +120,124 @@ internal object PythonDependencies {
 
     private fun String.isComment() = this == "#" || startsWith("# ")
 
+    /**
+     * Serializes the installations of this JVM,
+     * before the [LOCK_FILE_NAME] serializes them with the ones of other processes,
+     * as a JVM cannot lock a file it already holds a lock on.
+     */
+    internal val installLock = ReentrantLock()
+
     /** Installs the missing dependencies declared by the [code], if any, on the thread of the [interpreter]. */
     fun install(code: String, interpreter: Interpreter) {
-        // outside the lock, so that code without metadata does not wait for an installation of another thread
+        // before locking, so that code without metadata does not wait for an installation of another thread
         val metadata = scriptMetadata(code) ?: return
-        installMetadata(metadata, interpreter)
-    }
-
-    @Synchronized
-    private fun installMetadata(metadata: String, interpreter: Interpreter) {
-        val directory = PythonEnvironment.dependencyDirectory!!.createDirectories().toString()
+        val directory = PythonEnvironment.dependencyDirectory!!
         val imported = interpreter.getValue(
             "sorted({name.partition('.')[0] for name in __import__('sys').modules})",
             List::class.java
         ).map { it.toString() }
-        install(plan(metadata, directory, imported), directory)
-        @Suppress("UNCHECKED_CAST")
-        val path = interpreter.getValue("__import__('sys').path", List::class.java) as List<String>
-        if (directory !in path) {
-            interpreter.getValue("__import__('sys').path.append", PyCallable::class.java).use { it.call(directory) }
+        // without locking, as the plan only reads the directory, which can be read-only when nothing is missing,
+        // and so that the installed dependencies do not wait for an installation of another thread or process
+        if (plan(metadata, directory.toString(), imported).missing().isNotEmpty()) {
+            installLock.withLock {
+                withDirectoryLock(directory) {
+                    // again, as another thread or process could have installed them meanwhile
+                    installMissing(plan(metadata, directory.toString(), imported), directory.toString())
+                }
+            }
+        }
+        // the sys module is shared by all the interpreters, so that the directory is appended only once;
+        // as the str of the path in Python, which differs from the one of the JVM under a non-UTF-8 locale
+        synchronized(this) {
+            interpreter.exec(
+                "(lambda path, sys: path in sys.path or sys.path.append(path))" +
+                    "(${pythonPath(directory.toString())}, __import__('sys'))"
+            )
         }
         interpreter.getValue("__import__('importlib').invalidate_caches", PyCallable::class.java).use { it.call() }
     }
 
+    private fun List<Pair<String, String>>.missing() = filter { it.first == "install" }.map { it.second }
+
+    /**
+     * Runs the [block] with the [LOCK_FILE_NAME] of the dependency [directory] locked,
+     * against another JVM installing into the same directory, e.g. a shared one of the user cache,
+     * which would otherwise delete or overwrite the files being installed.
+     *
+     * The lock file is never deleted, as another process could have opened it already, and would lock a deleted file.
+     * It is created writable for everyone, like the lock file of uv,
+     * so that the users sharing the directory, e.g. of a group, can lock it.
+     *
+     * @throws PythonDependencyException if the directory cannot be locked, e.g. when it is not writable.
+     */
+    private fun withDirectoryLock(directory: Path, block: () -> Unit) {
+        val lockFile = directory.resolve(LOCK_FILE_NAME)
+        val channel = try {
+            directory.createDirectories()
+            if (!lockFile.exists()) createLockFile(lockFile)
+            FileChannel.open(lockFile, WRITE)
+        } catch (e: IOException) {
+            throw PythonDependencyException("Cannot lock the dependency directory with $lockFile: $e")
+        }
+        channel.use {
+            val lock = try {
+                channel.lock()
+            } catch (e: IOException) {
+                // e.g. ENOLCK of a network file system without locking
+                throw PythonDependencyException("Cannot lock the dependency directory with $lockFile: $e")
+            }
+            lock.use { block() }
+        }
+    }
+
+    private fun createLockFile(lockFile: Path) {
+        try {
+            lockFile.createFile()
+        } catch (_: FileAlreadyExistsException) {
+            // created by another process meanwhile
+            return
+        }
+        try {
+            // after creating, as the permissions of creating are restricted by the umask
+            lockFile.setPosixFilePermissions(PosixFilePermissions.fromString("rw-rw-rw-"))
+        } catch (_: UnsupportedOperationException) {
+            // e.g. on Windows
+        }
+    }
+
     /**
      * Runs the [PLAN] for the [metadata], found by [scriptMetadata], the dependency [directory],
-     * and the [imported] top-level modules.
+     * and the [imported] top-level modules, with the [command], by default the [planCommand].
      *
-     * @return the `install`, `constraint` and `requirement` entries of the plan, as pairs of the kind and the value.
+     * @return the entries of the plan, as pairs of the kind and the value.
      * @throws PythonDependencyException if the plan cannot be made.
      */
-    fun plan(metadata: String, directory: String, imported: List<String>): List<Pair<String, String>> {
+    fun plan(
+        metadata: String,
+        directory: String,
+        imported: List<String>,
+        command: List<String> = planCommand(directory)
+    ): List<Pair<String, String>> {
         // on the standard input, as the command line would exceed the OS limit after importing many modules
         val input = """{"metadata": ${metadata.toJson()}, "modules": [${imported.joinToString(", ") { it.toJson() }}]}"""
-        val (exitCode, output) = runProcess(
-            listOf(PythonEnvironment.executable, "-c", PLAN, directory),
-            input = input
-        )
-        if (exitCode != 0) throw PythonDependencyException(output)
-        return output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
+        // the standard error separately, as a write to it, e.g. a warning, could split a line of the plan
+        val result = runProcess(command, input = input, mergeErrorStream = false)
+        if (result.exitCode != 0) throw PythonDependencyException(result.failureOutput)
+        return result.output.lines().filter { it.isNotBlank() }.map { it.substringBefore(' ') to it.substringAfter(' ') }
     }
+
+    /** The command running the [PLAN] for the dependency [directory]. */
+    fun planCommand(directory: String): List<String> = pythonCommand(PythonEnvironment.executable, PLAN, directory)
+
+    /**
+     * The command running `pip` of the environment with the [arguments],
+     * like `python -m pip`, which would import from the working directory, also `pip` itself.
+     */
+    fun pipCommand(vararg arguments: String): List<String> = pythonCommand(
+        PythonEnvironment.executable,
+        "import runpy\nrunpy.run_module('pip', run_name='__main__', alter_sys=True)",
+        *arguments
+    )
 
     /** This string as a JSON string, with every character outside printable ASCII escaped, so it is ASCII only. */
     private fun String.toJson(): String = buildString(length + 2) {
@@ -166,8 +264,9 @@ internal object PythonDependencies {
     }
 
     /**
-     * Installs the `install` entries of the [plan], of the [PLAN], into the dependency [directory],
-     * with [uv], or pip, if `null`, with the [installerOptions], e.g. its index.
+     * Installs the `install` entries of the [plan], of the [PLAN], if any, into the dependency [directory],
+     * with [uv], or pip, if `null`, with the [installerOptions], e.g. its index,
+     * and then removes the dist-info directories the installation replaced, see [removeReplacedDistInfo].
      *
      * The `requirement` entries, of the distributions installed in the directory, all become constraints,
      * as only the declared dependencies are known to be replaced before the installation,
@@ -176,13 +275,13 @@ internal object PythonDependencies {
      *
      * @throws PythonDependencyException if the dependencies cannot be installed.
      */
-    fun install(
+    fun installMissing(
         plan: List<Pair<String, String>>,
         directory: String,
         installerOptions: List<String> = emptyList(),
         uv: String? = findOnPath("uv")
     ) {
-        val missing = plan.filter { it.first == "install" }.map { it.second }
+        val missing = plan.missing()
         if (missing.isEmpty()) return
         val pinned = plan.filter { it.first == "constraint" }.map { it.second }
         val requirements = plan.filter { it.first == "requirement" }.map {
@@ -200,8 +299,8 @@ internal object PythonDependencies {
                 "--constraints", constraintsFile
             )
         } else {
-            listOf(
-                PythonEnvironment.executable, "-m", "pip", "install", "--quiet",
+            pipCommand(
+                "install", "--quiet",
                 "--disable-pip-version-check", "--no-input", "--upgrade",
                 "--target", directory,
                 "--constraint", constraintsFile
@@ -209,7 +308,11 @@ internal object PythonDependencies {
         } + (if (dryRun) listOf("--dry-run") else emptyList()) + installerOptions + missing
 
         val (exitCode, output) = withConstraints(constraints) { runProcess(installCommand(it)) }
-        if (exitCode == 0) return
+        if (exitCode == 0) {
+            // within the lock, as another process could be installing another version meanwhile
+            removeReplacedDistInfo(directory, plan.single { it.first == "dist-info" }.second)
+            return
+        }
         val message = "Cannot install Python dependencies ${missing.joinToString(", ")}:\n$output"
         // the failure is a conflict with the requirements of the installed distributions,
         // only if the dependencies can be installed without them, and not e.g. because of the network
@@ -243,11 +346,108 @@ internal object PythonDependencies {
         }
     }
 
+    private val logger = System.getLogger(PythonDependencies::class.java.name)
+
+    /**
+     * Removes from the dependency [directory] the dist-info directories of the distributions
+     * replaced by another version by the installation since the [snapshot],
+     * the `dist-info` entry of the [PLAN] made before it,
+     * which `pip install --target --upgrade` leaves beside the installed one, see [REPLACED_DIST_INFO],
+     * or logs a warning, if they cannot be removed, as the installation itself succeeded,
+     * and the [PLAN] plans a distribution with several dist-info as missing.
+     */
+    internal fun removeReplacedDistInfo(directory: String, snapshot: String) {
+        val result = runProcess(
+            pythonCommand(PythonEnvironment.executable, REPLACED_DIST_INFO, directory),
+            input = snapshot,
+            mergeErrorStream = false
+        )
+        if (result.exitCode != 0) {
+            logger.log(
+                System.Logger.Level.WARNING,
+                "Cannot remove the dist-info of replaced distributions from $directory:\n${result.failureOutput}"
+            )
+        }
+    }
+
     fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
         ?.flatMap { listOf(Path(it, name), Path(it, "$name.exe")) }
         ?.firstOrNull { it.isExecutable() }
         ?.toString()
+
+    /**
+     * The Python functions finding the dist-info directories of the dependency directory by their distribution,
+     * and telling their identity,
+     * shared by the [PLAN] and [REPLACED_DIST_INFO], importing only modules of the standard library.
+     *
+     * `pip install --target --upgrade` replaces the files of a distribution installed in another version,
+     * but leaves its dist-info beside the one of the new version,
+     * and `importlib.metadata` would find whichever of them the directory lists first.
+     */
+    @Language("python")
+    private val DIST_INFOS = """
+        import os, re
+
+        def normalized_name(name):
+            return re.sub(r"[-_.]+", "_", name).lower()
+
+        def dist_infos(directory):
+            # the dist-info directories by the normalized name of their distribution,
+            # taken from the directory name, like importlib.metadata finds them
+            found = {}
+            try:
+                entries = sorted(os.listdir(directory))
+            except OSError:
+                return found
+            for entry in entries:
+                path = os.path.join(directory, entry)
+                if entry.lower().endswith(".dist-info") and os.path.isdir(path):
+                    found.setdefault(normalized_name(entry[:-len(".dist-info")].partition("-")[0]), []).append(path)
+            return found
+
+        def identity(path):
+            # with the change time, against an inode number reused for a directory written again,
+            # or None without inode numbers, e.g. on FAT
+            try:
+                status = os.stat(path)
+            except OSError:
+                return None
+            return [status.st_dev, status.st_ino, status.st_ctime_ns] if status.st_ino else None
+
+        def dist_info_snapshot(directory):
+            return {os.path.basename(path): identity(path) for paths in dist_infos(directory).values() for path in paths}
+    """.trimIndent()
+
+    /**
+     * Its argument is the dependency directory, and its standard input the `dist-info` snapshot of the [PLAN],
+     * the identities of the dist-info directories by their names, taken before an installation.
+     * It removes the dist-info directories of a distribution which the installation did not write,
+     * when it wrote one of the distribution, as the one of the files it installed,
+     * as an installation writes at most one dist-info of a distribution.
+     *
+     * The installer, pip or uv, writes a dist-info as a new directory, also when replacing the same version,
+     * so a dist-info is told written by the installation by its name, not in the snapshot,
+     * or by its identity, unless unknown, e.g. on a file system without inode numbers.
+     * Nothing is told by the content, e.g. by `RECORD`, whose paths are relative to the layout
+     * which the installer used, e.g. `../../bin/` of `pip install --target`, not to the directory.
+     */
+    @Language("python")
+    private val REPLACED_DIST_INFO = DIST_INFOS + "\n\n" + """
+        import json, shutil, sys
+
+        directory, before = sys.argv[1], json.loads(sys.stdin.read())
+        for paths in dist_infos(directory).values():
+            def is_written(path):
+                name = os.path.basename(path)
+                return name not in before or (before[name] is not None and identity(path) != before[name])
+            written = [path for path in paths if is_written(path)]
+            if len(written) == 1:
+                for path in paths:
+                    if path not in written:
+                        # a link, not the directory it points to
+                        os.unlink(path) if os.path.islink(path) else shutil.rmtree(path)
+    """.trimIndent()
 
     /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
     internal const val NO_TOML_PARSER_MESSAGE =
@@ -256,28 +456,32 @@ internal object PythonDependencies {
     /**
      * Prints the dependencies to install, as `install <requirement>`,
      * the distributions to keep in their versions, as `constraint <name>==<version>`,
-     * and the requirements of the distributions of the dependency directory,
+     * the requirements of the distributions of the dependency directory,
      * as `requirement <dependent> <version> <name> <specifier>`, with canonical names,
-     * except the ones of the declared dependencies, which [install] turns into constraints,
+     * except the ones of the declared dependencies, which [installMissing] turns into constraints,
+     * and, when something is to be installed, the identities of the dist-info directories,
+     * as `dist-info <JSON object>`, for [removeReplacedDistInfo] after the installation,
      * or exits with the error.
-     * Without packaging, to read the requirements, there are none.
-     * Of several `dist-info` directories of a distribution, left behind by `pip install --target`,
-     * the one whose `RECORD` hashes match the files on disk is read, and none if it is not the only one.
      * Its argument is the dependency directory,
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
     @Language("python")
-    internal val PLAN = """
+    internal val PLAN = DIST_INFOS + "\n\n" + """
         import json, sys
 
-        # before any import which can fail, so that the input is always read
+        # before any import which can fail, so that the input is always read,
+        # while the ones of DIST_INFOS above, of the standard library, cannot
         request = json.loads(sys.stdin.read())
 
-        import base64, hashlib, importlib, importlib.metadata as metadata, os, re
+        import base64, csv, hashlib, importlib, importlib.metadata as metadata
+        from pathlib import Path
+        from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
+        dependency_location = os.path.realpath(directory)
+        dependency_dist_infos = dist_infos(directory)
         # tomllib is new in Python 3.11, tomli is its original, also vendored by pip
         for toml_module in ("tomllib", "tomli", "pip._vendor.tomli"):
             try:
@@ -297,12 +501,14 @@ internal object PythonDependencies {
         try:
             from packaging.requirements import Requirement, InvalidRequirement
             from packaging.utils import canonicalize_name
+            from packaging.version import Version
         except ImportError:
             try:
                 from pip._vendor.packaging.requirements import Requirement, InvalidRequirement
                 from pip._vendor.packaging.utils import canonicalize_name
+                from pip._vendor.packaging.version import Version
             except ImportError:
-                Requirement = None
+                Requirement = Version = None
 
         def is_missing(dependency):
             if Requirement is None:
@@ -315,14 +521,79 @@ internal object PythonDependencies {
                     sys.exit(f"Invalid dependency '{dependency}': {e}")
                 if requirement.marker is not None and not requirement.marker.evaluate():
                     return False
+                if requirement.url is not None:
+                    url_dependencies.add(dependency)
                 name = requirement.name
-            try:
-                version = metadata.version(name)
-            except metadata.PackageNotFoundError:
+            distribution = find_distribution(name)
+            if distribution is None:
                 return True
             if Requirement is None:
                 return specified
-            return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
+            if requirement.url is not None:
+                # the dependencies of the extras are not checked (#47), so they are installed again with them
+                return bool(requirement.extras) or not is_installed_from(requirement.url, distribution)
+            return not requirement.specifier.contains(distribution.version, prereleases=True)
+
+        def find_distribution(name):
+            # like importlib.metadata, but None for several dist-info of the name in the dependency directory,
+            # when it is not known which of them the installed files belong to,
+            # so that the installation writes a new one, and removes the others
+            try:
+                distribution = metadata.distribution(name)
+            except metadata.PackageNotFoundError:
+                return None
+            if os.path.realpath(distribution.locate_file("")) != dependency_location:
+                return distribution
+            if len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
+                return None
+            return distribution
+
+        def imported_files(distribution):
+            # the number of the recorded files of the imported top-level modules of the distribution,
+            # e.g. demo/__init__.py or demo.py of the imported demo, if they are all on disk with their recorded hashes;
+            # only the paths within the dependency directory, unlike e.g. ../../bin/ of pip install --target;
+            # RECORD is read as it is, as Distribution.files leaves out the missing files since Python 3.12
+            try:
+                files = [
+                    (row[0].split("/"), row[1].partition("="))
+                    for row in csv.reader((distribution.read_text("RECORD") or "").splitlines())
+                    if len(row) > 1 and row[1] and not row[0].endswith(".pyc")
+                    and row[0].split("/")[0].partition(".")[0] in imported
+                ]
+                for parts, (algorithm, _, value) in files:
+                    if algorithm not in hashlib.algorithms_guaranteed or algorithm.startswith("shake_"):
+                        return None
+                    digest = file_digests(os.path.join(directory, *parts), [algorithm])
+                    if digest is None:
+                        return None
+                    if base64.urlsafe_b64encode(bytes.fromhex(digest[algorithm])).rstrip(b"=").decode() != value:
+                        return None
+                return len(files) or None
+            except (OSError, ValueError, csv.Error):
+                return None
+
+        def version_key(version):
+            if Version is not None:
+                try:
+                    return 1, Version(version)
+                except ValueError:
+                    pass
+            return 0, version
+
+        def imported_distribution(name, distribution):
+            # of several dist-info of an imported distribution in the dependency directory,
+            # the one whose files of the imported modules are installed, as the constraint keeps them:
+            # of several such ones, e.g. when a version only added files, the one recording the most of them,
+            # then the highest version, otherwise the one importlib.metadata finds first
+            candidates = []
+            for path in dependency_dist_infos.get(normalized_name(name), []):
+                candidate = metadata.PathDistribution(Path(path))
+                count = imported_files(candidate)
+                if count is not None:
+                    candidates.append((count, version_key(candidate.version), candidate))
+            if not candidates:
+                return distribution
+            return max(candidates, key=lambda it: it[:2])[2]
 
         def requirements_of(distribution):
             # without the ones of its extras, and of other environments
@@ -348,17 +619,121 @@ internal object PythonDependencies {
                     return False
             return bool(hashed)
 
+        def without_credentials(url):
+            # direct_url.json holds the URL without credentials, and without the fragment
+            parts = urlsplit(url)
+            return urlunsplit((parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path, parts.query, ""))
+
+        def file_digests(path, algorithms):
+            # in one pass over the file for all the algorithms
+            try:
+                digests = {algorithm: hashlib.new(algorithm) for algorithm in algorithms}
+                with open(path, "rb") as file:
+                    for chunk in iter(lambda: file.read(1 << 20), b""):
+                        for digest in digests.values():
+                            digest.update(chunk)
+                return {algorithm: digest.hexdigest() for algorithm, digest in digests.items()}
+            except (OSError, ValueError):
+                return None
+
+        def is_unmodified_since_uv_install(path, distribution):
+            # uv records the change time of a local archive in uv_cache.json, the last write time on Windows,
+            # not its hash
+            try:
+                timestamp = json.loads(distribution.read_text("uv_cache.json") or "null")["timestamp"]
+                installed_time = timestamp["secs_since_epoch"] * 1_000_000_000 + timestamp["nanos_since_epoch"]
+                status = os.stat(path)
+                return (status.st_mtime_ns if os.name == "nt" else status.st_ctime_ns) == installed_time
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
+
+        def is_installed_from(url, distribution):
+            # compared with the direct_url.json of the distribution, PEP 610, without hitting the network
+            try:
+                installed = json.loads(distribution.read_text("direct_url.json") or "null")
+            except ValueError:
+                return False
+            if not isinstance(installed, dict) or not isinstance(installed.get("url"), str):
+                return False
+            url, _, fragment = url.partition("#")
+            options = dict(parse_qsl(fragment))
+            if options.pop("subdirectory", None) != installed.get("subdirectory"):
+                return False
+            vcs, plus, _ = urlsplit(url).scheme.partition("+")
+            vcs_info = installed.get("vcs_info")
+            if plus and vcs in ("git", "hg", "svn", "bzr"):
+                # a branch or a tag is satisfied by the commit installed for it before, as the snippet requests
+                # the same thing, and the latest commit cannot be known without the network
+                parts = urlsplit(url[len(vcs) + 1:])
+                path, at, revision = parts.path.rpartition("@")
+                if not at:
+                    path, revision = parts.path, None
+                if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != vcs:
+                    return False
+                installed_url = installed["url"]
+                if installed_url.startswith(vcs + "+"):
+                    installed_url = installed_url[len(vcs) + 1:]
+                if without_credentials(parts._replace(path=path).geturl()) != without_credentials(installed_url):
+                    return False
+                if revision is not None and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+                    return vcs_info.get("commit_id") == revision
+                return vcs_info.get("requested_revision") == revision
+            archive_info = installed.get("archive_info")
+            if vcs_info is not None or not isinstance(archive_info, dict):
+                # a local directory can change without changing its URL, so it is always installed again
+                return False
+            if without_credentials(url) != without_credentials(installed["url"]):
+                return False
+            # pip records the hashes, also when not requested, while uv records none,
+            # but keeps the hash fragment in the URL of a local archive
+            hashes = archive_info.get("hashes")
+            hashes = dict(hashes) if isinstance(hashes, dict) else {}
+            legacy_hash = archive_info.get("hash")
+            if isinstance(legacy_hash, str) and "=" in legacy_hash:
+                hashes.setdefault(*legacy_hash.split("=", 1))
+            for algorithm, value in parse_qsl(installed["url"].partition("#")[2]):
+                # the recorded hashes are the ones verified on installation
+                hashes.setdefault(algorithm, value)
+            # a shake digest has no fixed length to compute and compare
+            if any(name.startswith("shake_") for name in options):
+                return False
+            algorithms = {name for name in hashlib.algorithms_guaranteed if not name.startswith("shake_")}
+            hashes = {name: str(value).lower() for name, value in hashes.items() if name in algorithms}
+            requested = {name: value.lower() for name, value in options.items() if name in algorithms}
+            if any(name in hashes and hashes[name] != value for name, value in requested.items()):
+                return False
+            if urlsplit(url).scheme.lower() != "file":
+                # a remote archive is trusted to keep its content under the same URL,
+                # as uv records no hash of it, not even the requested one,
+                # but a requested hash of another algorithm than the ones pip recorded cannot be verified
+                return not hashes or all(name in hashes for name in requested)
+            # imported only here, as it imports http.client, email and ssl
+            from urllib.request import url2pathname
+            # a local archive can be rebuilt without changing its URL, so its content is compared
+            path = url2pathname(urlsplit(url).path)
+            if hashes:
+                expected = {**hashes, **requested}
+                return file_digests(path, expected) == expected
+            return not requested and is_unmodified_since_uv_install(path, distribution)
+
+        # the URL requirements whose marker applies, collected by is_missing
+        url_dependencies = set()
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
+            # pip resolves the missing ones without the dependency directory, so it would install a distribution
+            # required by them from the index over the one installed from a URL, also in the same version
+            missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
-            dependency_location = os.path.realpath(directory)
             constraints = {}
             for distribution in metadata.distributions():
                 name = distribution.metadata["Name"]
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
-                if name and (not in_dependencies or name in in_use):
-                    constraints.setdefault(name, distribution.version)
+                if name and name not in constraints and (not in_dependencies or name in in_use):
+                    if in_dependencies and len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
+                        # not the version of a dist-info left by a replaced version
+                        distribution = imported_distribution(name, distribution)
+                    constraints[name] = distribution.version
             for dependency in missing:
                 print("install", dependency)
             for name, version in constraints.items():
@@ -383,6 +758,8 @@ internal object PythonDependencies {
                             required = canonicalize_name(requirement.name)
                             if requirement.specifier and required not in kept:
                                 print("requirement", name, distribution.version, required, requirement.specifier)
+            # the dist-info directories before the installation, to remove the ones it replaced
+            print("dist-info", json.dumps(dist_info_snapshot(directory)))
     """.trimIndent()
 
 }
