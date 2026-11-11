@@ -28,6 +28,7 @@ import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectory
+import kotlin.io.path.createFile
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
@@ -932,6 +933,103 @@ class PythonEnvironmentTest {
             assert(probe == expected)
         } finally {
             workingDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should not resolve default Python to python3 in working directory through empty PATH entry`() {
+        // given
+        val planted = Path("").toAbsolutePath().resolve("python3")
+        assumeTrue(!planted.exists(), "no python3 in the working directory to plant over")
+        planted.createFile().toFile().setExecutable(true)
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.resolvePythonExecutable(
+                    configured = null, virtualEnv = null, path = "/nonexistent:", windows = false
+                )
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
+                    "VIRTUAL_ENV" in message &&
+                    "PythonEnvironment.pythonExecutable" in message
+            )
+        } finally {
+            planted.deleteIfExists()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should resolve default Python to absolute path of python3 on PATH`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        val python3 = directory.resolve("python3").createFile()
+        python3.toFile().setExecutable(true)
+
+        try {
+            // when
+            val python = PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = null, path = ":$directory", windows = false
+            )
+
+            // then
+            assert(python == python3.toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should resolve configured Python name to absolute path on PATH, but keep configured path`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        val python3 = directory.resolve("python3").createFile()
+        python3.toFile().setExecutable(true)
+
+        try {
+            // when
+            val name = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3"), virtualEnv = null, path = ":$directory", windows = false
+            )
+            val relative = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("venv", "bin", "python3"), virtualEnv = null, path = ":$directory", windows = false
+            )
+
+            // then
+            assert(name == python3.toString() && relative == Path("venv", "bin", "python3").toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should resolve default and configured Python name to exe file on PATH on Windows`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        directory.resolve("python3").createFile().toFile().setExecutable(true)
+        val python3Exe = directory.resolve("python3.exe").createFile()
+        python3Exe.toFile().setExecutable(true)
+
+        try {
+            // when
+            val default = PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = null, path = "$directory", windows = true
+            )
+            val configured = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.exe"), virtualEnv = null, path = "$directory", windows = true
+            )
+
+            // then
+            assert(default == python3Exe.toString() && configured == python3Exe.toString())
+        } finally {
+            directory.deleteRecursively()
         }
     }
 
