@@ -37,6 +37,7 @@ import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.isExecutable
+import kotlin.io.path.isRegularFile
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeLines
 
@@ -264,12 +265,9 @@ internal object PythonDependencies {
      * or of an environment variable like `UV_CONFIG_FILE` or `UV_CACHE_DIR`.
      * uv would read a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]` section, of this directory or of its parents,
      * e.g. one written by an agent among its generated files, changing the index the packages come from,
-     * so its project is the root directory of the working one instead,
-     * where it reads only the configuration of the root directory itself,
-     * which only an administrator can write on Unix, but e.g. every user on a drive other than the system one on Windows,
-     * or by every process of a container running as root.
-     * The user and system configuration of uv, and its environment variables, still apply,
-     * as `--no-config` would ignore the user configuration too, e.g. of a company index,
+     * so it runs with `--no-config`, since its version [uvNoConfigVersion], with the [uvConfigFile] instead.
+     * `--project /` would not do, as the working directory can be the root directory itself, e.g. of a container,
+     * and `--no-config` alone would ignore the user configuration too, e.g. of a company index,
      * and so install from PyPI instead.
      * pip reads no configuration of the working directory.
      */
@@ -277,18 +275,17 @@ internal object PythonDependencies {
         missing: List<String>,
         constraints: List<String>,
         directory: String,
-        uv: String? = findOnPath("uv")
+        uv: String? = findOnPath("uv"),
+        uvConfigFile: Path? = findUvConfigFile()
     ) {
         val constraintsFile = createTempFile("python-constraints", ".txt")
         try {
             constraintsFile.writeLines(constraints)
             val command = if (uv != null) {
-                listOf(
-                    uv, "pip", "install", "--quiet",
-                    "--project", Path("").toAbsolutePath().root.toString(),
+                listOf(uv, "pip", "install", "--quiet") + uvConfigArguments(uv, uvConfigFile) + listOf(
                     "--python", PythonEnvironment.executable,
                     "--target", directory,
-                    "--constraints", constraintsFile.toString()
+                    "--constraint", constraintsFile.toString()
                 )
             } else {
                 pipCommand(
@@ -307,6 +304,60 @@ internal object PythonDependencies {
         } finally {
             constraintsFile.deleteIfExists()
         }
+    }
+
+    /** The first version of uv with `--no-config`, which an older one rejects. */
+    private val uvNoConfigVersion = listOf(0, 2, 30)
+
+    /**
+     * The arguments making the [uv] executable read only the [configFile], if any,
+     * and not discover the configuration of the working directory,
+     * or none, if its version is older than [uvNoConfigVersion], or unknown, so that it still installs.
+     */
+    private fun uvConfigArguments(uv: String, configFile: Path?): List<String> {
+        val version = try {
+            val result = runProcess(listOf(uv, "--version"), mergeErrorStream = false)
+            if (result.exitCode == 0) parseUvVersion(result.output) else null
+        } catch (_: IOException) {
+            null
+        }
+        val supported = version != null &&
+            (version.zip(uvNoConfigVersion).firstOrNull { (a, b) -> a != b }?.let { (a, b) -> a > b } ?: true)
+        if (!supported) return emptyList()
+        return listOf("--no-config") + (configFile?.let { listOf("--config-file", it.toString()) } ?: emptyList())
+    }
+
+    private val uvVersionPattern = Regex("""^uv (\d+)\.(\d+)\.(\d+)""")
+
+    /** The major, minor and patch version in the [output] of `uv --version`, or `null` if there is none. */
+    fun parseUvVersion(output: String): List<Int>? =
+        uvVersionPattern.find(output.trim())?.groupValues?.drop(1)?.map { it.toInt() }
+
+    /**
+     * The configuration file of uv, which it reads when it discovers the configuration,
+     * the user one, or otherwise the system one, or `null` if there is none,
+     * or if the `UV_CONFIG_FILE` environment variable is set, which uv reads itself, also with `--no-config`.
+     *
+     * uv would merge the user configuration into the system one, so the system one is ignored when there is a user one.
+     */
+    fun findUvConfigFile(
+        environment: Map<String, String> = System.getenv(),
+        userHome: String = System.getProperty("user.home"),
+        windows: Boolean = System.getProperty("os.name").startsWith("Windows")
+    ): Path? {
+        fun variable(name: String) = environment[name]?.takeIf { it.isNotEmpty() }
+        if (variable("UV_CONFIG_FILE") != null) return null
+        val directories = if (windows) {
+            listOfNotNull(
+                variable("APPDATA"),
+                (variable("SYSTEMDRIVE") ?: "C:") + "\\ProgramData"
+            )
+        } else {
+            listOf(variable("XDG_CONFIG_HOME") ?: Path(userHome, ".config").toString()) +
+                (variable("XDG_CONFIG_DIRS") ?: "/etc/xdg").split(':').filter { it.isNotEmpty() } +
+                "/etc"
+        }
+        return directories.map { Path(it, "uv", "uv.toml") }.firstOrNull { it.isRegularFile() }
     }
 
     /** The executable of the [name] on the `PATH`, or `null` if there is none. */

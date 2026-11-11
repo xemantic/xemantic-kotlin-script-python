@@ -172,7 +172,7 @@ otherwise the code can declare it as a dependency, see below.
 * The code passed to `exec`, or `python(code)`, can declare its dependencies,
   like a `@file:DependsOn` of a Kotlin snippet,
   with [inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/),
-  as with `uv run`:
+  the format of a script run with `uv run`:
   ```python
   # /// script
   # dependencies = ["rdkit"]
@@ -186,10 +186,14 @@ otherwise the code can declare it as a dependency, see below.
   or otherwise `~/.cache/xemantic-kotlin-script-python/<python>-<hash of the environment>`,
   which becomes importable once any code declares its dependencies.
   The installer runs in the working directory of the JVM, against which relative paths are resolved,
-  but uv does not read a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]` section, of this directory or of its parents,
-  e.g. one written by an agent, which could change the package index,
-  as its project is the root directory (`--project /`), so that only the configuration of the root directory itself,
-  the user and system configuration of uv, and its environment variables, like `UV_CONFIG_FILE` or `UV_DEFAULT_INDEX`, apply.
+  but uv, since its version 0.2.30, does not read a `uv.toml`, or a `pyproject.toml` with a `[tool.uv]` section,
+  of this directory or of its parents, e.g. one written by an agent, which could change the package index:
+  it runs with `--no-config`, and reads only the file of the `UV_CONFIG_FILE` environment variable, if set,
+  or otherwise its user configuration file (`$XDG_CONFIG_HOME/uv/uv.toml`, `~/.config/uv/uv.toml`, or `%APPDATA%\uv\uv.toml` on Windows),
+  or, if there is none, its system one (`$XDG_CONFIG_DIRS/uv/uv.toml`, `/etc/xdg/uv/uv.toml`, `/etc/uv/uv.toml`, or `%SYSTEMDRIVE%\ProgramData\uv\uv.toml` on Windows) —
+  not both merged, as uv would do itself —
+  and its other environment variables, like `UV_DEFAULT_INDEX`, apply too.
+  An older uv reads the configuration of the working directory, as it cannot be told not to.
   The installed dependencies are shared by all the `Python` interpreters of the JVM,
   and they cannot change the versions of the distributions of the Python environment itself,
   nor the ones already imported from the dependency directory, as a module cannot be replaced once imported.

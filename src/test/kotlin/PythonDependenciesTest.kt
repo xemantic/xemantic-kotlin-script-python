@@ -683,7 +683,7 @@ class PythonDependenciesTest {
     @Test
     fun `should run uv in working directory of JVM, against which relative paths are resolved`() {
         // when
-        val (workingDirectory, _) = runFakeUv()
+        val (workingDirectory, _) = runFakeUv("0.13.7")
 
         // then
         // e.g. of a dependency like 'name @ ./dist/name.whl', or of UV_CONFIG_FILE or UV_CACHE_DIR
@@ -691,34 +691,204 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should run uv with project in root directory, so that it finds no configuration of working directory`() {
+    fun `should run uv without configuration discovery, so that it finds no configuration of working directory`() {
         // when
-        val (_, arguments) = runFakeUv()
+        val (_, arguments) = runFakeUv("0.13.7")
 
         // then
-        // uv reads a uv.toml, or a pyproject.toml with a [tool.uv] section, of its project directory and its parents
-        val project = arguments.getOrNull(arguments.indexOf("--project") + 1)
-        assert(project == Path("").toAbsolutePath().root.toString())
+        // uv reads a uv.toml, or a pyproject.toml with a [tool.uv] section, of its working directory and its parents,
+        // also when the working directory is the root directory, as by default in a container
+        assert("--no-config" in arguments && "--project" !in arguments)
+    }
+
+    @Test
+    fun `should run uv with configuration file without configuration discovery`() {
+        // given
+        val configFile = Path("uv", "uv.toml").toAbsolutePath()
+
+        // when
+        val (_, arguments) = runFakeUv("0.13.7", configFile)
+
+        // then
+        assert(arguments.getOrNull(arguments.indexOf("--config-file") + 1) == configFile.toString())
+    }
+
+    @Test
+    fun `should run uv older than 0_2_30 with configuration discovery, which it cannot disable`() {
+        // when
+        val (_, arguments) = runFakeUv("0.2.29", Path("uv", "uv.toml").toAbsolutePath())
+
+        // then
+        // so that the installation works as before, without the protection
+        assert("--no-config" !in arguments && "--config-file" !in arguments && "--project" !in arguments)
+    }
+
+    @Test
+    fun `should run uv with constraint option known to uv older than 0_5`() {
+        // when
+        val (_, arguments) = runFakeUv("0.2.30")
+
+        // then
+        // --constraints, an alias of it, is rejected by uv 0.5.0 and older
+        assert("--constraint" in arguments && "--constraints" !in arguments)
+    }
+
+    @Test
+    fun `should parse version of uv`() {
+        // then
+        assert(PythonDependencies.parseUvVersion("uv 0.13.7 (5e2bc1fb5 2026-10-02)") == listOf(0, 13, 7))
+        assert(PythonDependencies.parseUvVersion("uv 0.2.30") == listOf(0, 2, 30))
+        assert(PythonDependencies.parseUvVersion("error: unknown") == null)
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find user configuration file of uv in XDG_CONFIG_HOME`() {
+        // given
+        val home = createTempDirectory("python-uv-home")
+        try {
+            val xdg = home.resolve("xdg")
+            val user = xdg.resolve("uv").createDirectories().resolve("uv.toml").apply { writeText("") }
+            home.resolve(".config/uv").createDirectories().resolve("uv.toml").writeText("")
+
+            // when
+            val configFile = PythonDependencies.findUvConfigFile(
+                environment = mapOf(
+                    "XDG_CONFIG_HOME" to xdg.toString(),
+                    "XDG_CONFIG_DIRS" to home.resolve("none").toString()
+                ),
+                userHome = home.toString(),
+                windows = false
+            )
+
+            // then
+            assert(configFile == user)
+        } finally {
+            home.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find user configuration file of uv in home, before system one`() {
+        // given
+        val home = createTempDirectory("python-uv-home")
+        try {
+            val user = home.resolve(".config/uv").createDirectories().resolve("uv.toml").apply { writeText("") }
+            val system = home.resolve("etc-xdg")
+            system.resolve("uv").createDirectories().resolve("uv.toml").writeText("")
+
+            // when
+            val configFile = PythonDependencies.findUvConfigFile(
+                environment = mapOf("XDG_CONFIG_DIRS" to system.toString()),
+                userHome = home.toString(),
+                windows = false
+            )
+
+            // then
+            assert(configFile == user)
+        } finally {
+            home.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find system configuration file of uv without user one`() {
+        // given
+        val home = createTempDirectory("python-uv-home")
+        try {
+            val systemDirectory = home.resolve("etc-xdg")
+            val system = systemDirectory.resolve("uv").createDirectories().resolve("uv.toml").apply { writeText("") }
+
+            // when
+            val configFile = PythonDependencies.findUvConfigFile(
+                environment = mapOf("XDG_CONFIG_DIRS" to "${home.resolve("none")}:$systemDirectory"),
+                userHome = home.toString(),
+                windows = false
+            )
+
+            // then
+            assert(configFile == system)
+        } finally {
+            home.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find no configuration file of uv with UV_CONFIG_FILE, which uv reads itself`() {
+        // given
+        val home = createTempDirectory("python-uv-home")
+        try {
+            home.resolve(".config/uv").createDirectories().resolve("uv.toml").writeText("")
+
+            // when
+            val configFile = PythonDependencies.findUvConfigFile(
+                environment = mapOf("UV_CONFIG_FILE" to "my-uv.toml"),
+                userHome = home.toString(),
+                windows = false
+            )
+
+            // then
+            assert(configFile == null)
+        } finally {
+            home.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find user configuration file of uv in APPDATA on Windows`() {
+        // given
+        val appData = createTempDirectory("python-uv-appdata")
+        try {
+            val user = appData.resolve("uv").createDirectories().resolve("uv.toml").apply { writeText("") }
+
+            // when
+            val configFile = PythonDependencies.findUvConfigFile(
+                environment = mapOf("APPDATA" to appData.toString()),
+                userHome = appData.resolve("home").toString(),
+                windows = true
+            )
+
+            // then
+            assert(configFile == user)
+        } finally {
+            appData.deleteRecursively()
+        }
     }
 
     /**
-     * Installs a dependency with a fake `uv`,
-     * which only records its working directory and arguments, so that uv need not be installed.
+     * Installs a dependency with a fake `uv` of the [version],
+     * which only records its working directory and arguments, so that uv need not be installed,
+     * and with the [configFile] of uv, if any.
      *
      * @return the working directory and the arguments of the fake `uv`.
      */
     @OptIn(ExperimentalPathApi::class)
-    private fun runFakeUv(): Pair<Path, List<String>> {
+    private fun runFakeUv(version: String, configFile: Path? = null): Pair<Path, List<String>> {
         assumeFalse(System.getProperty("os.name").startsWith("Windows"), "the fake uv is a shell script")
         PythonEnvironment.initialize()
         val uvDirectory = createTempDirectory("python-fake-uv")
         try {
             val record = uvDirectory.resolve("record.txt")
             val uv = uvDirectory.resolve("uv")
-            uv.writeText("#!/bin/sh\npwd -P > '$record'\nprintf '%s\\n' \"$@\" >> '$record'\n")
+            uv.writeText(
+                """
+                |#!/bin/sh
+                |if [ "$1" = --version ]; then echo 'uv $version (fake)'; exit 0; fi
+                |pwd -P > '$record'
+                |printf '%s\n' "$@" >> '$record'
+                |""".trimMargin()
+            )
             uv.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
             PythonDependencies.installMissing(
-                listOf("fake-dependency"), emptyList(), uvDirectory.resolve("dependencies").toString(), uv = uv.toString()
+                listOf("fake-dependency"),
+                emptyList(),
+                uvDirectory.resolve("dependencies").toString(),
+                uv = uv.toString(),
+                uvConfigFile = configFile
             )
             val lines = record.readLines()
             return Path(lines.first()) to lines.drop(1)
@@ -727,42 +897,45 @@ class PythonDependenciesTest {
         }
     }
 
-    /**
-     * In a JVM of its own, as the working directory of this one cannot be changed.
-     * The dependency is a local wheel, and the cache of uv is a new one,
-     * so that uv neither needs the network, nor waits for the lock of the shared cache of the user,
-     * e.g. held by uv of another build.
-     */
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should install with uv relative path dependency in working directory with uv configuration`() {
+    fun `should install with uv and its user configuration in working directory with uv configuration`() {
         // given
-        assumeTrue(PythonDependencies.findOnPath("uv") != null, "uv is not on the PATH")
         val directory = createTempDirectory("python-uv-config")
         try {
             val workingDirectory = directory.resolve("work").createDirectory()
-            // uv fails whenever it reads this configuration, of the working directory or of its parent
+            // uv fails whenever it reads this configuration
             workingDirectory.resolve("uv.toml").writeText("index-url = 42\n")
-            directory.resolve("pyproject.toml").writeText("[tool.uv]\nindex-url = 42\n")
-            writeFakeWheel(workingDirectory.resolve("dist").createDirectory())
-            val code = """
-                |# /// script
-                |# dependencies = ["fake-dependency @ ./dist/fake_dependency-1.0-py3-none-any.whl"]
-                |# ///
-                |import fake_dependency
-                |print(fake_dependency.VALUE, flush=True)
-                |""".trimMargin()
+            val userCache = directory.resolve("user-cache")
+            val xdg = directory.resolve("xdg")
+            xdg.resolve("uv").createDirectories().resolve("uv.toml").writeText("cache-dir = '$userCache'\n")
 
             // when
-            val (exitCode, output) = runInJvm(
-                EmbeddedPythonMain::class.java.name,
-                input = code,
-                environment = mapOf("UV_CACHE_DIR" to ".uv-cache"),
-                jvmArguments = listOf(
-                    "-Dxemantic.kotlin.script.python.dependencyDirectory=${directory.resolve("dependencies")}"
-                ),
-                directory = workingDirectory
+            val (exitCode, output) = installWithUv(
+                directory, workingDirectory, mapOf("XDG_CONFIG_HOME" to xdg.toString())
             )
+
+            // then
+            assert(output == "installed")
+            assert(exitCode == 0)
+            assert(userCache.exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should install with uv in working directory with uv configuration in parent directory`() {
+        // given
+        val directory = createTempDirectory("python-uv-config")
+        try {
+            val workingDirectory = directory.resolve("work").createDirectory()
+            // uv fails whenever it reads this configuration, the nearest one to the working directory
+            directory.resolve("uv.toml").writeText("index-url = 42\n")
+
+            // when
+            val (exitCode, output) = installWithUv(directory, workingDirectory, mapOf("UV_CACHE_DIR" to ".uv-cache"))
 
             // then
             assert(output == "installed")
@@ -773,10 +946,44 @@ class PythonDependenciesTest {
         }
     }
 
+    /**
+     * Installs, with uv, the `fake-dependency` of a wheel in the `dist` directory of the [workingDirectory],
+     * by a path relative to it, into the `dependencies` of the [directory],
+     * in a JVM of its own, as the working directory of this one cannot be changed,
+     * with the [environment] variables, which give uv a cache of its own,
+     * so that it does not wait for the lock of the shared cache of the user, e.g. held by uv of another build.
+     * The wheel is local, so that uv needs no network.
+     *
+     * @return the exit code and the output of the JVM.
+     */
+    private fun installWithUv(
+        directory: Path,
+        workingDirectory: Path,
+        environment: Map<String, String>
+    ): Pair<Int, String> {
+        assumeTrue(PythonDependencies.findOnPath("uv") != null, "uv is not on the PATH")
+        writeFakeWheel(workingDirectory.resolve("dist").createDirectory())
+        val code = """
+            |# /// script
+            |# dependencies = ["fake-dependency @ ./dist/fake_dependency-1.0-py3-none-any.whl"]
+            |# ///
+            |import fake_dependency
+            |print(fake_dependency.VALUE, flush=True)
+            |""".trimMargin()
+        return runInJvm(
+            EmbeddedPythonMain::class.java.name,
+            input = code,
+            environment = environment,
+            jvmArguments = listOf(
+                "-Dxemantic.kotlin.script.python.dependencyDirectory=${directory.resolve("dependencies")}"
+            ),
+            directory = workingDirectory
+        )
+    }
+
     /** Writes the wheel of the `fake-dependency` distribution, of the `fake_dependency` module, into the [directory]. */
-    private fun writeFakeWheel(directory: Path): Path {
-        val wheel = directory.resolve("fake_dependency-1.0-py3-none-any.whl")
-        ZipOutputStream(wheel.outputStream()).use { zip ->
+    private fun writeFakeWheel(directory: Path) {
+        ZipOutputStream(directory.resolve("fake_dependency-1.0-py3-none-any.whl").outputStream()).use { zip ->
             mapOf(
                 "fake_dependency.py" to "VALUE = 'installed'\n",
                 "fake_dependency-1.0.dist-info/METADATA" to
@@ -790,7 +997,6 @@ class PythonDependenciesTest {
                 zip.closeEntry()
             }
         }
-        return wheel
     }
 
     private companion object {
