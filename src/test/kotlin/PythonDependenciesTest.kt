@@ -1933,7 +1933,8 @@ class PythonDependenciesTest {
     @Test
     fun `should install dependency requiring installed distribution which uv does not find in index`() {
         // given
-        val uv = PythonDependencies.findOnPath("uv") ?: return
+        val uv = PythonDependencies.findOnPath("uv")
+        assumeTrue(uv != null, "uv is not on the PATH of the Gradle daemon")
         withLocalIndex { directory, index ->
             // installed from a URL, or an index no longer configured, like pip would install it again
             directory.writeDistribution("issue28-dependency", "1.0")
@@ -2090,6 +2091,105 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan pre-release bounds of requirement as release bounds when installed version is release`() {
+        // given
+        withDistInfos { directory ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency!=2.1b1,<3.0rc1,>=2.0b1")
+            directory.writeDistribution("issue28-dependency", "2.0")
+
+            // when
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
+
+            // then
+            // as a constraint mentioning a pre-release lets pip install pre-releases of the distribution
+            assert(
+                plan.filter { it.first == "requirement" } ==
+                    listOf("requirement" to "issue28-dependent issue28-dependency <3.0,>=2.0 1.0")
+            )
+        }
+    }
+
+    @Test
+    fun `should plan pre-release bound of requirement when installed version is pre-release`() {
+        // given
+        withDistInfos { directory ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency>=2.0b1")
+            directory.writeDistribution("issue28-dependency", "2.0b2")
+
+            // when
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
+
+            // then
+            assert(
+                plan.filter { it.first == "requirement" } ==
+                    listOf("requirement" to "issue28-dependent issue28-dependency >=2.0b1 1.0")
+            )
+        }
+    }
+
+    @Test
+    fun `should not plan requirement already violated by installed version`() {
+        // given
+        withDistInfos { directory ->
+            // e.g. left by an installation before the requirements were protected
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+            directory.writeDistribution("issue28-other-dependent", "1.0", "issue28-dependency>=2")
+            directory.writeDistribution("issue28-dependency", "2.0")
+
+            // when
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
+
+            // then
+            // nothing to protect, while the constraint would refuse any installation requiring the dependency
+            assert(
+                plan.filter { it.first == "requirement" } ==
+                    listOf("requirement" to "issue28-other-dependent issue28-dependency >=2 1.0")
+            )
+        }
+    }
+
+    @Test
+    fun `should not import packaging of dependency directory to plan`() {
+        // given
+        withDistInfos { directory ->
+            directory.writeDistribution("issue28-dependent", "1.0", "issue28-dependency<2")
+            // e.g. packaging 21.3, which still parses legacy specifiers, like >=1.0.*, which uv rejects
+            directory.resolve("packaging").createDirectories().resolve("__init__.py")
+                .writeText("raise RuntimeError('issue28: packaging of the dependency directory imported')\n")
+
+            // when
+            val plan = PythonDependencies.plan("dependencies = [\"issue28-new\"]\n", directory.toString(), emptyList())
+
+            // then
+            assert(plan.any { it == ("install" to "issue28-new") })
+        }
+    }
+
+    @Test
+    fun `should tell valid PEP 440 specifier clauses`() {
+        // given
+        PythonEnvironment.initialize()
+        val clauses = listOf(
+            ">=" to "1.0", ">=" to "1.0.*", "==" to "1.0.*", "!=" to "1.0.*", "==" to "1.0+cpu", "<" to "1.0+cpu",
+            "~=" to "1", "~=" to "1.0", ">=" to "1.0-beta1", ">=" to "1!2.0rc1.post2.dev3", ">=" to "abc",
+            "===" to "abc", "==" to "1.0.*+cpu"
+        )
+        val code = PythonDependencies.SPECIFIER_CLAUSES + "\n" +
+            clauses.joinToString("") { (operator, version) -> "print(is_valid_clause('$operator', '$version'))\n" }
+
+        // when
+        val (exitCode, output) = runProcess(listOf(PythonEnvironment.executable, "-c", code))
+
+        // then
+        assert(exitCode == 0)
+        assert(
+            clauses.zip(output.lines().filter { it.isNotBlank() }).filter { it.second == "True" }.map { it.first } ==
+                listOf(">=" to "1.0", "==" to "1.0.*", "!=" to "1.0.*", "==" to "1.0+cpu", "~=" to "1.0",
+                    ">=" to "1.0-beta1", ">=" to "1!2.0rc1.post2.dev3")
+        )
+    }
+
+    @Test
     fun `should not plan requirements of distribution of dependency directory shadowed by environment`() {
         // given
         withDistInfos { directory ->
@@ -2179,6 +2279,48 @@ class PythonDependenciesTest {
         assert("  issue28-dependency <2, required by issue28-dependent 1.0\n" in explanation)
         assert("  issue28-other >=1, required by issue28-other-dependent 1.0\n" in explanation)
         assert(dryRuns.size == 1)
+    }
+
+    @Test
+    fun `should search conflict among same requirements of many dependents as one`() {
+        // given
+        val requirements = (1..300).map {
+            PythonDependencies.InstalledRequirement("issue28-dependent-$it", "1.0", "issue28-dependency", "<2", false)
+        }
+        var dryRuns = 0
+
+        // when
+        val explanation = PythonDependencies.explainConflict(requirements, "", "/directory") {
+            dryRuns++
+            ProcessResult(if (it.isEmpty()) 0 else 1, "", "")
+        }
+
+        // then
+        assert(explanation != null)
+        assert(requirements.all { "  $it\n" in explanation })
+        assert(dryRuns < 10)
+    }
+
+    @Test
+    fun `should stop searching conflict among many requirements and list all suspected`() {
+        // given
+        val requirements = (1..300).map {
+            PythonDependencies.InstalledRequirement("issue28-dependent-$it", "1.0", "issue28-dependency-$it", "<2", false)
+        }
+        var dryRuns = 0
+
+        // when
+        // each of them conflicting alone, which takes a search for each
+        val explanation = PythonDependencies.explainConflict(requirements, "", "/directory") {
+            dryRuns++
+            ProcessResult(if (it.isEmpty()) 0 else 1, "", "")
+        }
+
+        // then
+        assert(explanation != null)
+        assert(requirements.all { "  $it\n" in explanation })
+        assert("might conflict" in explanation)
+        assert(dryRuns <= PythonDependencies.MAX_CONFLICT_DRY_RUNS)
     }
 
     @Test

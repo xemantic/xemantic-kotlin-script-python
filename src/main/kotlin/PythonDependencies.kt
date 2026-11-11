@@ -344,6 +344,9 @@ internal object PythonDependencies {
         }
     }
 
+    /** The most resolutions without installing which [explainConflict] takes to find the requirements in conflict. */
+    internal const val MAX_CONFLICT_DRY_RUNS = 64
+
     /** The [name] of a distribution, normalized like `packaging.utils.canonicalize_name`. */
     private fun canonicalName(name: String) = name.lowercase().replace(Regex("[-_.]+"), "-")
 
@@ -359,8 +362,13 @@ internal object PythonDependencies {
         directory: String,
         dryRun: (List<InstalledRequirement>) -> ProcessResult
     ): String? {
-        fun resolves(requirements: List<InstalledRequirement>) = dryRun(requirements).exitCode == 0
+        var dryRuns = 0
+        fun resolves(requirements: List<InstalledRequirement>): Boolean {
+            if (++dryRuns > MAX_CONFLICT_DRY_RUNS) throw ConflictSearchExhausted()
+            return dryRun(requirements).exitCode == 0
+        }
         if (requirements.isEmpty()) return null
+        dryRuns++
         val constrained = dryRun(requirements)
         if (constrained.exitCode != 0 && "no such option: --dry-run" in constrained.output) {
             // pip before 22.2, which cannot resolve without installing, so all the requirements are suspected
@@ -376,29 +384,59 @@ internal object PythonDependencies {
         // only if the resolution fails with them, unlike e.g. building a wheel, which a dry run does not do,
         // and succeeds without them, unlike e.g. a dependency not found
         if (constrained.exitCode == 0 || !resolves(emptyList())) return null
+        // the same requirement of several dependents is the same constraint, so they are searched as one
+        val groups = requirements.groupBy { it.name to it.specifier }.values.toList()
+        fun resolvesGroups(groups: List<List<InstalledRequirement>>) = resolves(groups.flatten())
         // every minimal conflict, as resolving one, e.g. by upgrading its dependent, would leave the others
-        val conflicting = mutableListOf<InstalledRequirement>()
-        var remaining = requirements
-        do {
-            val conflict = minimalConflict(emptyList(), remaining, ::resolves)
-            // none only when the resolution is not repeatable, e.g. with the network failing meanwhile
-            if (conflict.isEmpty()) break
-            conflicting += conflict
-            remaining = remaining - conflict.toSet()
-        } while (remaining.isNotEmpty() && !resolves(remaining))
+        val conflicting = mutableListOf<List<InstalledRequirement>>()
+        var remaining = groups
+        try {
+            do {
+                val conflict = minimalConflict(emptyList(), remaining, ::resolvesGroups)
+                // none only when the resolution is not repeatable, e.g. with the network failing meanwhile
+                if (conflict.isEmpty()) break
+                conflicting += conflict
+                remaining = remaining - conflict.toSet()
+            } while (remaining.isNotEmpty() && !resolvesGroups(remaining))
+        } catch (_: ConflictSearchExhausted) {
+            // too many conflicts to tell them all in a reasonable time, so the rest of them are suspected
+            val suspected = (conflicting + remaining).flatten().toSet()
+            return "The dependencies might conflict with these requirements of the distributions " +
+                "installed in the dependency directory $directory, " +
+                "the search for the ones in conflict stopped after $MAX_CONFLICT_DRY_RUNS resolutions:\n" +
+                requirements.filter { it in suspected }.joinToString("") { "  $it\n" } +
+                advice(requirements.filter { it in suspected })
+        }
         if (conflicting.isEmpty()) return null
+        val found = conflicting.flatten().toSet()
         return "The dependencies conflict with these requirements of the distributions " +
             "installed in the dependency directory $directory:\n" +
-            requirements.filter { it in conflicting }.joinToString("") { "  $it\n" } +
-            advice(conflicting)
+            requirements.filter { it in found }.joinToString("") { "  $it\n" } +
+            advice(requirements.filter { it in found })
     }
+
+    private class ConflictSearchExhausted : RuntimeException()
+
+    /** A valid PEP 440 version, also not normalized, like the pattern of `packaging.version`. */
+    private val pep440Version = Regex(
+        "v?(?:[0-9]+!)?[0-9]+(?:\\.[0-9]+)*" +
+            "(?:[-_.]?(?:alpha|a|beta|b|preview|pre|c|rc)[-_.]?[0-9]*)?" +
+            "(?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?" +
+            "(?:[-_.]?dev[-_.]?[0-9]*)?" +
+            "(?:\\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?",
+        RegexOption.IGNORE_CASE
+    )
 
     /** How to resolve a conflict with the [requirements] of the installed distributions. */
     private fun advice(requirements: List<InstalledRequirement>): String {
         val (imported, upgradable) = requirements.partition { it.imported }
         // against the public version, as a local one, like 2.1.0+cpu, cannot be compared with >,
         // while >2.1.0 excludes it
-        val laterVersions = upgradable.map { "${it.dependent}>${it.version.substringBefore('+')}" }.distinct()
+        val laterVersions = upgradable.map {
+            if (pep440Version.matches(it.version)) "${it.dependent}>${it.version.substringBefore('+')}"
+            // a version of legacy metadata, which cannot be compared
+            else "${it.dependent}, in a later version than ${it.version}"
+        }.distinct()
         return (
             if (laterVersions.isEmpty()) "" else "A later version of such a distribution might not require it, " +
                 "so to upgrade it along, declare it as a dependency in a later version than the installed one:\n" +
@@ -558,8 +596,11 @@ internal object PythonDependencies {
      * the distributions to keep in their versions, as `constraint <name>==<version>`,
      * the requirements of the distributions of the dependency directory,
      * as `requirement <dependent> <name> <specifier> <version>`, with canonical names,
-     * except the ones of the distributions shadowed by the ones of the environment,
-     * except the ones of the declared dependencies, which [installMissing] turns into constraints,
+     * which [installMissing] turns into constraints,
+     * except the ones of the declared dependencies, of the distributions shadowed by the ones of the environment,
+     * of their extras, and the ones the installed version of the required distribution already violates,
+     * with the valid PEP 440 clauses of the specifier, see [SPECIFIER_CLAUSES],
+     * a pre-release bound as the one of its release, unless a pre-release is installed,
      * and, when something is to be installed, the identities of the dist-info directories,
      * as `dist-info <JSON object>`, for [removeReplacedDistInfo] after the installation,
      * or exits with the error.
@@ -567,8 +608,36 @@ internal object PythonDependencies {
      * and its standard input is a JSON object of the TOML content of the `script` metadata block,
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      */
+    /** The Python function telling a clause of a version specifier valid by PEP 440. */
     @Language("python")
-    internal val PLAN = DIST_INFOS + "\n\n" + """
+    internal val SPECIFIER_CLAUSES = """
+        import re
+
+        # the version pattern of packaging, of all the valid PEP 440 versions, also not normalized
+        valid_version = re.compile(r""${'"'}
+            ^\s*v?
+            (?:(?:[0-9]+!)?(?P<release>[0-9]+(?:\.[0-9]+)*)
+                (?:[-_\.]?(?:alpha|a|beta|b|preview|pre|c|rc)[-_\.]?[0-9]*)?
+                (?:-[0-9]+|[-_\.]?(?:post|rev|r)[-_\.]?[0-9]*)?
+                (?:[-_\.]?dev[-_\.]?[0-9]*)?)
+            (?:\+(?P<local>[a-z0-9]+(?:[-_\.][a-z0-9]+)*))?
+            \s*${'$'}
+        ""${'"'}, re.VERBOSE | re.IGNORECASE)
+        valid_prefix = re.compile(r"^\s*v?(?:[0-9]+!)?[0-9]+(?:\.[0-9]+)*\.\*\s*${'$'}", re.IGNORECASE)
+
+        def is_valid_clause(operator, version):
+            # strictly, as packaging before 22 also parses legacy specifiers, like >=1.0.*, which uv rejects;
+            # without the arbitrary equality, ===, which constrains nothing comparable
+            if operator in ("==", "!="):
+                return bool(valid_prefix.match(version) or valid_version.match(version))
+            if operator in ("~=", "<", ">", "<=", ">="):
+                match = valid_version.match(version)
+                return bool(match) and not match.group("local") and (operator != "~=" or "." in match.group("release"))
+            return False
+    """.trimIndent()
+
+    @Language("python")
+    internal val PLAN = DIST_INFOS + "\n\n" + SPECIFIER_CLAUSES + "\n\n" + """
         import json, sys
 
         # before any import which can fail, so that the input is always read,
@@ -580,7 +649,6 @@ internal object PythonDependencies {
         from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
         directory, imported = sys.argv[1], set(request["modules"])
-        sys.path.append(directory)
         dependency_location = os.path.realpath(directory)
         dependency_dist_infos = dist_infos(directory)
         # tomllib is new in Python 3.11, tomli is its original, also vendored by pip
@@ -610,6 +678,9 @@ internal object PythonDependencies {
                 from pip._vendor.packaging.version import Version
             except ImportError:
                 Requirement = Version = None
+        # after importing the parsers, not to import them from the directory, e.g. packaging 21.3,
+        # parsing the legacy specifiers of the requirements, which uv rejects in a constraints file
+        sys.path.append(directory)
 
         def is_missing(dependency):
             if Requirement is None:
@@ -706,6 +777,46 @@ internal object PythonDependencies {
                 except Exception:
                     # an invalid requirement, or marker, of an installed distribution cannot be honored anyway
                     pass
+
+        def installed_version(name):
+            try:
+                return metadata.distribution(name).version
+            except metadata.PackageNotFoundError:
+                return None
+
+        def protected_clauses(requirement, installed):
+            # the clauses of the requirement to keep the installed version of the required distribution within,
+            # if it is within all of them, as a requirement violated already protects nothing
+            if installed is not None:
+                try:
+                    if not requirement.specifier.contains(installed, prereleases=True):
+                        return []
+                    installed_prerelease = Version(installed).is_prerelease
+                except Exception:
+                    return []
+            else:
+                installed_prerelease = False
+            clauses = set()
+            for clause in requirement.specifier:
+                operator, version = clause.operator, clause.version
+                if not is_valid_clause(operator, version):
+                    continue
+                if version.endswith(".*") or installed_prerelease or not Version(version).is_prerelease:
+                    clauses.add(operator + version)
+                    continue
+                # pip installs pre-releases of a distribution when a constraint mentions one,
+                # so a pre-release bound becomes the one of its release, unless a pre-release is installed
+                parsed = Version(version)
+                release = parsed.base_version
+                if operator in (">=", ">", "~="):
+                    clauses.add(">=" + release)
+                if operator in ("<", "<="):
+                    clauses.add("<" + release)
+                if operator == "~=":
+                    epoch = f"{parsed.epoch}!" if parsed.epoch else ""
+                    clauses.add("==" + epoch + ".".join(map(str, parsed.release[:-1])) + ".*")
+                # == and != of a pre-release, which is not installed, nor would be, constrain nothing
+            return sorted(clauses)
 
         def is_shadowed(name):
             # by a distribution of the environment, before the dependency directory on sys.path,
@@ -851,8 +962,13 @@ internal object PythonDependencies {
                         continue
                     for requirement in requirements_of(distribution):
                         required = canonicalize_name(requirement.name)
-                        if requirement.specifier and required not in kept:
-                            print("requirement", name, required, requirement.specifier, distribution.version)
+                        if required in kept:
+                            continue
+                        clauses = protected_clauses(requirement, installed_version(required))
+                        if clauses:
+                            # with no space in the name, e.g. of legacy metadata, as the version comes last
+                            dependent = re.sub(r"\s+", "-", name)
+                            print("requirement", dependent, required, ",".join(clauses), distribution.version)
             # the dist-info directories before the installation, to remove the ones it replaced
             print("dist-info", json.dumps(dist_info_snapshot(directory)))
     """.trimIndent()
