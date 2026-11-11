@@ -169,6 +169,10 @@ otherwise the code can declare it as a dependency, see below.
 * A Jep interpreter can be used only by the thread which created it,
   so each `Python` runs its code on a thread of its own, and can be called from any thread.
 * A `ScriptSession` does not close its dependencies, close the `Python` when no longer needed.
+  The first `close()` waits until the interpreter is closed, unless a call is running:
+  then it returns at once, and the interpreter is closed after the call returns,
+  as the call might itself wait for this `close()`, e.g. one made by a Kotlin function called from Python.
+  Calling `close()` again returns at once, also while the interpreter is still being closed.
 * The code passed to `exec`, or `python(code)`, can declare its dependencies,
   like a `@file:DependsOn` of a Kotlin snippet,
   with [inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/),

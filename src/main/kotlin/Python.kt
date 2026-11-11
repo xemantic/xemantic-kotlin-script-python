@@ -49,6 +49,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * therefore each `Python` runs its code on a thread of its own,
  * and can be called from any thread, one call at a time.
  * Concurrent calls wait for their turn.
+ * A call whose calling thread is interrupted while waiting, throws an [InterruptedException],
+ * with the interrupt flag of the thread set again,
+ * and is cancelled, so that it does not run, unless the thread of this `Python` has already started it,
+ * possibly just as the calling thread was interrupted — such a call completes, with its side effects, unreported.
  *
  * Once [close] is called, every call which is not running yet fails with an [IllegalStateException]
  * with the message `Python is closed` —
@@ -88,10 +92,12 @@ import java.util.concurrent.atomic.AtomicInteger
  * Once the embedded CPython fails to start, every `Python` fails, as it can be started only once per JVM.
  */
 public class Python private constructor(
-    decorateExecutor: (ExecutorService) -> ExecutorService
+    decorateExecutor: (ExecutorService) -> ExecutorService,
+    // replaced only by tests, see withInterpreterFactory
+    private val newInterpreter: () -> SharedInterpreter
 ) : AutoCloseable {
 
-    public constructor() : this({ it })
+    public constructor() : this({ it }, { SharedInterpreter() })
 
     @Volatile
     private var thread: Thread? = null
@@ -245,7 +251,19 @@ public class Python private constructor(
      * it closes the interpreter on its thread, and waits for it,
      * so that the interpreter is closed when it returns.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
-     * Calling it again has no effect, and returns immediately.
+     * If closing the interpreter fails, its exception is thrown by this `close()`, which waits for it.
+     * If the waiting is interrupted, it throws an [InterruptedException], with the interrupt flag of the thread set again,
+     * and the interpreter is still closed afterward, but a failure of closing it is not reported.
+     *
+     * Only the first `close()` can wait.
+     * Calling it again has no effect, and returns immediately,
+     * also while the interpreter is not closed yet: while the first `close()` waits for it,
+     * or after it is interrupted, or when it has returned without waiting, see below.
+     * So it throws no failure of closing the interpreter again,
+     * e.g. when `use` or try-with-resources closes a `Python` closed explicitly in its block.
+     * Neither can it deadlock when the closing of the interpreter, which can run Python code, waits for it:
+     * when it is called by a Kotlin function, which `__del__` of a global variable calls on the thread of this `Python`,
+     * or by another thread this function waits for.
      *
      * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
@@ -264,8 +282,12 @@ public class Python private constructor(
         // explicitly a Runnable, unlike the calls, which tests rely on to intercept only this task
         val closing = try {
             executor.submit(Runnable {
-                interpreter?.close()
-                interpreter = null
+                try {
+                    interpreter?.close()
+                } finally {
+                    // not to keep a half-closed interpreter, which cannot be closed again, as the executor is shut down
+                    interpreter = null
+                }
             })
         } finally {
             executor.shutdown()
@@ -279,6 +301,9 @@ public class Python private constructor(
             closing.get()
         } catch (e: ExecutionException) {
             throw e.cause ?: e
+        } catch (e: InterruptedException) {
+            // the interpreter is still closed by its task, which is not cancelled
+            throw e.restoringInterrupt()
         }
     }
 
@@ -300,7 +325,7 @@ public class Python private constructor(
                         PythonEnvironment.initialize()
                         // assigned only once checked, so that a later call does not use an interpreter failing the check
                         PythonEnvironment.starter.createInterpreter(
-                            create = { SharedInterpreter() },
+                            create = newInterpreter,
                             check = { PythonEnvironment.checkUtf8Mode(it) }
                         ).also { interpreter = it }
                     }
@@ -317,6 +342,10 @@ public class Python private constructor(
             future.get()
         } catch (e: ExecutionException) {
             throw e.cause ?: e
+        } catch (e: InterruptedException) {
+            // a call still waiting for its turn never runs, while one already taken by the thread of this Python completes
+            future.cancel(false)
+            throw e.restoringInterrupt()
         }
     }
 
@@ -510,6 +539,15 @@ public class Python private constructor(
 
     private fun closedException() = IllegalStateException("Python is closed")
 
+    /**
+     * Sets the interrupt flag of the current thread again, cleared when this exception was thrown,
+     * as Java code cannot catch the [InterruptedException] undeclared by a Kotlin function,
+     * only a supertype, which code not expecting an interruption may as well handle.
+     */
+    private fun InterruptedException.restoringInterrupt(): InterruptedException = also {
+        Thread.currentThread().interrupt()
+    }
+
     internal companion object {
 
         /**
@@ -518,7 +556,15 @@ public class Python private constructor(
          */
         internal fun withDecoratedExecutor(
             decorateExecutor: (ExecutorService) -> ExecutorService
-        ): Python = Python(decorateExecutor)
+        ): Python = Python(decorateExecutor) { SharedInterpreter() }
+
+        /**
+         * Creates a `Python`, whose interpreter is created by [newInterpreter], on the thread of this `Python`,
+         * so that a test can make closing the interpreter fail.
+         */
+        internal fun withInterpreterFactory(
+            newInterpreter: () -> SharedInterpreter
+        ): Python = Python({ it }, newInterpreter)
 
         private val threadCounter = AtomicInteger()
 

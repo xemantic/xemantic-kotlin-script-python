@@ -19,6 +19,8 @@
 package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
+import jep.JepException
+import jep.SharedInterpreter
 import java.util.concurrent.Callable
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -485,6 +487,190 @@ class PythonCloseTest {
 
         // then
         assert(closeTaskRan.count == 0L)
+    }
+
+    @Test
+    fun `should not run call whose caller is interrupted while waiting for its turn`() {
+        // given
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val interruptedSubmitted = CountDownLatch(1)
+        Python.withDecoratedExecutor(interceptingExecutor(
+            afterSubmit = {
+                if (Thread.currentThread().name == "interrupted") interruptedSubmitted.countDown()
+            }
+        )).use { python ->
+            python["block"] = { n: Long ->
+                callbackEntered.countDown()
+                assert(releaseCallback.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+                n
+            }
+            var runningResult: Long? = null
+            val running = thread(isDaemon = true, name = "running") {
+                runningResult = python.eval<Long>("block(42)")
+            }
+            assert(callbackEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+            var interruptedFailure: Throwable? = null
+            var interruptedFlag: Boolean? = null
+            // queued behind the running call
+            val interrupted = thread(isDaemon = true, name = "interrupted") {
+                interruptedFailure = runCatching { python.exec("side_effect = True") }.exceptionOrNull()
+                interruptedFlag = Thread.currentThread().isInterrupted
+            }
+            assert(interruptedSubmitted.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+
+            // when
+            interrupted.interrupt()
+            interrupted.join(DEADLOCK_TIMEOUT)
+            releaseCallback.countDown()
+            running.join(DEADLOCK_TIMEOUT)
+
+            // then
+            assert(!interrupted.isAlive)
+            assert(interruptedFailure is InterruptedException)
+            // restored, as Java code cannot catch the undeclared InterruptedException
+            assert(interruptedFlag == true)
+            assert(!running.isAlive)
+            assert(runningResult == 42L)
+            // the queued call would have run before this one
+            assert(!python.eval<Boolean>("'side_effect' in globals()"))
+        }
+    }
+
+    @Test
+    fun `should close interpreter after close interrupted while waiting for it`() {
+        // given
+        val closeTaskEntered = CountDownLatch(1)
+        val releaseCloseTask = CountDownLatch(1)
+        val closeTaskRan = CountDownLatch(1)
+        val python = Python.withDecoratedExecutor(interceptingExecutor(
+            decorateRunnable = { task ->
+                Runnable {
+                    closeTaskEntered.countDown()
+                    assert(releaseCloseTask.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+                    task.run()
+                    closeTaskRan.countDown()
+                }
+            }
+        ))
+        python.exec("x = 1")
+        var closerFailure: Throwable? = null
+        var closerInterruptedFlag: Boolean? = null
+        val closer = thread(isDaemon = true, name = "closer") {
+            closerFailure = runCatching { python.close() }.exceptionOrNull()
+            closerInterruptedFlag = Thread.currentThread().isInterrupted
+        }
+        assert(closeTaskEntered.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+
+        // when
+        closer.interrupt()
+        closer.join(DEADLOCK_TIMEOUT)
+        releaseCloseTask.countDown()
+
+        // then
+        assert(!closer.isAlive)
+        assert(closerFailure is InterruptedException)
+        // restored, as Java code cannot catch the undeclared InterruptedException
+        assert(closerInterruptedFlag == true)
+        assert(closeTaskRan.await(DEADLOCK_TIMEOUT, MILLISECONDS))
+    }
+
+    @Test
+    fun `should throw failure of closing interpreter only from close waiting for it`() {
+        // given
+        val python = Python.withInterpreterFactory {
+            object : SharedInterpreter() {
+                override fun close() {
+                    super.close()
+                    throw JepException("close failed")
+                }
+            }
+        }
+        python.exec("x = 1")
+
+        // when
+        val firstFailure = runCatching { python.close() }.exceptionOrNull()
+        val secondFailure = runCatching { python.close() }.exceptionOrNull()
+
+        // then
+        assert(firstFailure is JepException)
+        assert(firstFailure.message == "close failed")
+        assert(secondFailure == null)
+    }
+
+    @Test
+    fun `should throw failure of closing interpreter closed explicitly within use`() {
+        // given
+        val python = Python.withInterpreterFactory {
+            object : SharedInterpreter() {
+                override fun close() {
+                    super.close()
+                    throw JepException("close failed")
+                }
+            }
+        }
+        python.exec("x = 1")
+
+        // when
+        // like try-with-resources, use closes it again after its block
+        val failure = runCatching { python.use { it.close() } }.exceptionOrNull()
+
+        // then
+        assert(failure is JepException)
+        assert(failure.message == "close failed")
+        assert(failure.suppressed.isEmpty())
+    }
+
+    @Test
+    fun `should not deadlock when closing interpreter calls close from Kotlin callback`() {
+        // given
+        val python = Python()
+        var stopCalled = false
+        python["stop"] = {
+            stopCalled = true
+            python.close()
+        }
+        // closing the interpreter drops the global c, whose __del__, with stop bound when defined, calls close() on the Python thread
+        python.exec("class C:\n    def __del__(self, stop=stop):\n        stop()\nc = C()")
+        var failure: Throwable? = null
+
+        // when
+        // bounded, only to fail instead of hanging the JVM, if it deadlocks
+        val closer = thread(isDaemon = true, name = "closer") {
+            failure = runCatching { python.close() }.exceptionOrNull()
+        }
+        closer.join(DEADLOCK_TIMEOUT)
+
+        // then
+        assert(!closer.isAlive)
+        assert(failure == null)
+        assert(stopCalled)
+    }
+
+    @Test
+    fun `should not deadlock when closing interpreter waits for another thread calling close`() {
+        // given
+        val python = Python()
+        var stopCalled = false
+        python["stop"] = {
+            stopCalled = true
+            thread(isDaemon = true, name = "helper") { python.close() }.join()
+        }
+        // closing the interpreter drops the global c, whose __del__, with stop bound when defined, waits for close() on another thread
+        python.exec("class C:\n    def __del__(self, stop=stop):\n        stop()\nc = C()")
+        var failure: Throwable? = null
+
+        // when
+        // bounded, only to fail instead of hanging the JVM, if it deadlocks
+        val closer = thread(isDaemon = true, name = "closer") {
+            failure = runCatching { python.close() }.exceptionOrNull()
+        }
+        closer.join(DEADLOCK_TIMEOUT)
+
+        // then
+        assert(!closer.isAlive)
+        assert(failure == null)
+        assert(stopCalled)
     }
 
     /**
