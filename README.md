@@ -180,7 +180,7 @@ otherwise the code can declare it as a dependency, see below.
   from rdkit import Chem
   ```
   The missing dependencies are installed before executing the code,
-  with [uv](https://docs.astral.sh/uv/) if it is on the `PATH`, or with `pip` of the Python executable otherwise,
+  with [uv](https://docs.astral.sh/uv/) if it is found in an absolute directory of the `PATH`, or with `pip` of the Python executable otherwise,
   into `PythonEnvironment.dependencyDirectory`,
   by default the directory of the `xemantic.kotlin.script.python.dependencyDirectory` system property, if set,
   or otherwise `~/.cache/xemantic-kotlin-script-python/<python>-<hash of the environment>`,

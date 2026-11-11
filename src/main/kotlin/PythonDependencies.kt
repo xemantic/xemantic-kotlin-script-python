@@ -37,6 +37,7 @@ import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.isExecutable
+import kotlin.io.path.isRegularFile
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeLines
 
@@ -286,11 +287,28 @@ internal object PythonDependencies {
         }
     }
 
-    private fun findOnPath(name: String): String? = System.getenv("PATH")
-        ?.split(File.pathSeparator)
-        ?.flatMap { listOf(Path(it, name), Path(it, "$name.exe")) }
-        ?.firstOrNull { it.isExecutable() }
+    /** The first executable regular file of [executableCandidates] in the [path], or `null`. */
+    internal fun findOnPath(
+        name: String,
+        path: String? = System.getenv("PATH"),
+        windows: Boolean = System.getProperty("os.name").startsWith("Windows")
+    ): String? = path
+        ?.let { executableCandidates(name, it, windows) }
+        ?.firstOrNull { it.isRegularFile() && it.isExecutable() }
         ?.toString()
+
+    /**
+     * The files named [name], or `$name.exe` on [windows], in the directories of the [path], in their order —
+     * only `$name.exe` on Windows, where an extension-less file is a shell script, which cannot be run directly.
+     * A relative entry is skipped, as it resolves against a directory which can change, and whose files must not run as a tool:
+     * the working directory for an empty entry or `.`,
+     * and on Windows the current directory of a drive for `C:tools`, or the root of the current drive for `\tools`.
+     */
+    internal fun executableCandidates(name: String, path: String, windows: Boolean): List<Path> = path
+        .split(File.pathSeparator)
+        .map { Path(it) }
+        .filter { it.isAbsolute }
+        .map { it.resolve(if (windows) "$name.exe" else name) }
 
     /** The error of the [PLAN], when there is no TOML parser to read the metadata. */
     internal const val NO_TOML_PARSER_MESSAGE =
