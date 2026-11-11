@@ -46,6 +46,7 @@ bin/
 
 # the Python virtual environment of the tests
 /.venv/
+/.venv.previous/
 
 ### Claude Code ###
 /TASK-QUEUE.md
