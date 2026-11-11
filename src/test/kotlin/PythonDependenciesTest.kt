@@ -30,6 +30,8 @@ import java.util.UUID
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.concurrent.thread
 import kotlin.concurrent.withLock
 import kotlin.io.path.ExperimentalPathApi
@@ -42,6 +44,9 @@ import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
 import kotlin.io.path.getPosixFilePermissions
 import kotlin.io.path.isWritable
+import kotlin.io.path.outputStream
+import kotlin.io.path.readLines
+import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -671,6 +676,94 @@ class PythonDependenciesTest {
             assert(exitCode == 0 && output.startsWith("pip "))
         } finally {
             workingDirectory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should run uv with constraint option known to every uv version`() {
+        // given
+        assumeFalse(System.getProperty("os.name").startsWith("Windows"), "the fake uv is a shell script")
+        PythonEnvironment.initialize()
+        val uvDirectory = createTempDirectory("python-fake-uv")
+        try {
+            val record = uvDirectory.resolve("record.txt")
+            // records its arguments, followed by the content of the file of the --constraint option
+            val uv = uvDirectory.resolve("uv")
+            uv.writeText(
+                """
+                |#!/bin/sh
+                |printf '%s\n' "$@" > '$record'
+                |while [ $# -gt 0 ]; do
+                |  if [ "$1" = --constraint ]; then cat "$2" >> '$record'; fi
+                |  shift
+                |done
+                |""".trimMargin()
+            )
+            uv.setPosixFilePermissions(PosixFilePermissions.fromString("rwx------"))
+
+            // when
+            PythonDependencies.installMissing(
+                listOf("fake-dependency"),
+                listOf("kept-dependency==1.0"),
+                uvDirectory.resolve("dependencies").toString(),
+                uv = uv.toString()
+            )
+
+            // then
+            val lines = record.readLines()
+            // --constraints, its alias since uv 0.2.30, is rejected by uv 0.5.0 and older
+            assert("--constraints" !in lines)
+            assert("--constraint" in lines && lines.last() == "kept-dependency==1.0")
+        } finally {
+            uvDirectory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should install with uv on PATH keeping constraints`() {
+        // given
+        val uv = PythonDependencies.findOnPath("uv")
+        assumeTrue(uv != null, "uv is not on the PATH")
+        PythonEnvironment.initialize()
+        val directory = createTempDirectory("python-uv-install")
+        try {
+            // a local wheel, so that uv needs no network
+            val wheel = directory.resolve("fake_dependency-1.0-py3-none-any.whl")
+            writeFakeWheel(wheel)
+            val dependencies = directory.resolve("dependencies")
+
+            // when
+            PythonDependencies.installMissing(
+                listOf("fake-dependency @ ${wheel.toUri()}"),
+                listOf("fake-dependency==1.0"),
+                dependencies.toString(),
+                uv = uv
+            )
+
+            // then
+            assert(dependencies.resolve("fake_dependency.py").exists())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    /** Writes the [wheel] of the `fake-dependency` distribution 1.0, of the `fake_dependency` module. */
+    private fun writeFakeWheel(wheel: Path) {
+        ZipOutputStream(wheel.outputStream()).use { zip ->
+            mapOf(
+                "fake_dependency.py" to "VALUE = 'installed'\n",
+                "fake_dependency-1.0.dist-info/METADATA" to
+                    "Metadata-Version: 2.1\nName: fake-dependency\nVersion: 1.0\n",
+                "fake_dependency-1.0.dist-info/WHEEL" to
+                    "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                "fake_dependency-1.0.dist-info/RECORD" to ""
+            ).forEach { (name, content) ->
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(content.toByteArray())
+                zip.closeEntry()
+            }
         }
     }
 
