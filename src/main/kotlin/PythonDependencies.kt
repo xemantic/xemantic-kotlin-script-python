@@ -351,6 +351,8 @@ internal object PythonDependencies {
                     sys.exit(f"Invalid dependency '{dependency}': {e}")
                 if requirement.marker is not None and not requirement.marker.evaluate():
                     return False
+                if requirement.url is not None:
+                    url_dependencies.add(dependency)
                 name = requirement.name
             try:
                 distribution = metadata.distribution(name)
@@ -441,7 +443,9 @@ internal object PythonDependencies {
             legacy_hash = archive_info.get("hash")
             if isinstance(legacy_hash, str) and "=" in legacy_hash:
                 hashes.setdefault(*legacy_hash.split("=", 1))
-            hashes.update(parse_qsl(installed["url"].partition("#")[2]))
+            for algorithm, value in parse_qsl(installed["url"].partition("#")[2]):
+                # the recorded hashes are the ones verified on installation
+                hashes.setdefault(algorithm, value)
             # a shake digest has no fixed length to compute and compare
             if any(name.startswith("shake_") for name in options):
                 return False
@@ -464,18 +468,13 @@ internal object PythonDependencies {
                 return file_digests(path, expected) == expected
             return not requested and is_unmodified_since_uv_install(path, distribution)
 
-        def is_url(dependency):
-            # of the requirements validated by is_missing
-            if Requirement is None:
-                return False
-            requirement = Requirement(dependency)
-            return requirement.url is not None and (requirement.marker is None or requirement.marker.evaluate())
-
+        # the URL requirements whose marker applies, collected by is_missing
+        url_dependencies = set()
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
             # pip resolves the missing ones without the dependency directory, so it would install a distribution
             # required by them from the index over the one installed from a URL, also in the same version
-            missing = [dependency for dependency in dependencies if dependency in missing or is_url(dependency)]
+            missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)

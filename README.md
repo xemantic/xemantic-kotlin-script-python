@@ -194,6 +194,11 @@ otherwise the code can declare it as a dependency, see below.
   and once for the same URL of a remote archive, and its hash if the installer recorded it (pip does, uv does not),
   or for the same content of a local archive (its change time when installed by uv, the last write time on Windows),
   while a local directory, or a dependency with extras, is installed again on each use,
+  and so is a direct URL dependency
+  next to a stale `dist-info` directory of another version of it,
+  left in the dependency directory by `pip install --target --upgrade` ([#59](https://github.com/xemantic/xemantic-kotlin-script-python/issues/59)),
+  or a remote archive with a requested hash of an algorithm which pip does not record, like `#sha3_256=` or `#blake2b=`
+  (pip records only `sha512`, `sha384`, `sha256`, `sha224`, `sha1` and `md5`),
   and any direct URL dependency is installed again together with another missing dependency of the same code,
   so that pip does not replace it with a distribution from the index required by the other one.
   To update a branch, or a remote archive changing its content under the same URL,

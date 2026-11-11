@@ -1014,6 +1014,19 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan archive dependency as installed for recorded hash differing from URL fragment`() {
+        // given
+        // the hashes recorded for the archive are the ones verified on installation, not the URL fragment
+        val directUrl = """{"url": "https://example.com/probe-1.0.tar.gz#sha256=${HASH.reversed()}", "archive_info": {"hashes": {"sha256": "$HASH"}}}"""
+
+        // when
+        val installs = planInstalls("direct-url-probe @ https://example.com/probe-1.0.tar.gz#sha256=$HASH", directUrl)
+
+        // then
+        assert(installs.isEmpty())
+    }
+
+    @Test
     fun `should plan archive dependency as missing for hash of another algorithm than recorded`() {
         // given
         // pip records only the sha256 hash, so a requested hash of another algorithm cannot be verified
