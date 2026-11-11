@@ -202,7 +202,8 @@ public object PythonEnvironment {
      *
      * @throws IllegalStateException if it cannot be run, or fails, has no `jep` package,
      * does not write the values of the probe, or cannot tell the path of its executable,
-     * or if its paths are not valid in the [filesystemCharset].
+     * or if its paths are not valid in the [filesystemCharset],
+     * or if its `jep` package is of another version than the `org.ninia:jep` library, see [checkJepPackageVersion].
      */
     internal fun probePython(python: String): PythonProbe {
         val result = try {
@@ -240,6 +241,7 @@ public object PythonEnvironment {
         check(probe.executable.isNotEmpty()) {
             "Python cannot tell the path of its executable (sys.executable is empty): $python"
         }
+        checkJepPackageVersion(python, probe)
         // limited, as it is kept for the lifetime of the JVM; a warning of Python at startup comes first
         return probe.copy(error = limitProbeError(result.error))
     }
@@ -275,13 +277,14 @@ public object PythonEnvironment {
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
         val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
-        if (values == null || values.size != 7) return null
+        if (values == null || values.size != 8) return null
         val paths = values.map { it.hexToPath() ?: return null }
         val (executable, cacheTag, prefix, jepLocation, externallyManaged) = paths
         return PythonProbe(
             executable, cacheTag, prefix, jepLocation, externallyManaged.isNotEmpty(),
             libraryDirectory = paths[5],
-            librarySoname = paths[6]
+            librarySoname = paths[6],
+            jepPackageVersion = paths[7]
         )
     }
 
@@ -299,6 +302,7 @@ public object PythonEnvironment {
      * into which pip refuses to install.
      * The values after it are the directory and the soname of the `libpython` of the base Python,
      * `LIBDIR` and `INSTSONAME` of `sysconfig`, empty if unknown, e.g. on Windows, see [pythonLibrary].
+     * The last value is the version of the `jep` package, empty if unknown, see [PythonProbe.jepPackageVersion].
      * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
      * or the [PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE] if the Python is externally managed,
      * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
@@ -310,7 +314,7 @@ public object PythonEnvironment {
     internal fun probeCommand(python: String): List<String> = pythonCommand(
         python,
         """
-        |import importlib.util, os, sys, sysconfig
+        |import ast, importlib.metadata, importlib.util, os, sys, sysconfig
         |externally_managed = sys.prefix == sys.base_prefix and os.path.isfile(
         |    os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED')
         |)
@@ -321,14 +325,37 @@ public object PythonEnvironment {
         |    sys.exit(
         |        $PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE if externally_managed else $PROBE_JEP_MISSING_EXIT_CODE
         |    )
+        |def jep_package_version(package):
+        |    try:
+        |        with open(os.path.join(package, 'version.py'), 'rb') as file:
+        |            module = ast.parse(file.read())
+        |        for statement in module.body:
+        |            if (
+        |                isinstance(statement, ast.Assign)
+        |                and any(isinstance(target, ast.Name) and target.id == '__VERSION__' for target in statement.targets)
+        |                and isinstance(statement.value, ast.Constant)
+        |                and isinstance(statement.value.value, str)
+        |            ):
+        |                return statement.value.value
+        |    except Exception:
+        |        pass
+        |    try:
+        |        distributions = importlib.metadata.distributions(name='jep', path=[os.path.dirname(package)])
+        |        versions = {distribution.version for distribution in distributions} - {None}
+        |    except Exception:
+        |        return ''
+        |    return versions.pop() if len(versions) == 1 else ''
+        |jep_location = jep_spec.submodule_search_locations[0]
+        |jep_version = jep_package_version(jep_location)
         |values = [
         |    sys.executable,
         |    sys.implementation.cache_tag,
         |    sys.prefix,
-        |    jep_spec.submodule_search_locations[0],
+        |    jep_location,
         |    '1' if externally_managed else '',
         |    sysconfig.get_config_var('LIBDIR'),
         |    sysconfig.get_config_var('INSTSONAME'),
+        |    jep_version if jep_version.isascii() else '',
         |]
         |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
         |sys.stdout.flush()
@@ -461,6 +488,45 @@ internal fun jepInstallAdvice(
     } else emptyList()
     return (install + build + powerShell).joinToString("\n")
 }
+
+/**
+ * Checks that the `jep` package of the [probe] of the [python] executable is of the [libraryVersion],
+ * the version of the `org.ninia:jep` library, see [jepVersionsMatch],
+ * as otherwise Jep would fail later, and obscurely, e.g. with a missing native symbol, or behave differently.
+ *
+ * @throws IllegalStateException if it is not, advising to reinstall it in the [libraryVersion].
+ */
+internal fun checkJepPackageVersion(
+    python: String,
+    probe: PythonProbe,
+    libraryVersion: String? = PythonEnvironment.jepVersion
+) {
+    check(jepVersionsMatch(probe.jepPackageVersion, libraryVersion)) {
+        "The jep package of $python, in ${probe.jepLocation}, is version ${probe.jepPackageVersion}, " +
+            "but the org.ninia:jep library is version $libraryVersion, which it must match.\n" +
+            jepInstallAdvice(python, probe.externallyManaged, reinstall = true, jepVersion = libraryVersion)
+    }
+}
+
+/**
+ * Whether the [packageVersion] of the `jep` package matches the [libraryVersion] of the `org.ninia:jep` library,
+ * comparing only their release numbers, e.g. `4.3.2` of `4.3.2.dev0`, `4.3.2+local` or `4.3.2-SNAPSHOT`,
+ * as PEP 440 does, ignoring trailing zeros, so that a development or a local build of the same release matches.
+ * A version which is unknown, empty or `null`, or has no release numbers, matches any, as it is no reason to fail.
+ */
+internal fun jepVersionsMatch(packageVersion: String, libraryVersion: String?): Boolean {
+    val packageRelease = releaseNumbers(packageVersion) ?: return true
+    val libraryRelease = libraryVersion?.let { releaseNumbers(it) } ?: return true
+    return packageRelease == libraryRelease
+}
+
+/** The release numbers the [version] starts with, without leading and trailing zeros, or `null` if it has none. */
+private fun releaseNumbers(version: String): List<String>? =
+    Regex("""^v?(\d+(?:\.\d+)*)""").find(version.trim())
+        ?.groupValues?.get(1)
+        ?.split('.')
+        ?.map { it.trimStart('0') }
+        ?.dropLastWhile { it.isEmpty() }
 
 /**
  * The encoding of the file paths of the JVM, the one of the locale on POSIX, `sun.jnu.encoding`,
@@ -655,6 +721,12 @@ internal class EmbeddedPythonStarter(
  * @property externallyManaged whether pip refuses to install into it (PEP 668), see [PythonEnvironment.probeCommand].
  * @property libraryDirectory the directory of the `libpython` of the base Python, `LIBDIR`, empty if unknown.
  * @property librarySoname the soname of the `libpython`, `INSTSONAME`, empty if unknown, see [pythonLibrary].
+ * @property jepPackageVersion the version of the `jep` package in the [jepLocation], empty if unknown,
+ * read without importing it, as it cannot be imported outside the JVM:
+ * from the `__VERSION__` of its `version.py`, from which the `setup.py` of jep takes its version, parsed but not executed,
+ * or else from the metadata of the `jep` distribution in the same directory as the package, if there is just one version of it.
+ * Not with `importlib.metadata.version('jep')`, which would read the first metadata of jep on `sys.path`,
+ * maybe of another directory than the package's, e.g. left behind without it.
  * @property error the standard error of the probe, e.g. a warning of Python, empty if none.
  */
 internal data class PythonProbe(
@@ -665,6 +737,7 @@ internal data class PythonProbe(
     val externallyManaged: Boolean = false,
     val libraryDirectory: String = "",
     val librarySoname: String = "",
+    val jepPackageVersion: String = "",
     val error: String = ""
 )
 

@@ -37,7 +37,8 @@ An environment without `pip`, like the one of `uv venv`, can get `tomli` with `p
 Jep is a native CPython extension:
 the Java library comes from Maven Central,
 but its native part comes with the `jep` Python package, which has to be installed in the Python environment in use.
-The version of the `jep` package must match the version of the `org.ninia:jep` Java library, 4.3.2 in these examples:
+The version of the `jep` package must match the version of the `org.ninia:jep` Java library, 4.3.2 in these examples
+(the first use of `Python` fails telling so, when it does not):
 
 ```shell
 python -m pip install jep==4.3.2
