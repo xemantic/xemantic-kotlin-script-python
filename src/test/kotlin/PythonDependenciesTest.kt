@@ -1013,6 +1013,35 @@ class PythonDependenciesTest {
         assert(installs.isEmpty())
     }
 
+    @Test
+    fun `should plan archive dependency as missing for hash of another algorithm than recorded`() {
+        // given
+        // pip records only the sha256 hash, so a requested hash of another algorithm cannot be verified
+        val directUrl = """{"url": "https://example.com/probe-1.0.tar.gz", "archive_info": {"hashes": {"sha256": "$HASH"}}}"""
+        val dependency = "direct-url-probe @ https://example.com/probe-1.0.tar.gz#sha512=$HASH$HASH"
+
+        // when
+        val installs = planInstalls(dependency, directUrl)
+
+        // then
+        assert(installs == listOf(dependency))
+    }
+
+    @Test
+    fun `should plan archive dependency as missing next to stale dist-info of another version`() {
+        // given
+        // pip install --target --upgrade to another version leaves the dist-info of the previous one,
+        // so it cannot be known which of them the files on disk belong to
+        val directUrl = """{"url": "https://example.com/probe-1.0.tar.gz", "archive_info": {"hashes": {"sha256": "$HASH"}}}"""
+        val dependency = "direct-url-probe @ https://example.com/probe-1.0.tar.gz"
+
+        // when
+        val installs = planInstalls(dependency, directUrl, otherVersion = "2.0")
+
+        // then
+        assert(installs == listOf(dependency))
+    }
+
     @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should plan local archive dependency with unverifiable hash as missing`() {
@@ -1118,14 +1147,17 @@ class PythonDependenciesTest {
     /**
      * The requirements to install, planned for the [dependency]
      * with the dependency directory holding `direct-url-probe 1.0` installed from the [directUrl] (PEP 610),
-     * or from an index when `null`.
+     * or from an index when `null`,
+     * and also the `dist-info` directory of its [otherVersion], if given, with the same `direct_url.json`,
+     * so that whichever of them `importlib.metadata` finds first matches the [dependency].
      */
     @OptIn(ExperimentalPathApi::class)
     private fun planInstalls(
         dependency: String,
         directUrl: String?,
         uvCache: String? = null,
-        otherDependencies: List<String> = emptyList()
+        otherDependencies: List<String> = emptyList(),
+        otherVersion: String? = null
     ): List<String> {
         PythonEnvironment.initialize()
         val directory = createTempDirectory("python-dependencies")
@@ -1134,6 +1166,12 @@ class PythonDependenciesTest {
             distInfo.resolve("METADATA").writeText("Metadata-Version: 2.1\nName: direct-url-probe\nVersion: 1.0\n")
             if (directUrl != null) distInfo.resolve("direct_url.json").writeText(directUrl)
             if (uvCache != null) distInfo.resolve("uv_cache.json").writeText(uvCache)
+            if (otherVersion != null) {
+                val otherDistInfo = directory.resolve("direct_url_probe-$otherVersion.dist-info").createDirectories()
+                otherDistInfo.resolve("METADATA")
+                    .writeText("Metadata-Version: 2.1\nName: direct-url-probe\nVersion: $otherVersion\n")
+                if (directUrl != null) otherDistInfo.resolve("direct_url.json").writeText(directUrl)
+            }
             val dependencies = (listOf(dependency) + otherDependencies).joinToString(", ") { "'$it'" }
             return PythonDependencies.plan("dependencies = [$dependencies]\n", directory.toString(), emptyList())
                 .filter { it.first == "install" }

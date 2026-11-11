@@ -313,7 +313,6 @@ internal object PythonDependencies {
 
         import hashlib, importlib, importlib.metadata as metadata, os, re
         from urllib.parse import parse_qsl, urlsplit, urlunsplit
-        from urllib.request import url2pathname
 
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
@@ -360,8 +359,14 @@ internal object PythonDependencies {
             if Requirement is None:
                 return specified
             if requirement.url is not None:
-                # the dependencies of the extras are not checked (#47), so they are installed again with them
-                return bool(requirement.extras) or not is_installed_from(requirement.url, distribution)
+                # the dependencies of the extras are not checked (#47), so they are installed again with them,
+                # and pip --target --upgrade leaves the dist-info of the previous version, maybe with its
+                # direct_url.json, so it cannot be known which of them the installed files belong to
+                return (
+                    bool(requirement.extras)
+                    or len(list(metadata.distributions(name=name, path=[directory]))) > 1
+                    or not is_installed_from(requirement.url, distribution)
+                )
             return not requirement.specifier.contains(distribution.version, prereleases=True)
 
         def without_credentials(url):
@@ -447,8 +452,11 @@ internal object PythonDependencies {
                 return False
             if urlsplit(url).scheme.lower() != "file":
                 # a remote archive is trusted to keep its content under the same URL,
-                # as uv records no hash of it, not even the requested one
-                return True
+                # as uv records no hash of it, not even the requested one,
+                # but a requested hash of another algorithm than the ones pip recorded cannot be verified
+                return not hashes or all(name in hashes for name in requested)
+            # imported only here, as it imports http.client, email and ssl
+            from urllib.request import url2pathname
             # a local archive can be rebuilt without changing its URL, so its content is compared
             path = url2pathname(urlsplit(url).path)
             if hashes:
