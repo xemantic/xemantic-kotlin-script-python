@@ -1123,7 +1123,25 @@ class PythonEnvironmentTest {
         val message = exception.message!!
         assert(
             message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
-                "VIRTUAL_ENV is ignored, as it is not an absolute path: /in\u0000valid" in message
+                "VIRTUAL_ENV is ignored, as it is not a valid path" in message &&
+                '\u0000' !in message
+        )
+    }
+
+    @Test
+    fun `should ignore relative VIRTUAL_ENV, telling so when Python is not found`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = "venv", path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV is ignored, as it is not an absolute path: venv" in message
         )
     }
 

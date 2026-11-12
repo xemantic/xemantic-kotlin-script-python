@@ -350,7 +350,7 @@ internal object PythonDependencies {
     /**
      * The file name of the executable [name]: on [windows] `$name.exe`, if the [name] has no extension,
      * as an extension-less file is a shell script there, which cannot be run directly,
-     * while a name with an extension, e.g. `python3.bat` of a pyenv-win shim, is looked up as is, like Windows does.
+     * while a name with an extension, e.g. `python3.12` or `uv.cmd`, is looked up as is, like Windows does.
      */
     internal fun executableFileName(name: String, windows: Boolean): String =
         if (windows && '.' !in name) "$name.exe" else name
