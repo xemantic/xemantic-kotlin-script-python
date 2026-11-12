@@ -1269,6 +1269,44 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan installed dependency as installed with requirement of empty extra`() {
+        withDistInfos { directory ->
+            // given
+            // uv and pip up to 23.0 never install it, so it would be installed again on every use
+            writeDistInfo(
+                directory, "1.0", name = "requiring-probe",
+                requires = listOf("required-probe>=2; extra == \"\"", "other-probe; extra == \"\" or python_version < \"3\"")
+            )
+            writeDistInfo(directory, "1.0", name = "required-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as installed with requirement installed in version not of PEP 440`() {
+        withDistInfos { directory ->
+            // given
+            // like a Debian package, e.g. 1.1build1, which an installer does not replace either
+            writeDistInfo(
+                directory, "1.0", name = "requiring-probe", requires = listOf("legacy-probe>=1", "other-legacy-probe")
+            )
+            writeDistInfo(directory, "1.1build1", name = "legacy-probe")
+            writeDistInfo(directory, "1.1build1", name = "other-legacy-probe")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
     fun `should plan installed dependency as missing when requirement of requested extra is not installed`() {
         withDistInfos { directory ->
             // given

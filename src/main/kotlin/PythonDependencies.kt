@@ -482,27 +482,42 @@ internal object PythonDependencies {
                     return True
             elif not requirement.specifier.contains(distribution.version, prereleases=True):
                 return True
-            return not are_requirements_satisfied(distribution, requirement.extras)
+            return not are_requirements_satisfied(name, requirement.extras)
 
         def is_in_dependencies(distribution):
             return os.path.realpath(distribution.locate_file("")) == dependency_location
+
+        # the installed distributions by normalized name, as (distribution, version, requirements),
+        # the requirements only of the ones in the dependency directory, otherwise None,
+        # as importlib.metadata parses the metadata on every access
+        installed_distributions = {}
+
+        def installed(name):
+            key = normalized_name(name)
+            if key not in installed_distributions:
+                distribution = find_distribution(name)
+                installed_distributions[key] = None if distribution is None else (
+                    distribution,
+                    distribution.version,
+                    (distribution.requires or []) if is_in_dependencies(distribution) else None
+                )
+            return installed_distributions[key]
 
         # whether the requirements of a distribution of the dependency directory with the extras are satisfied,
         # by the normalized names of both, True while they are being checked, against a cycle of requirements
         requirements_satisfied = {}
 
-        def are_requirements_satisfied(distribution, extras):
+        def are_requirements_satisfied(name, extras):
             # recursively, as an installation for another snippet can replace a distribution required by it (#81),
             # which the installer resolves again when the declared requirement is planned as missing;
             # not the ones of a distribution of the environment, which is not installed into the dependency directory
-            if not is_in_dependencies(distribution):
+            requires = installed(name)[2]
+            if requires is None:
                 return True
-            key = (normalized_name(distribution.metadata["Name"] or ""), frozenset(normalized_name(it) for it in extras))
+            key = (normalized_name(name), frozenset(normalized_name(it) for it in extras))
             if key not in requirements_satisfied:
                 requirements_satisfied[key] = True
-                requirements_satisfied[key] = all(
-                    is_requirement_satisfied(it, extras) for it in distribution.requires or []
-                )
+                requirements_satisfied[key] = all(is_requirement_satisfied(it, extras) for it in requires)
             return requirements_satisfied[key]
 
         def is_requirement_satisfied(line, extras):
@@ -510,22 +525,35 @@ internal object PythonDependencies {
             # but one which cannot be judged counts as satisfied, so that it is not installed again on every use
             try:
                 requirement = Requirement(line)
-                if requirement.marker is not None and not any(
-                    requirement.marker.evaluate({"extra": extra}) for extra in sorted(extras) or [""]
-                ):
-                    return True
+                marker = requirement.marker
+                if marker is not None:
+                    # the requirements of an extra only for a requested one, also of extra == "",
+                    # which uv and pip before 23.1 never install
+                    if not extras and re.search(r"\bextra\b", str(marker)):
+                        return True
+                    if not any(marker.evaluate({"extra": extra}) for extra in sorted(extras) or [""]):
+                        return True
             except Exception:
                 return True
-            distribution = find_distribution(requirement.name)
-            if distribution is None:
+            found = installed(requirement.name)
+            if found is None:
                 return False
+            distribution, version, _ = found
             if requirement.url is not None:
                 # of the environment, it would be found before the one installed into the dependency directory
-                if is_in_dependencies(distribution) and not is_installed_from_source(requirement.url, distribution):
+                if is_in_dependencies(distribution) and installed_source(requirement.url, distribution) is None:
                     return False
-            elif not requirement.specifier.contains(distribution.version, prereleases=True):
+            elif requirement.specifier and is_pep440(version) and not requirement.specifier.contains(version, prereleases=True):
                 return False
-            return are_requirements_satisfied(distribution, requirement.extras)
+            return are_requirements_satisfied(requirement.name, requirement.extras)
+
+        def is_pep440(version):
+            # not e.g. 1.1build1 of a Debian package, whose requirement cannot be judged
+            try:
+                Version(version)
+                return True
+            except Exception:
+                return False
 
         def find_distribution(name):
             # like importlib.metadata, but None for several dist-info of the name in the dependency directory,
@@ -650,16 +678,12 @@ internal object PythonDependencies {
                 return None
             return installed, vcs, revision, options
 
-        def is_installed_from_source(url, distribution):
-            return installed_source(url, distribution) is not None
-
         def is_installed_from(url, distribution):
             # also in the requested revision, or with the requested content
             source = installed_source(url, distribution)
             if source is None:
                 return False
             installed, vcs, revision, options = source
-            url = url.partition("#")[0]
             if vcs is not None:
                 # a branch or a tag is satisfied by the commit installed for it before, as the snippet requests
                 # the same thing, and the latest commit cannot be known without the network
