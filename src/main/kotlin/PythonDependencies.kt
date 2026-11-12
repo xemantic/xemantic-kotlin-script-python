@@ -255,26 +255,36 @@ internal object PythonDependencies {
         append('"')
     }
 
-    private fun installMissing(missing: List<String>, constraints: List<String>, directory: String) {
+    /**
+     * Installs the [missing] dependencies into the dependency [directory], keeping the [constraints],
+     * with the [uv] executable, if any, otherwise with `pip` of the environment.
+     */
+    fun installMissing(
+        missing: List<String>,
+        constraints: List<String>,
+        directory: String,
+        uv: String? = findOnPath("uv")
+    ) {
         val constraintsFile = createTempFile("python-constraints", ".txt")
         try {
             constraintsFile.writeLines(constraints)
-            val uv = findOnPath("uv")
+            // understood alike by uv and pip; not --constraints, an alias in uv, which uv older than 0.5.4 rejects
+            val arguments = listOf(
+                "--target", directory,
+                "--constraint", constraintsFile.toString()
+            ) + missing
             val command = if (uv != null) {
                 listOf(
                     uv, "pip", "install", "--quiet",
-                    "--python", PythonEnvironment.executable,
-                    "--target", directory,
-                    "--constraints", constraintsFile.toString()
-                )
+                    "--python", PythonEnvironment.executable
+                ) + arguments
             } else {
                 pipCommand(
                     "install", "--quiet",
                     "--disable-pip-version-check", "--no-input", "--upgrade",
-                    "--target", directory,
-                    "--constraint", constraintsFile.toString()
+                    *arguments.toTypedArray()
                 )
-            } + missing
+            }
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
@@ -286,7 +296,8 @@ internal object PythonDependencies {
         }
     }
 
-    private fun findOnPath(name: String): String? = System.getenv("PATH")
+    /** The executable of the [name] on the `PATH`, or `null` if there is none. */
+    fun findOnPath(name: String): String? = System.getenv("PATH")
         ?.split(File.pathSeparator)
         ?.flatMap { listOf(Path(it, name), Path(it, "$name.exe")) }
         ?.firstOrNull { it.isExecutable() }
