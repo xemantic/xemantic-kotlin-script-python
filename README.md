@@ -204,9 +204,12 @@ otherwise the code can declare it as a dependency, see below.
   is no longer satisfied by what is installed,
   e.g. when code declaring `demo==1.0` replaced the `demo 2.0` which an earlier dependency requires —
   unless the replacing version is already imported, and so kept,
+  or a distribution of the Python environment, whose version is kept, no longer satisfies it,
+  e.g. after upgrading the environment,
   when the installation fails with the conflict instead of the code failing later.
   A direct URL requirement of an installed dependency is satisfied by a distribution installed from the same URL,
-  whatever its revision or content.
+  whatever its revision or content,
+  and the requirements of extras are not checked.
   When pip replaces a distribution with another version of it,
   it leaves the `dist-info` directory of the replaced version beside the new one,
   which is removed after the installation, as it was not written by it.

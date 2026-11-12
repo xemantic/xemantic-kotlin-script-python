@@ -406,9 +406,10 @@ internal object PythonDependencies {
      * found by [scriptMetadata], as `metadata`, and of the imported top-level modules, as `modules`.
      *
      * A dependency is installed when it is not installed, in a version or from a URL it does not accept,
-     * or when the installed distribution of the dependency directory, with the requested extras,
+     * or when the installed distribution of the dependency directory
      * has a requirement, also a transitive one, which is not satisfied anymore,
-     * e.g. replaced by another version declared by another snippet.
+     * e.g. replaced by another version declared by another snippet,
+     * but not a requirement of an extra (#47), as an installer can tell the requested extras differently.
      * Such a requirement cannot be installed again on every use, as the installer installs it with the dependency:
      * one which the installer cannot satisfy, e.g. against a constraint, fails the installation,
      * and a URL requirement counts as satisfied by a distribution installed from the same URL,
@@ -471,25 +472,27 @@ internal object PythonDependencies {
                 if requirement.url is not None:
                     url_dependencies.add(dependency)
                 name = requirement.name
-            distribution = find_distribution(name)
-            if distribution is None:
+            found = installed(name)
+            if found is None:
                 return True
             if Requirement is None:
                 return specified
+            distribution, version, _ = found
             if requirement.url is not None:
-                # the dependencies of the extras are not checked (#47), so they are installed again with them
+                # the requirements of the extras are not checked (#47),
+                # so a URL dependency with extras is installed again for them
                 if requirement.extras or not is_installed_from(requirement.url, distribution):
                     return True
-            elif not requirement.specifier.contains(distribution.version, prereleases=True):
+            elif not requirement.specifier.contains(version, prereleases=True):
                 return True
-            return not are_requirements_satisfied(name, requirement.extras)
+            return not are_requirements_satisfied(name)
 
         def is_in_dependencies(distribution):
             return os.path.realpath(distribution.locate_file("")) == dependency_location
 
         # the installed distributions by normalized name, as (distribution, version, requirements),
         # the requirements only of the ones in the dependency directory, otherwise None,
-        # as importlib.metadata parses the metadata on every access
+        # as importlib.metadata parses the metadata on every access, and None for a missing one
         installed_distributions = {}
 
         def installed(name):
@@ -503,35 +506,34 @@ internal object PythonDependencies {
                 )
             return installed_distributions[key]
 
-        # whether the requirements of a distribution of the dependency directory with the extras are satisfied,
-        # by the normalized names of both, True while they are being checked, against a cycle of requirements
+        # whether the requirements of a distribution of the dependency directory are satisfied,
+        # by its normalized name, True while they are being checked, against a cycle of requirements
         requirements_satisfied = {}
 
-        def are_requirements_satisfied(name, extras):
+        def are_requirements_satisfied(name):
             # recursively, as an installation for another snippet can replace a distribution required by it (#81),
             # which the installer resolves again when the declared requirement is planned as missing;
             # not the ones of a distribution of the environment, which is not installed into the dependency directory
             requires = installed(name)[2]
             if requires is None:
                 return True
-            key = (normalized_name(name), frozenset(normalized_name(it) for it in extras))
+            key = normalized_name(name)
             if key not in requirements_satisfied:
                 requirements_satisfied[key] = True
-                requirements_satisfied[key] = all(is_requirement_satisfied(it, extras) for it in requires)
+                requirements_satisfied[key] = all(is_requirement_satisfied(it) for it in requires)
             return requirements_satisfied[key]
 
-        def is_requirement_satisfied(line, extras):
+        def is_requirement_satisfied(line):
             # a requirement of an installed distribution, judged like a declared one,
             # but one which cannot be judged counts as satisfied, so that it is not installed again on every use
             try:
                 requirement = Requirement(line)
                 marker = requirement.marker
                 if marker is not None:
-                    # the requirements of an extra only for a requested one, also of extra == "",
-                    # which uv and pip before 23.1 never install
-                    if not extras and re.search(r"\bextra\b", str(marker)):
-                        return True
-                    if not any(marker.evaluate({"extra": extra}) for extra in sorted(extras) or [""]):
+                    # not the requirements of extras (#47), not even of a requested one, as an installer
+                    # can tell the requested extras by another normalization, or not at all without Provides-Extra,
+                    # nor of extra == "", which uv and pip before 23.1 never install
+                    if re.search(r"\bextra\b", str(marker)) or not marker.evaluate({"extra": ""}):
                         return True
             except Exception:
                 return True
@@ -545,7 +547,7 @@ internal object PythonDependencies {
                     return False
             elif requirement.specifier and is_pep440(version) and not requirement.specifier.contains(version, prereleases=True):
                 return False
-            return are_requirements_satisfied(requirement.name, requirement.extras)
+            return are_requirements_satisfied(requirement.name)
 
         def is_pep440(version):
             # not e.g. 1.1build1 of a Debian package, whose requirement cannot be judged

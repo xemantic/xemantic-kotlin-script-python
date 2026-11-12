@@ -1307,21 +1307,23 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should plan installed dependency as missing when requirement of requested extra is not installed`() {
+    fun `should plan installed dependency as installed with requirement of requested extra not installed`() {
         withDistInfos { directory ->
             // given
-            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("other-probe; extra == \"fast\""))
+            // the requirements of extras are not checked (#47), as an installer can tell a requested extra
+            // by another normalization, or not at all without Provides-Extra, which would install it on every use
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("other-probe; extra == \"Foo_Bar\""))
 
             // when
-            val installs = planInstalls(directory, "requiring-probe[fast]")
+            val installs = planInstalls(directory, "requiring-probe[foo-bar]")
 
             // then
-            assert(installs == listOf("requiring-probe[fast]"))
+            assert(installs.isEmpty())
         }
     }
 
     @Test
-    fun `should plan installed dependency as missing when requirement of extra requested by its requirement is not installed`() {
+    fun `should plan installed dependency as installed with requirement of extra requested by its requirement not installed`() {
         withDistInfos { directory ->
             // given
             writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("required-probe[fast]"))
@@ -1331,7 +1333,7 @@ class PythonDependenciesTest {
             val installs = planInstalls(directory, "requiring-probe")
 
             // then
-            assert(installs == listOf("requiring-probe"))
+            assert(installs.isEmpty())
         }
     }
 
