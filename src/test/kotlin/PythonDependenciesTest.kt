@@ -738,7 +738,8 @@ class PythonDependenciesTest {
 
         // then
         // the constraint is applied, not only accepted as an option
-        assert(failure is PythonDependencyException && "unexpected argument" !in failure.message!!)
+        // with uv's explanation of the conflict, e.g. "there is no version of fake-dependency==2.0"
+        assert(failure is PythonDependencyException && "fake-dependency==2.0" in failure.message!!)
         assert("fake_dependency.py" !in dependencies)
     }
 
