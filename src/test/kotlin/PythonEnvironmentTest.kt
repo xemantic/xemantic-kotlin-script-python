@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import jep.JepException
+import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.nio.file.Path
@@ -28,6 +29,7 @@ import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectory
+import kotlin.io.path.createFile
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
@@ -932,6 +934,238 @@ class PythonEnvironmentTest {
             assert(probe == expected)
         } finally {
             workingDirectory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should not resolve default Python to python3 in working directory through empty PATH entry`() {
+        // given
+        assumeFalse(isWindows, "a POSIX PATH")
+        val planted = Path("").toAbsolutePath().resolve("python3")
+        assumeTrue(!planted.exists(), "no python3 in the working directory to plant over")
+        planted.createFile().toFile().setExecutable(true)
+
+        try {
+            // when
+            val exception = assertFailsWith<IllegalStateException> {
+                PythonEnvironment.resolvePythonExecutable(
+                    configured = null, virtualEnv = null, path = "/nonexistent:", windows = false
+                )
+            }
+
+            // then
+            val message = exception.message!!
+            assert(
+                message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
+                    "VIRTUAL_ENV" in message &&
+                    "PythonEnvironment.pythonExecutable" in message
+            )
+        } finally {
+            planted.deleteIfExists()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should resolve default Python to absolute path of python3 on PATH`() {
+        // given
+        assumeFalse(isWindows, "a POSIX PATH")
+        val directory = createTempDirectory("python-path")
+        val python3 = directory.resolve("python3").createFile()
+        python3.toFile().setExecutable(true)
+
+        try {
+            // when
+            val python = PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = null, path = ":$directory", windows = false
+            )
+
+            // then
+            assert(python == python3.toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should resolve configured Python name to absolute path on PATH, but keep configured path`() {
+        // given
+        assumeFalse(isWindows, "a POSIX PATH")
+        val directory = createTempDirectory("python-path")
+        val python3 = directory.resolve("python3").createFile()
+        python3.toFile().setExecutable(true)
+
+        try {
+            // when
+            val name = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3"), virtualEnv = null, path = ":$directory", windows = false
+            )
+            val relative = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("venv", "bin", "python3"), virtualEnv = null, path = ":$directory", windows = false
+            )
+
+            // then
+            assert(name == python3.toString() && relative == Path("venv", "bin", "python3").toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should resolve default and configured Python name to exe file on PATH on Windows`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        directory.resolve("python3").createFile().toFile().setExecutable(true)
+        val python3Exe = directory.resolve("python3.exe").createFile()
+        python3Exe.toFile().setExecutable(true)
+
+        try {
+            // when
+            val default = PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = null, path = "$directory", windows = true
+            )
+            val configured = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.exe"), virtualEnv = null, path = "$directory", windows = true
+            )
+
+            // then
+            assert(default == python3Exe.toString() && configured == python3Exe.toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should name exe file looked up for default Python on Windows`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = null, path = "", windows = true
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3.exe in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV" in message
+        )
+    }
+
+    @Test
+    fun `should not advise VIRTUAL_ENV when configured Python name is not found`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.12"), virtualEnv = null, path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3.12 in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV" !in message &&
+                "PythonEnvironment.pythonExecutable" in message
+        )
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should look up configured Python name with extension as is on Windows`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        val pythonExe = directory.resolve("python.EXE").createFile()
+        val python3Bat = directory.resolve("python3.bat").createFile()
+
+        try {
+            // when
+            val exe = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python.EXE"), virtualEnv = null, path = "$directory", windows = true
+            )
+            val bat = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.bat"), virtualEnv = null, path = "$directory", windows = true
+            )
+
+            // then
+            assert(exe == pythonExe.toString() && bat == python3Bat.toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should not read VIRTUAL_ENV when Python executable name is configured`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.12"), virtualEnv = "/in\u0000valid", path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(message.startsWith("Cannot find Python executable python3.12") && "VIRTUAL_ENV" !in message)
+    }
+
+    @Test
+    fun `should ignore invalid VIRTUAL_ENV, telling so when Python is not found`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = "/in\u0000valid", path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV is ignored, as it is not a valid path" in message &&
+                '\u0000' !in message
+        )
+    }
+
+    @Test
+    fun `should ignore relative VIRTUAL_ENV, telling so when Python is not found`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = "venv", path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV is ignored, as it is not an absolute path: venv" in message
+        )
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should ignore empty or relative VIRTUAL_ENV, which would resolve against working directory`() {
+        // given
+        assumeFalse(isWindows, "a POSIX PATH")
+        val directory = createTempDirectory("python-path")
+        val python3 = directory.resolve("python3").createFile()
+        python3.toFile().setExecutable(true)
+
+        try {
+            for (virtualEnv in listOf("", "venv", ".")) {
+                // when
+                val python = PythonEnvironment.resolvePythonExecutable(
+                    configured = null, virtualEnv = virtualEnv, path = "$directory", windows = false
+                )
+
+                // then
+                assert(python == python3.toString())
+            }
+        } finally {
+            directory.deleteRecursively()
         }
     }
 
