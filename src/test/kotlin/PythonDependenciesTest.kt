@@ -44,6 +44,8 @@ import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
 import kotlin.io.path.getPosixFilePermissions
 import kotlin.io.path.isWritable
+import kotlin.io.path.listDirectoryEntries
+import kotlin.io.path.name
 import kotlin.io.path.outputStream
 import kotlin.io.path.readLines
 import kotlin.io.path.setPosixFilePermissions
@@ -712,7 +714,7 @@ class PythonDependenciesTest {
 
             // then
             val lines = record.readLines()
-            // --constraints, its alias since uv 0.2.30, is rejected by uv 0.5.0 and older
+            // --constraints, its alias since uv 0.5.4, is rejected by older uv
             assert("--constraints" !in lines)
             assert("--constraint" in lines && lines.last() == "kept-dependency==1.0")
         } finally {
@@ -720,30 +722,55 @@ class PythonDependenciesTest {
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should install with uv on PATH keeping constraints`() {
-        // given
+    fun `should install with uv on PATH satisfying constraint`() {
+        // when
+        val (dependencies, failure) = installFakeDependencyWithUv(constraint = "fake-dependency==1.0")
+
+        // then
+        assert(failure == null && "fake_dependency.py" in dependencies)
+    }
+
+    @Test
+    fun `should fail to install with uv on PATH violating constraint`() {
+        // when
+        val (dependencies, failure) = installFakeDependencyWithUv(constraint = "fake-dependency==2.0")
+
+        // then
+        // the constraint is applied, not only accepted as an option
+        assert(failure is PythonDependencyException && "unexpected argument" !in failure.message!!)
+        assert("fake_dependency.py" !in dependencies)
+    }
+
+    /**
+     * Installs the `fake-dependency` 1.0, of a local wheel, so that uv needs no network,
+     * with the real uv on the `PATH`, keeping the [constraint], or skips the test without uv.
+     *
+     * @return the files of the dependency directory, and the failure of the installation, if any.
+     */
+    @OptIn(ExperimentalPathApi::class)
+    private fun installFakeDependencyWithUv(constraint: String): Pair<List<String>, Exception?> {
         val uv = PythonDependencies.findOnPath("uv")
         assumeTrue(uv != null, "uv is not on the PATH")
         PythonEnvironment.initialize()
         val directory = createTempDirectory("python-uv-install")
         try {
-            // a local wheel, so that uv needs no network
             val wheel = directory.resolve("fake_dependency-1.0-py3-none-any.whl")
             writeFakeWheel(wheel)
             val dependencies = directory.resolve("dependencies")
-
-            // when
-            PythonDependencies.installMissing(
-                listOf("fake-dependency @ ${wheel.toUri()}"),
-                listOf("fake-dependency==1.0"),
-                dependencies.toString(),
-                uv = uv
-            )
-
-            // then
-            assert(dependencies.resolve("fake_dependency.py").exists())
+            val failure = try {
+                PythonDependencies.installMissing(
+                    listOf("fake-dependency @ ${wheel.toUri()}"),
+                    listOf(constraint),
+                    dependencies.toString(),
+                    uv = uv
+                )
+                null
+            } catch (e: PythonDependencyException) {
+                e
+            }
+            val files = if (dependencies.exists()) dependencies.listDirectoryEntries().map { it.name } else emptyList()
+            return files to failure
         } finally {
             directory.deleteRecursively()
         }

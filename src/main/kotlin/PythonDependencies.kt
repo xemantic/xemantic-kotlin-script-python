@@ -268,22 +268,23 @@ internal object PythonDependencies {
         val constraintsFile = createTempFile("python-constraints", ".txt")
         try {
             constraintsFile.writeLines(constraints)
+            // understood alike by uv and pip; not --constraints, an alias in uv, which uv older than 0.5.4 rejects
+            val arguments = listOf(
+                "--target", directory,
+                "--constraint", constraintsFile.toString()
+            ) + missing
             val command = if (uv != null) {
                 listOf(
                     uv, "pip", "install", "--quiet",
-                    "--python", PythonEnvironment.executable,
-                    "--target", directory,
-                    // not its alias --constraints, which uv 0.5.0 and older reject
-                    "--constraint", constraintsFile.toString()
-                )
+                    "--python", PythonEnvironment.executable
+                ) + arguments
             } else {
                 pipCommand(
                     "install", "--quiet",
                     "--disable-pip-version-check", "--no-input", "--upgrade",
-                    "--target", directory,
-                    "--constraint", constraintsFile.toString()
+                    *arguments.toTypedArray()
                 )
-            } + missing
+            }
             val (exitCode, output) = runProcess(command)
             if (exitCode != 0) {
                 throw PythonDependencyException(
