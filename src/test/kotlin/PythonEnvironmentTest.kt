@@ -1074,22 +1074,57 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should strip exe extension of configured Python name on Windows ignoring case`() {
+    fun `should look up configured Python name with extension as is on Windows`() {
         // given
         val directory = createTempDirectory("python-path")
-        val pythonExe = directory.resolve("python.exe").createFile()
+        val pythonExe = directory.resolve("python.EXE").createFile()
+        val python3Bat = directory.resolve("python3.bat").createFile()
 
         try {
             // when
-            val python = PythonEnvironment.resolvePythonExecutable(
+            val exe = PythonEnvironment.resolvePythonExecutable(
                 configured = Path("python.EXE"), virtualEnv = null, path = "$directory", windows = true
+            )
+            val bat = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.bat"), virtualEnv = null, path = "$directory", windows = true
             )
 
             // then
-            assert(python == pythonExe.toString())
+            assert(exe == pythonExe.toString() && bat == python3Bat.toString())
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @Test
+    fun `should not read VIRTUAL_ENV when Python executable name is configured`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.12"), virtualEnv = "/in\u0000valid", path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(message.startsWith("Cannot find Python executable python3.12") && "VIRTUAL_ENV" !in message)
+    }
+
+    @Test
+    fun `should ignore invalid VIRTUAL_ENV, telling so when Python is not found`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = "/in\u0000valid", path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3 in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV is ignored, as it is not an absolute path: /in\u0000valid" in message
+        )
     }
 
     @OptIn(ExperimentalPathApi::class)

@@ -27,6 +27,7 @@ import java.nio.file.FileAlreadyExistsException
 import java.nio.file.InvalidPathException
 import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.PosixFilePermissions
 import java.util.concurrent.locks.ReentrantLock
@@ -37,9 +38,9 @@ import kotlin.io.path.createFile
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
-import kotlin.io.path.isDirectory
 import kotlin.io.path.isExecutable
 import kotlin.io.path.isRegularFile
+import kotlin.io.path.readAttributes
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeLines
 
@@ -309,17 +310,21 @@ internal object PythonDependencies {
 
     /**
      * Whether the [file] can be run as an executable found on the `PATH`:
-     * an executable regular file, or on [windows] any existing file which is not a directory,
+     * an executable regular file, or on [windows] a regular file, or another file which is not a directory,
      * as an app execution alias, e.g. `python3.exe` of the Microsoft Store in `WindowsApps`,
-     * is a reparse point, which Java reports neither as a regular file, nor as existing, if it follows it.
+     * is a reparse point, which Java reports neither as a regular file, nor as existing, if it follows it,
+     * but as other, when it does not — unlike a dangling symbolic link, or a junction, which is a directory.
      */
     internal fun isExecutableFile(file: Path, windows: Boolean): Boolean =
-        if (windows) file.exists(LinkOption.NOFOLLOW_LINKS) && !file.isDirectory()
+        if (windows) file.isRegularFile() || try {
+            file.readAttributes<BasicFileAttributes>(LinkOption.NOFOLLOW_LINKS).let { it.isOther && !it.isDirectory }
+        } catch (_: IOException) {
+            false
+        }
         else file.isRegularFile() && file.isExecutable()
 
     /**
-     * The files named [name], or `$name.exe` on [windows], in the directories of the [path], in their order —
-     * only `$name.exe` on Windows, where an extension-less file is a shell script, which cannot be run directly.
+     * The files named [executableFileName] in the directories of the [path], in their order.
      * A relative entry is skipped, as it resolves against a directory which can change, and whose files must not run as a tool:
      * the working directory for an empty entry or `.`,
      * and on Windows the current directory of a drive for `C:tools`, or the root of the current drive for `\tools`.
@@ -340,7 +345,15 @@ internal object PythonDependencies {
             }
         }
         .filter { it.isAbsolute }
-        .map { it.resolve(if (windows) "$name.exe" else name) }
+        .map { it.resolve(executableFileName(name, windows)) }
+
+    /**
+     * The file name of the executable [name]: on [windows] `$name.exe`, if the [name] has no extension,
+     * as an extension-less file is a shell script there, which cannot be run directly,
+     * while a name with an extension, e.g. `python3.bat` of a pyenv-win shim, is looked up as is, like Windows does.
+     */
+    internal fun executableFileName(name: String, windows: Boolean): String =
+        if (windows && '.' !in name) "$name.exe" else name
 
     /**
      * The entries of the Windows [path], as Windows splits them:
