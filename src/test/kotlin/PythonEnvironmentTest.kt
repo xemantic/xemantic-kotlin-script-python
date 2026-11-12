@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script.python
 
 import com.xemantic.kotlin.test.assert
 import jep.JepException
+import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.io.IOException
 import java.nio.file.Path
@@ -939,6 +940,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not resolve default Python to python3 in working directory through empty PATH entry`() {
         // given
+        assumeFalse(isWindows, "a POSIX PATH")
         val planted = Path("").toAbsolutePath().resolve("python3")
         assumeTrue(!planted.exists(), "no python3 in the working directory to plant over")
         planted.createFile().toFile().setExecutable(true)
@@ -967,6 +969,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should resolve default Python to absolute path of python3 on PATH`() {
         // given
+        assumeFalse(isWindows, "a POSIX PATH")
         val directory = createTempDirectory("python-path")
         val python3 = directory.resolve("python3").createFile()
         python3.toFile().setExecutable(true)
@@ -988,6 +991,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should resolve configured Python name to absolute path on PATH, but keep configured path`() {
         // given
+        assumeFalse(isWindows, "a POSIX PATH")
         val directory = createTempDirectory("python-path")
         val python3 = directory.resolve("python3").createFile()
         python3.toFile().setExecutable(true)
@@ -1028,6 +1032,85 @@ class PythonEnvironmentTest {
 
             // then
             assert(default == python3Exe.toString() && configured == python3Exe.toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should name exe file looked up for default Python on Windows`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = null, virtualEnv = null, path = "", windows = true
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3.exe in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV" in message
+        )
+    }
+
+    @Test
+    fun `should not advise VIRTUAL_ENV when configured Python name is not found`() {
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python3.12"), virtualEnv = null, path = "", windows = false
+            )
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            message.startsWith("Cannot find Python executable python3.12 in the absolute directories of the PATH") &&
+                "VIRTUAL_ENV" !in message &&
+                "PythonEnvironment.pythonExecutable" in message
+        )
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should strip exe extension of configured Python name on Windows ignoring case`() {
+        // given
+        val directory = createTempDirectory("python-path")
+        val pythonExe = directory.resolve("python.exe").createFile()
+
+        try {
+            // when
+            val python = PythonEnvironment.resolvePythonExecutable(
+                configured = Path("python.EXE"), virtualEnv = null, path = "$directory", windows = true
+            )
+
+            // then
+            assert(python == pythonExe.toString())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should ignore empty or relative VIRTUAL_ENV, which would resolve against working directory`() {
+        // given
+        assumeFalse(isWindows, "a POSIX PATH")
+        val directory = createTempDirectory("python-path")
+        val python3 = directory.resolve("python3").createFile()
+        python3.toFile().setExecutable(true)
+
+        try {
+            for (virtualEnv in listOf("", "venv", ".")) {
+                // when
+                val python = PythonEnvironment.resolvePythonExecutable(
+                    configured = null, virtualEnv = virtualEnv, path = "$directory", windows = false
+                )
+
+                // then
+                assert(python == python3.toString())
+            }
         } finally {
             directory.deleteRecursively()
         }

@@ -66,7 +66,7 @@ On Debian/Ubuntu, the Python headers, and the `venv` module, come with `apt inst
 
 The Python executable is, in this order:
 1. `PythonEnvironment.pythonExecutable`, if set before the first use of `Python`,
-2. the one of the virtual environment of the `VIRTUAL_ENV` environment variable,
+2. the one of the virtual environment of the `VIRTUAL_ENV` environment variable, if it is an absolute path,
 3. `python3` on the `PATH`, `python3.exe` on Windows.
 
 A bare name, the default `python3`, or a configured one, e.g. `python3.12`,

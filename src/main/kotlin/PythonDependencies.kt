@@ -25,6 +25,7 @@ import java.io.IOException
 import java.nio.channels.FileChannel
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.InvalidPathException
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption.WRITE
 import java.nio.file.attribute.PosixFilePermissions
@@ -36,6 +37,7 @@ import kotlin.io.path.createFile
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
+import kotlin.io.path.isDirectory
 import kotlin.io.path.isExecutable
 import kotlin.io.path.isRegularFile
 import kotlin.io.path.setPosixFilePermissions
@@ -287,15 +289,33 @@ internal object PythonDependencies {
         }
     }
 
-    /** The first executable regular file of [executableCandidates] in the [path], or `null`. */
+    /**
+     * The first [isExecutableFile] of [executableCandidates] in the [path], or `null`.
+     *
+     * Without a `PATH`, the default of the JDK on POSIX, `/bin:/usr/bin`, is searched, as `ProcessBuilder` would,
+     * and nothing on [windows].
+     */
     internal fun findOnPath(
         name: String,
         path: String? = System.getenv("PATH"),
-        windows: Boolean = System.getProperty("os.name").startsWith("Windows")
-    ): String? = path
+        windows: Boolean = isWindows
+    ): String? = (path ?: if (windows) null else DEFAULT_POSIX_PATH)
         ?.let { executableCandidates(name, it, windows) }
-        ?.firstOrNull { it.isRegularFile() && it.isExecutable() }
+        ?.firstOrNull { isExecutableFile(it, windows) }
         ?.toString()
+
+    /** The `PATH` of a process started by the JDK on POSIX without one, but without its empty entry. */
+    private const val DEFAULT_POSIX_PATH = "/bin:/usr/bin"
+
+    /**
+     * Whether the [file] can be run as an executable found on the `PATH`:
+     * an executable regular file, or on [windows] any existing file which is not a directory,
+     * as an app execution alias, e.g. `python3.exe` of the Microsoft Store in `WindowsApps`,
+     * is a reparse point, which Java reports neither as a regular file, nor as existing, if it follows it.
+     */
+    internal fun isExecutableFile(file: Path, windows: Boolean): Boolean =
+        if (windows) file.exists(LinkOption.NOFOLLOW_LINKS) && !file.isDirectory()
+        else file.isRegularFile() && file.isExecutable()
 
     /**
      * The files named [name], or `$name.exe` on [windows], in the directories of the [path], in their order —

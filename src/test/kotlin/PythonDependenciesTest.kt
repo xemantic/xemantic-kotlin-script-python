@@ -37,6 +37,7 @@ import kotlin.io.path.Path
 import kotlin.io.path.createDirectories
 import kotlin.io.path.createDirectory
 import kotlin.io.path.createFile
+import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
@@ -329,7 +330,7 @@ class PythonDependenciesTest {
      * It locks with POSIX `fcntl.lockf`, like `FileChannel.lock` on Linux and macOS, so the test is skipped on Windows.
      */
     private fun startOtherInstallation(directory: Path, distribution: String?): Process {
-        assumeFalse(System.getProperty("os.name").startsWith("Windows"), "fcntl.lockf is POSIX only")
+        assumeFalse(isWindows, "fcntl.lockf is POSIX only")
         directory.createDirectories()
         val process = ProcessBuilder(
             PythonEnvironment.executable, "-c", OTHER_INSTALLATION,
@@ -820,6 +821,55 @@ class PythonDependenciesTest {
 
         // then
         assert(candidates == listOf(absolute.resolve("uv")))
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should accept file which is not regular as executable only on Windows`() {
+        // given
+        assumeFalse(isWindows, "a FIFO stands for a Windows app execution alias, which is not a regular file")
+        val directory = createTempDirectory("python-path")
+        // like an app execution alias, e.g. python3.exe of the Microsoft Store, Java reports a FIFO as other
+        val fifo = directory.resolve("fifo.exe")
+        val mkfifo = ProcessBuilder("/usr/bin/mkfifo", fifo.toString()).start()
+        assumeTrue(mkfifo.waitFor() == 0, "mkfifo is available")
+        val subdirectory = directory.resolve("directory.exe").createDirectory()
+        val directoryLink = directory.resolve("link.exe").createSymbolicLinkPointingTo(subdirectory)
+
+        try {
+            // when
+            val windowsFifo = PythonDependencies.isExecutableFile(fifo, windows = true)
+            val posixFifo = PythonDependencies.isExecutableFile(fifo, windows = false)
+            val windowsDirectory = PythonDependencies.isExecutableFile(subdirectory, windows = true)
+            val windowsDirectoryLink = PythonDependencies.isExecutableFile(directoryLink, windows = true)
+            val windowsMissing = PythonDependencies.isExecutableFile(directory.resolve("missing.exe"), windows = true)
+
+            // then
+            assert(windowsFifo && !posixFifo && !windowsDirectory && !windowsDirectoryLink && !windowsMissing)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should find executable on default POSIX PATH when PATH is unset`() {
+        // given
+        assumeFalse(isWindows, "the default PATH is POSIX only")
+
+        // when
+        val found = PythonDependencies.findOnPath("sh", path = null, windows = false)
+
+        // then
+        assert(found == "/bin/sh" || found == "/usr/bin/sh")
+    }
+
+    @Test
+    fun `should find nothing when PATH is unset on Windows`() {
+        // when
+        val found = PythonDependencies.findOnPath("sh", path = null, windows = true)
+
+        // then
+        assert(found == null)
     }
 
     private companion object {
