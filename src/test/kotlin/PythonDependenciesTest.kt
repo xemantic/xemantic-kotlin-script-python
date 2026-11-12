@@ -1288,6 +1288,21 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should plan version dependency as installed in version not of PEP 440`() {
+        withDistInfos { directory ->
+            // given
+            // like a Debian package, which packaging 22 to 24 fails to compare with InvalidVersion
+            writeDistInfo(directory, "1.1build1", name = "legacy-probe")
+
+            // when
+            val installs = planInstalls(directory, "legacy-probe>=1")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
     fun `should plan installed dependency as installed with requirement installed in version not of PEP 440`() {
         withDistInfos { directory ->
             // given

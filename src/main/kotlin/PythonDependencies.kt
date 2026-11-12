@@ -483,7 +483,7 @@ internal object PythonDependencies {
                 # so a URL dependency with extras is installed again for them
                 if requirement.extras or not is_installed_from(requirement.url, distribution):
                     return True
-            elif not requirement.specifier.contains(version, prereleases=True):
+            elif not accepts_version(requirement, version):
                 return True
             return not are_requirements_satisfied(name)
 
@@ -492,18 +492,24 @@ internal object PythonDependencies {
 
         # the installed distributions by normalized name, as (distribution, version, requirements),
         # the requirements only of the ones in the dependency directory, otherwise None,
-        # as importlib.metadata parses the metadata on every access, and None for a missing one
+        # read from the metadata parsed once, as importlib.metadata parses it on every access,
+        # and None for a missing one
         installed_distributions = {}
 
         def installed(name):
             key = normalized_name(name)
             if key not in installed_distributions:
                 distribution = find_distribution(name)
-                installed_distributions[key] = None if distribution is None else (
-                    distribution,
-                    distribution.version,
-                    (distribution.requires or []) if is_in_dependencies(distribution) else None
-                )
+                if distribution is None:
+                    installed_distributions[key] = None
+                else:
+                    distribution_metadata = distribution.metadata
+                    installed_distributions[key] = (
+                        distribution,
+                        distribution_metadata["Version"],
+                        (distribution_metadata.get_all("Requires-Dist") or [])
+                        if is_in_dependencies(distribution) else None
+                    )
             return installed_distributions[key]
 
         # whether the requirements of a distribution of the dependency directory are satisfied,
@@ -533,29 +539,31 @@ internal object PythonDependencies {
                     # not the requirements of extras (#47), not even of a requested one, as an installer
                     # can tell the requested extras by another normalization, or not at all without Provides-Extra,
                     # nor of extra == "", which uv and pip before 23.1 never install
-                    if re.search(r"\bextra\b", str(marker)) or not marker.evaluate({"extra": ""}):
+                    if re.search(r"\bextra\b", str(marker)) or not marker.evaluate():
                         return True
             except Exception:
                 return True
             found = installed(requirement.name)
             if found is None:
                 return False
-            distribution, version, _ = found
+            distribution, version, requires = found
             if requirement.url is not None:
                 # of the environment, it would be found before the one installed into the dependency directory
-                if is_in_dependencies(distribution) and installed_source(requirement.url, distribution) is None:
+                if requires is not None and installed_source(requirement.url, distribution) is None:
                     return False
-            elif requirement.specifier and is_pep440(version) and not requirement.specifier.contains(version, prereleases=True):
+            elif not accepts_version(requirement, version):
                 return False
             return are_requirements_satisfied(requirement.name)
 
-        def is_pep440(version):
-            # not e.g. 1.1build1 of a Debian package, whose requirement cannot be judged
+        def accepts_version(requirement, version):
+            # also a version not of PEP 440, e.g. 1.1build1 of a Debian package, which cannot be compared
+            if not requirement.specifier:
+                return True
             try:
                 Version(version)
-                return True
             except Exception:
-                return False
+                return True
+            return requirement.specifier.contains(version, prereleases=True)
 
         def find_distribution(name):
             # like importlib.metadata, but None for several dist-info of the name in the dependency directory,
@@ -651,16 +659,16 @@ internal object PythonDependencies {
             # if the distribution is installed from the URL, whatever the revision or the content, otherwise None,
             # compared without hitting the network
             try:
-                installed = json.loads(distribution.read_text("direct_url.json") or "null")
+                direct_url = json.loads(distribution.read_text("direct_url.json") or "null")
             except ValueError:
                 return None
-            if not isinstance(installed, dict) or not isinstance(installed.get("url"), str):
+            if not isinstance(direct_url, dict) or not isinstance(direct_url.get("url"), str):
                 return None
             url, _, fragment = url.partition("#")
             options = dict(parse_qsl(fragment))
-            if options.pop("subdirectory", None) != installed.get("subdirectory"):
+            if options.pop("subdirectory", None) != direct_url.get("subdirectory"):
                 return None
-            installed_url, vcs_info, revision = installed["url"], installed.get("vcs_info"), None
+            installed_url, vcs_info, revision = direct_url["url"], direct_url.get("vcs_info"), None
             vcs, plus, _ = urlsplit(url).scheme.partition("+")
             if plus and vcs in ("git", "hg", "svn", "bzr"):
                 parts = urlsplit(url[len(vcs) + 1:])
@@ -678,22 +686,22 @@ internal object PythonDependencies {
                 vcs = None
             if without_credentials(url) != without_credentials(installed_url):
                 return None
-            return installed, vcs, revision, options
+            return direct_url, vcs, revision, options
 
         def is_installed_from(url, distribution):
             # also in the requested revision, or with the requested content
             source = installed_source(url, distribution)
             if source is None:
                 return False
-            installed, vcs, revision, options = source
+            direct_url, vcs, revision, options = source
             if vcs is not None:
                 # a branch or a tag is satisfied by the commit installed for it before, as the snippet requests
                 # the same thing, and the latest commit cannot be known without the network
-                vcs_info = installed["vcs_info"]
+                vcs_info = direct_url["vcs_info"]
                 if revision is not None and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
                     return vcs_info.get("commit_id") == revision
                 return vcs_info.get("requested_revision") == revision
-            archive_info = installed.get("archive_info")
+            archive_info = direct_url.get("archive_info")
             if not isinstance(archive_info, dict):
                 # a local directory can change without changing its URL, so it is always installed again
                 return False
@@ -704,7 +712,7 @@ internal object PythonDependencies {
             legacy_hash = archive_info.get("hash")
             if isinstance(legacy_hash, str) and "=" in legacy_hash:
                 hashes.setdefault(*legacy_hash.split("=", 1))
-            for algorithm, value in parse_qsl(installed["url"].partition("#")[2]):
+            for algorithm, value in parse_qsl(direct_url["url"].partition("#")[2]):
                 # the recorded hashes are the ones verified on installation
                 hashes.setdefault(algorithm, value)
             # a shake digest has no fixed length to compute and compare

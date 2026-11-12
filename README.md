@@ -202,11 +202,13 @@ otherwise the code can declare it as a dependency, see below.
   change the URL — for example, pin the commit — or delete the dependency directory.
   An installed dependency is also installed again when one of its requirements, also a transitive one,
   is no longer satisfied by what is installed,
-  e.g. when code declaring `demo==1.0` replaced the `demo 2.0` which an earlier dependency requires —
-  unless the replacing version is already imported, and so kept,
-  or a distribution of the Python environment, whose version is kept, no longer satisfies it,
-  e.g. after upgrading the environment,
-  when the installation fails with the conflict instead of the code failing later.
+  e.g. when code declaring `demo==1.0` replaced the `demo 2.0` which an earlier dependency requires,
+  so code with conflicting requirements replaces the versions installed for the other one back and forth.
+  The installation is attempted also when the unsatisfied requirement cannot be installed,
+  as the replacing version is already imported, and so kept,
+  or a distribution of the Python environment, whose version is always kept, no longer satisfies it,
+  e.g. after upgrading the environment —
+  then it fails with the conflict, instead of the code failing later.
   A direct URL requirement of an installed dependency is satisfied by a distribution installed from the same URL,
   whatever its revision or content,
   and the requirements of extras are not checked.
