@@ -102,21 +102,21 @@ public object PythonEnvironment {
         val library = jepLibrary(Path(jepLocation), python, probe.externallyManaged)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
-        // read only when needed
-        val jepDynamic by lazy { readElfDynamic(library) }
-        val jepName = lazy { jepLibraryName(library) }
-        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname, jepNeeded = { jepDynamic?.needed })
         val linux = System.getProperty("os.name").startsWith("Linux")
+        // read only when needed, and only the ELF library of Linux
+        val jepDynamic by lazy { if (linux) readElfDynamic(library) else null }
+        val jepName by lazy { jepLibraryName(library) }
+        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname, jepNeeded = { jepDynamic?.needed })
         // only when needed, as the foreign linker prints a warning without --enable-native-access
         val loading = if (
             pythonLibrary != null && linux &&
-            !jepLoadsGlobally(pythonLibrary, jepDynamic = { jepDynamic }, developmentName = { jepName.value })
+            !jepLoadsGlobally(pythonLibrary, jepDynamic = { jepDynamic }, developmentName = { jepName })
         ) {
             loadPythonLibrary(pythonLibrary)
         } else PythonLibraryLoading()
         this.executable = executable
         starter = EmbeddedPythonStarter(
-            executable, probe.error, pythonLibrary, { jepName.value }, loading.failure, loading.localSymbols
+            executable, probe.error, pythonLibrary, { jepName }, loading.failure, loading.localSymbols
         )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -732,6 +732,12 @@ internal fun runProcess(
             // must not be inherited with another encoding
             put("PYTHONUTF8", "1")
             put("PYTHONIOENCODING", "utf-8")
+            // a libpython preloaded for the embedded Python, see pythonLibraryGlobalAdvice,
+            // would replace the symbols of the libpython of another Python
+            get("LD_PRELOAD")?.let { preload ->
+                val kept = preload.split(' ', ':').filter { it.isNotEmpty() && !it.substringAfterLast('/').startsWith("libpython") }
+                if (kept.isEmpty()) remove("LD_PRELOAD") else put("LD_PRELOAD", kept.joinToString(" "))
+            }
         }
         if (errorFile == null) builder.redirectErrorStream(true) else builder.redirectError(errorFile.toFile())
         val process = builder.start()

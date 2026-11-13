@@ -52,6 +52,8 @@ internal fun foreignLinkerEnabled(): Boolean = !java.lang.Boolean.getBoolean(NO_
  * so that the native library of Jep links to the shared one:
  * it is taken if the sonames [jepNeeded] by the native library of Jep, see [readElfDynamic], read only for a static [soname],
  * have exactly one of the version and ABI of the [soname], e.g. `libpython3.12.so.1.0`, and it is in the [directory].
+ * A shared [soname] is not taken if the native library of Jep needs another `libpython`, of a Jep built for another Python,
+ * which would not load the one of the [soname] anyway.
  */
 internal fun pythonLibrary(
     directory: String,
@@ -59,11 +61,15 @@ internal fun pythonLibrary(
     jepNeeded: () -> List<String>? = { null }
 ): Path? {
     if (directory.isEmpty() || soname.isEmpty()) return null
+    val needed = jepNeeded()
     val name = if (soname.endsWith(".a")) {
         val stem = soname.removeSuffix(".a")
-        jepNeeded()?.filter { (it == "$stem.so" || it.startsWith("$stem.so.")) && '/' !in it }?.singleOrNull()
+        needed?.filter { (it == "$stem.so" || it.startsWith("$stem.so.")) && '/' !in it }?.singleOrNull()
             ?: return null
-    } else soname
+    } else {
+        if (needed != null && needed.any { it.startsWith("libpython") } && soname !in needed) return null
+        soname
+    }
     return Path(directory, name).takeIf { it.isRegularFile() }
 }
 
@@ -178,8 +184,13 @@ private val JEP_LIBRARY_NAME = Regex("(?<=\u0000)libpython[^\u0000/]*\\.(?:so|a)
  * @property needed the sonames of the libraries it needs, of its `DT_NEEDED` entries, in their order.
  * @property searchPath whether it has a search path of its own, a `DT_RPATH`, which the dynamic loader searches
  * even before `LD_LIBRARY_PATH`, or a `DT_RUNPATH`, searched before `ld.so.cache`, e.g. of a conda build.
+ * @property searchDirectories the entries of its `DT_RPATH` and `DT_RUNPATH`, in this order, as they are.
  */
-internal class ElfDynamic(val needed: List<String>, val searchPath: Boolean)
+internal class ElfDynamic(
+    val needed: List<String>,
+    val searchPath: Boolean,
+    val searchDirectories: List<String> = emptyList()
+)
 
 /**
  * The dynamic section of the ELF [library], or `null` if it cannot be read, e.g. of a file which is not an ELF library.
@@ -236,30 +247,35 @@ private fun readElfDynamic(channel: FileChannel): ElfDynamic? {
     val entries = channel.readAt(dynamicOffset, dynamicSize.toIntSize() ?: return null, order) ?: return null
     val entrySize = if (is64) 16 else 8
     val neededOffsets = mutableListOf<Long>()
-    var searchPath = false
+    var rpathOffset: Long? = null
+    var runpathOffset: Long? = null
     var stringTableAddress: Long? = null
     var stringTableSize: Long? = null
     for (at in 0..entries.limit() - entrySize step entrySize) {
         val value = entries.word(at + entrySize / 2)
         when (entries.word(at)) {
             DT_NULL -> break
-            DT_NEEDED -> neededOffsets += value
+            DT_NEEDED -> if (neededOffsets.size < MAX_ELF_NEEDED) neededOffsets += value else return null
             DT_STRTAB -> stringTableAddress = value
             DT_STRSZ -> stringTableSize = value
-            DT_RPATH, DT_RUNPATH -> searchPath = true
+            DT_RPATH -> rpathOffset = value
+            DT_RUNPATH -> runpathOffset = value
         }
     }
     val address = stringTableAddress ?: return null
     val size = stringTableSize?.toIntSize() ?: return null
     val load = loads.firstOrNull { (_, start, length) -> address >= start && address - start < length } ?: return null
     val strings = channel.readAt(load.first + (address - load.second), size, order) ?: return null
-    val needed = neededOffsets.map { offset ->
+    fun string(offset: Long): String? {
         if (offset < 0 || offset >= size) return null
         val start = offset.toInt()
-        val end = (start until size).firstOrNull { strings.get(it).toInt() == 0 } ?: return null
-        String(ByteArray(end - start) { strings.get(start + it) }, Charsets.ISO_8859_1)
+        val end = (start until minOf(size, start + MAX_ELF_STRING_SIZE + 1)).firstOrNull { strings.get(it).toInt() == 0 }
+            ?: return null
+        return String(ByteArray(end - start) { strings.get(start + it) }, Charsets.ISO_8859_1)
     }
-    return ElfDynamic(needed, searchPath)
+    val needed = neededOffsets.map { string(it) ?: return null }
+    val searchDirectories = listOfNotNull(rpathOffset, runpathOffset).flatMap { (string(it) ?: return null).split(':') }
+    return ElfDynamic(needed, searchPath = rpathOffset != null || runpathOffset != null, searchDirectories)
 }
 
 /** The [size] bytes at the [offset] of the [FileChannel], or `null` if the file ends before. */
@@ -278,6 +294,10 @@ private fun Long.toIntSize(): Int? = takeIf { it in 0..MAX_ELF_PART_SIZE }?.toIn
 /** The largest part of an ELF library read by [readElfDynamic]. */
 private const val MAX_ELF_PART_SIZE = 16L * 1024 * 1024
 
+/** The most libraries needed, and the longest string, which [readElfDynamic] reads, beyond those of any sane library. */
+private const val MAX_ELF_NEEDED = 1024
+private const val MAX_ELF_STRING_SIZE = 4096
+
 private const val PT_LOAD = 1
 private const val PT_DYNAMIC = 2
 private const val DT_NULL = 0L
@@ -290,7 +310,8 @@ private const val DT_RUNPATH = 29L
 /** [loaderFinds] of the [library] by a name, reading the cache of the loader at most once for all the names. */
 private fun loaderFinder(library: Path): (name: String) -> Boolean {
     val cache by lazy(::readLoaderCache)
-    return { name -> loaderFinds(library, name, cache = { cache }) }
+    val jvmDirectories by lazy { jvmSearchDirectories() }
+    return { name -> loaderFinds(library, name, cache = { cache }, jvmDirectories = { jvmDirectories }) }
 }
 
 /**
@@ -299,22 +320,35 @@ private fun loaderFinder(library: Path): (name: String) -> Boolean {
  * the dynamic loader has to find the [library] by its soname, and by its [developmentName], see [jepLoadsGlobally].
  * If Jep cannot, with the [developmentName] of a static library, or might not, with an unknown, empty one,
  * the [library] has to be loaded with global symbols before Python starts:
- * on Java 22 or newer by [loadPythonLibrary], unless native access is denied,
- * or by the loader itself, with `LD_PRELOAD`, which the processes started by the JVM inherit as well,
- * e.g. another Python, which would then have the symbols of this `libpython` instead of its own.
+ * by [loadPythonLibrary] with the [foreignLinker] on Java 22 or newer, the [javaVersion],
+ * or by the loader itself, with `LD_PRELOAD`, which the processes started by the Python code inherit as well,
+ * e.g. another Python, which would then have the symbols of this `libpython` instead of its own,
+ * unlike the ones of [runProcess].
  */
-internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): String =
+internal fun pythonLibraryGlobalAdvice(
+    library: Path,
+    developmentName: String,
+    javaVersion: Int = Runtime.version().feature(),
+    foreignLinker: Boolean = foreignLinkerEnabled()
+): String =
     if (!jepOpensShared(developmentName)) {
         val reason = if (developmentName.isEmpty()) {
             "if Jep does not make its symbols global with this Python, which its native library does not tell for certain"
         } else {
             "as Jep does not make its symbols global with this Python"
         }
-        "run the JVM on Java 22 or newer with --enable-native-access=ALL-UNNAMED, " +
-            "which loads $library with global symbols before Python starts, " +
-            "or put it on LD_PRELOAD, $reason, " +
+        val beforeStartup = "$library with global symbols before Python starts"
+        val withoutPreload = when {
+            javaVersion < 22 -> "run the JVM on Java 22 or newer with --enable-native-access=ALL-UNNAMED, " +
+                "which loads $beforeStartup"
+            !foreignLinker -> "run the JVM without -D$NO_FOREIGN_LINKER_PROPERTY=true, " +
+                "with which the foreign linker loads $beforeStartup"
+            else -> "run the JVM with --enable-native-access=ALL-UNNAMED, as the foreign linker failed to load $beforeStartup"
+        }
+        "$withoutPreload, or put it on LD_PRELOAD, $reason, " +
             "set only for the launch of the JVM, e.g. LD_PRELOAD=$library java ..., " +
-            "as every process the JVM starts, e.g. pip, inherits LD_PRELOAD"
+            "as the processes started by the Python code inherit it, e.g. with subprocess, " +
+            "unlike the ones started by this library"
     } else {
         "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts, " +
             "unless it is a directory the dynamic loader searches anyway, and if $developmentName is missing there, " +
@@ -325,7 +359,8 @@ internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): 
  * Whether the dynamic loader finds the [library] by the [name], its soname by default, as the same file,
  * see [jepLoadsGlobally].
  *
- * Like the loader of glibc, it takes the first file of the name in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
+ * Like the loader of glibc, it takes the first file of the name in the [jvmDirectories], see [jvmSearchDirectories],
+ * in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
  * a relative one in the [workingDirectory], by default the one of the process, not changed by setting `user.dir`,
  * and then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
  * of the directories configured in `/etc/ld.so.conf`, read only if needed.
@@ -337,6 +372,7 @@ internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): 
  * - a `;` in `LD_LIBRARY_PATH`, at which glibc splits it as well, but musl does not;
  * - a `$` in `LD_LIBRARY_PATH`, of `$ORIGIN`, `$LIB` or `$PLATFORM`, which glibc expands;
  * - a path which is not valid in the JVM, e.g. not in the encoding of the file system;
+ * - [jvmDirectories] which cannot be told;
  * - a file of the [name] in a subdirectory of `glibc-hwcaps` of a searched directory, also in the cache,
  *   which glibc takes first, if the CPU supports its level, e.g. `x86-64-v3`;
  * - different files of the [name] in the cache, whose order is not the one of their priority to the loader;
@@ -355,9 +391,10 @@ internal fun loaderFinds(
     name: String = library.fileName.toString(),
     libraryPath: String? = System.getenv("LD_LIBRARY_PATH"),
     cache: () -> ByteArray? = ::readLoaderCache,
-    workingDirectory: Path = Path("")
+    workingDirectory: Path = Path(""),
+    jvmDirectories: () -> List<Path>? = ::jvmSearchDirectories
 ): Boolean = try {
-    loaderFindsValidPaths(library, name, libraryPath, cache, workingDirectory)
+    loaderFindsValidPaths(library, name, libraryPath, cache, workingDirectory, jvmDirectories)
 } catch (_: InvalidPathException) {
     false
 }
@@ -367,8 +404,13 @@ private fun loaderFindsValidPaths(
     name: String,
     libraryPath: String?,
     cache: () -> ByteArray?,
-    workingDirectory: Path
+    workingDirectory: Path,
+    jvmDirectories: () -> List<Path>?
 ): Boolean {
+    for (directory in jvmDirectories() ?: return false) {
+        val candidate = directory.resolve(name)
+        if (candidate.exists()) return isSameFile(candidate, library)
+    }
     if (libraryPath != null && (';' in libraryPath || '$' in libraryPath)) return false
     // an empty LD_LIBRARY_PATH has no entries, rather than an empty one
     val entries = if (libraryPath.isNullOrEmpty()) emptyList() else libraryPath.split(':')
@@ -382,6 +424,38 @@ private fun loaderFindsValidPaths(
     return cached.isNotEmpty() &&
         cached.none { path -> path.any { it.toString() == "glibc-hwcaps" } } &&
         cached.all { isSameFile(it, library) }
+}
+
+/**
+ * The directories which glibc searches for a library needed, or opened, by the native library of Jep,
+ * before `LD_LIBRARY_PATH`, or `null` if they cannot be told: the `RPATH` of the libraries which loaded it,
+ * those of the JVM, e.g. `$ORIGIN` of `libjli.so`, and of the JVM [executable], e.g. `$ORIGIN:$ORIGIN/../lib` of `java`.
+ * They are taken as the ones of the [executable], with its `RUNPATH` as well, which glibc would ignore,
+ * and the `lib` directory of the [javaHome], as the libraries of the JVM in between are not known.
+ * A `RUNPATH`, or `RPATH`, which is not absolute, or has a `$` other than of `$ORIGIN`, cannot be told.
+ * Off Linux, there are none.
+ */
+internal fun jvmSearchDirectories(
+    executable: Path = Path("/proc/self/exe"),
+    javaHome: String = System.getProperty("java.home")
+): List<Path>? {
+    if (!System.getProperty("os.name").startsWith("Linux")) return emptyList()
+    val file = try {
+        executable.toRealPath()
+    } catch (_: IOException) {
+        return null
+    }
+    val dynamic = readElfDynamic(file) ?: return null
+    val origin = file.parent.toString()
+    return try {
+        dynamic.searchDirectories.map { entry ->
+            val expanded = entry.replace("\${ORIGIN}", origin).replace("\$ORIGIN", origin)
+            if ('$' in expanded || !expanded.startsWith("/")) return null
+            Path(expanded)
+        } + listOf(Path(javaHome, "lib"))
+    } catch (_: InvalidPathException) {
+        null
+    }
 }
 
 /** Whether a file of the [name] is in a subdirectory of `glibc-hwcaps` of the [directory], or it cannot be told. */

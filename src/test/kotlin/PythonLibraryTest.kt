@@ -389,18 +389,20 @@ class PythonLibraryTest {
     @Test
     fun `should advise Java 22 or preloading libpython only for JVM when Jep does not make its symbols global`() {
         // given
-        val library = Path("/opt/conda/lib/libpython3.12.so.1.0")
+        // Jep compiled in the name of the static library, which existed when it was built
+        val library = Path("/opt/python/lib/libpython3.12.so.1.0")
 
         // when
-        val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.a")
+        val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.a", javaVersion = 21)
 
         // then
         assert(
             advice == "run the JVM on Java 22 or newer with --enable-native-access=ALL-UNNAMED, " +
-                "which loads /opt/conda/lib/libpython3.12.so.1.0 with global symbols before Python starts, " +
+                "which loads /opt/python/lib/libpython3.12.so.1.0 with global symbols before Python starts, " +
                 "or put it on LD_PRELOAD, as Jep does not make its symbols global with this Python, " +
-                "set only for the launch of the JVM, e.g. LD_PRELOAD=/opt/conda/lib/libpython3.12.so.1.0 java ..., " +
-                "as every process the JVM starts, e.g. pip, inherits LD_PRELOAD"
+                "set only for the launch of the JVM, e.g. LD_PRELOAD=/opt/python/lib/libpython3.12.so.1.0 java ..., " +
+                "as the processes started by the Python code inherit it, e.g. with subprocess, " +
+                "unlike the ones started by this library"
         )
     }
 
@@ -411,7 +413,7 @@ class PythonLibraryTest {
         val library = Path("/opt/python/lib/libpython3.13.so.1.0")
 
         // when
-        val advice = pythonLibraryGlobalAdvice(library, "")
+        val advice = pythonLibraryGlobalAdvice(library, "", javaVersion = 21)
 
         // then
         assert(
@@ -420,7 +422,33 @@ class PythonLibraryTest {
                 "or put it on LD_PRELOAD, if Jep does not make its symbols global with this Python, " +
                 "which its native library does not tell for certain, " +
                 "set only for the launch of the JVM, e.g. LD_PRELOAD=/opt/python/lib/libpython3.13.so.1.0 java ..., " +
-                "as every process the JVM starts, e.g. pip, inherits LD_PRELOAD"
+                "as the processes started by the Python code inherit it, e.g. with subprocess, " +
+                "unlike the ones started by this library"
+        )
+    }
+
+    @Test
+    fun `should not advise Java 22 to make symbols of libpython global when JVM already is`() {
+        // given
+        val library = Path("/opt/python/lib/libpython3.12.so.1.0")
+
+        // when
+        val failed = pythonLibraryGlobalAdvice(library, "libpython3.12.a", javaVersion = 25, foreignLinker = true)
+        val disabled = pythonLibraryGlobalAdvice(library, "libpython3.12.a", javaVersion = 22, foreignLinker = false)
+
+        // then
+        assert(
+            failed.startsWith(
+                "run the JVM with --enable-native-access=ALL-UNNAMED, as the foreign linker failed to load " +
+                    "/opt/python/lib/libpython3.12.so.1.0 with global symbols before Python starts, " +
+                    "or put it on LD_PRELOAD, "
+            ) &&
+                disabled.startsWith(
+                    "run the JVM without -D$NO_FOREIGN_LINKER_PROPERTY=true, with which the foreign linker loads " +
+                        "/opt/python/lib/libpython3.12.so.1.0 with global symbols before Python starts, " +
+                        "or put it on LD_PRELOAD, "
+                ) &&
+                "Java 22" !in failed + disabled
         )
     }
 
@@ -579,18 +607,100 @@ class PythonLibraryTest {
         }
 
     @Test
-    fun `should not read native library of Jep for shared soname`() =
+    fun `should not find shared libpython of soname which Jep does not need`() =
         withLibraryDirectory { directory ->
             // given
             val library = directory.resolve("libpython3.13.so.1.0").createFile()
+            fun found(needed: List<String>?) =
+                pythonLibrary(directory.toString(), "libpython3.13.so.1.0", jepNeeded = { needed })
 
             // when
-            val found = pythonLibrary(
-                directory.toString(), "libpython3.13.so.1.0", jepNeeded = { error("native library read") }
-            )
+            // of a Jep built for another Python, which would not load this libpython anyway
+            val otherVersion = found(listOf("libpython3.12.so.1.0", "libc.so.6"))
+            val same = found(listOf("libpython3.13.so.1.0", "libc.so.6"))
+            // of an unreadable native library of Jep, or one not linked to libpython, which then only opens it
+            val unreadable = found(null)
+            val notLinked = found(listOf("libc.so.6"))
 
             // then
-            assert(found == library)
+            assert(otherVersion == null && same == library && unreadable == library && notLinked == library)
+        }
+
+    @Test
+    fun `should not read too long name or too many libraries needed by ELF library`() =
+        withLibraryDirectory { directory ->
+            // given
+            fun library(name: String, bytes: ByteArray) = directory.resolve(name).apply { writeBytes(bytes) }
+            val longName = library("long.so", elfLibrary(listOf("libpython" + "3".repeat(5000) + ".so.1.0")))
+            val manyNeeded = library("many.so", elfLibrary(List(2000) { "libxemantic$it.so" }))
+            val limits = library("limits.so", elfLibrary(List(1000) { "libxemantic$it.so" } + "x".repeat(4000)))
+
+            // when
+            val dynamics = listOf(longName, manyNeeded, limits).map { readElfDynamic(it) }
+
+            // then
+            assert(dynamics[0] == null && dynamics[1] == null && dynamics[2]?.needed?.size == 1001)
+        }
+
+    @Test
+    fun `should tell directories of RPATH of JVM executable which glibc searches before LD_LIBRARY_PATH`() =
+        withLibraryDirectory { directory ->
+            // given
+            // like the java launcher, with RPATH $ORIGIN:$ORIGIN/../lib, inherited by the libraries it loads
+            val bin = directory.resolve("jdk/bin").createDirectories().toRealPath()
+            val java = bin.resolve("java")
+            java.writeBytes(elfLibrary(listOf("libc.so.6"), rpath = "\$ORIGIN:\${ORIGIN}/../lib"))
+            // e.g. /usr/bin/java, linked to the launcher of the JDK
+            val link = directory.resolve("java").createSymbolicLinkPointingTo(java)
+            val withToken = directory.resolve("token")
+            withToken.writeBytes(elfLibrary(emptyList(), runpath = "/opt/\$LIB"))
+            val relative = directory.resolve("relative")
+            relative.writeBytes(elfLibrary(emptyList(), rpath = "lib"))
+            val javaHome = directory.resolve("jdk").toString()
+
+            // when
+            val directories = jvmSearchDirectories(link, javaHome)
+            val unknown = listOf(withToken, relative, directory.resolve("missing")).map {
+                jvmSearchDirectories(it, javaHome)
+            }
+
+            // then
+            assert(
+                directories == listOf(bin, bin.resolve("../lib"), Path(javaHome, "lib")) &&
+                    unknown == listOf(null, null, null)
+            )
+        }
+
+    @Test
+    fun `should tell directories of RPATH of this JVM`() {
+        // given
+        assumeTrue(System.getProperty("os.name").startsWith("Linux"), "an ELF executable only on Linux")
+
+        // when
+        val directories = jvmSearchDirectories()
+
+        // then
+        assert(directories != null && Path(System.getProperty("java.home"), "lib") in directories)
+    }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with another one in directory of JVM`() =
+        withLibraryDirectory { directory ->
+            // given
+            val jvmDirectory = directory.resolve("jvm").createDirectory()
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            fun found(jvmDirectories: List<Path>?) =
+                loaderFinds(library, libraryPath = "$directory", cache = { null }, jvmDirectories = { jvmDirectories })
+
+            // when
+            val withoutIt = found(listOf(jvmDirectory))
+            val unknown = found(null)
+            jvmDirectory.resolve("libxemantic-test.so.1").createFile()
+            val withAnother = found(listOf(jvmDirectory))
+            val withSame = found(listOf(directory))
+
+            // then
+            assert(withoutIt && !unknown && !withAnother && withSame)
         }
 
     /**

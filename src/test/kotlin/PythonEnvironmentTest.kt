@@ -1372,6 +1372,25 @@ class PythonEnvironmentTest {
     }
 
     @Test
+    fun `should run process without libpython preloaded for JVM`() {
+        // given
+        // a libpython of another Python would replace the symbols of the one of the process
+        fun preloaded(preload: String) = runProcess(
+            listOf(venvPython, "-c", "import os; print(os.environ.get('LD_PRELOAD'))"),
+            environment = mapOf("LD_PRELOAD" to preload),
+            // the loader complains about a missing library on the standard error
+            mergeErrorStream = false
+        ).output
+
+        // when
+        val other = preloaded("/nonexistent/libpython3.12.so.1.0 /nonexistent/libxemantic.so:libpython3.13.so")
+        val onlyLibpython = preloaded("/nonexistent/libpython3.12.so.1.0")
+
+        // then
+        assert(other == "/nonexistent/libxemantic.so" && onlyLibpython == "None")
+    }
+
+    @Test
     fun `should run process with stderr merged into stdout`() {
         // when
         val result = runProcess(

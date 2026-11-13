@@ -82,7 +82,7 @@ so that `LD_LIBRARY_PATH` is not needed,
 e.g. for a Python installed by `uv python install`, pyenv, or in a custom prefix.
 Loading it when not needed is harmless, so whenever it cannot be told for certain, it is loaded:
 for a file found only in a default directory of the loader, which differ between distributions,
-for another file of the same name which the loader might take instead,
+for another file of the same name which the loader might take instead, also in a directory of the `RPATH` of `java`,
 or when the native library of `jep` has a search path of its own.
 `jep` makes the symbols global itself by the development symlink of `libpython`, e.g. `libpython3.12.so`,
 which is missing for a Python of the system without its development package, like `libpython3.12-dev` on Debian.
@@ -95,11 +95,15 @@ On Java 17 to 21, the symbols become global only after the startup of Python,
 so a C extension imported at the startup, by a `.pth` file of the `site-packages`, e.g. of coverage, or by `sitecustomize`,
 fails with an `undefined symbol`, unless the loader finds both `libpython` and its development symlink,
 which for a Python outside the system library directories means its `LIBDIR` on `LD_LIBRARY_PATH`,
+also of conda-forge, for which `jep` makes them global by the shared `libpython3.12.so`, as the static library is missing,
 and for a Python of the system its development package.
-With a static `libpython`, `jep` does not make the symbols global at all,
-so on Java 17 to 21 a C extension imported at the startup needs the shared `libpython` on `LD_PRELOAD`,
-set only for the launch of the JVM, e.g. `LD_PRELOAD=/opt/conda/lib/libpython3.12.so.1.0 java ...`,
-as every process started by the JVM inherits it, e.g. `pip`, or another Python, which would then use the symbols of this `libpython`.
+Only a `jep` built while the static `libpython3.12.a` existed, e.g. installed with conda's `libpython-static`,
+does not make the symbols global at all,
+so on Java 17 to 21 a C extension imported at the startup then needs the shared `libpython` on `LD_PRELOAD`,
+set only for the launch of the JVM, e.g. `LD_PRELOAD=/opt/conda/lib/libpython3.12.so.1.0 java ...`.
+The processes started by this library, e.g. `pip`, run without a `libpython` of `LD_PRELOAD`,
+but the ones started by the Python code inherit it, e.g. with `subprocess`,
+so that another Python would use the symbols of this `libpython`.
 If `libpython` is not found, e.g. on macOS, where it is not loaded so,
 put its directory, the `LIBDIR` of `sysconfig`, on `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS),
 set before the JVM starts, as the loader reads it only then.
