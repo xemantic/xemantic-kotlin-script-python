@@ -77,6 +77,8 @@ which on Linux the dynamic loader finds by its soname in the directories of `LD_
 unless the native library of `jep` has a `RUNPATH` of it, e.g. in conda.
 For a Python installed elsewhere, e.g. by `uv python install`, pyenv, or in a custom prefix,
 the library loads `libpython` from the `LIBDIR` of the Python's `sysconfig` itself, with its symbols global,
+or, when the Python was moved since it was built, e.g. a python-build-standalone not installed by uv, which reports `/install/lib`,
+from the `lib` directory of its base prefix,
 as C extension modules, e.g. of numpy, need them,
 so that `LD_LIBRARY_PATH` is not needed.
 On Java 22 or newer, it does so with the foreign linker, a restricted method,

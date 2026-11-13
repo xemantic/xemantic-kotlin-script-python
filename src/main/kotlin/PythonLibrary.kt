@@ -39,10 +39,25 @@ internal fun foreignLinkerEnabled(): Boolean = !java.lang.Boolean.getBoolean(NO_
 /**
  * The shared `libpython` of the [soname] in the library [directory] of a Python, see [PythonEnvironment.probeCommand],
  * or `null` if there is none, e.g. of a Python linked to `libpython` statically, with `libpython3.X.a` as its soname.
+ *
+ * On [linux], when the [directory] has none, it is the one of the [soname] in the `lib` directory of the [basePrefix]:
+ * the `LIBDIR` of `sysconfig` is the one of the prefix where the Python was built,
+ * so a Python moved since reports a stale one, e.g. `/install/lib` of a python-build-standalone not installed by uv,
+ * while its `libpython` stays in the `lib` directory of the prefix, which `sys.base_prefix` tells from the executable.
+ * Only a library of the [soname] is taken, not e.g. `libpython3.X.so` or `libpython3.so`,
+ * as the native library of Jep is linked to the soname, which the dynamic loader then finds already loaded,
+ * and so never the library of another Python version.
  */
-internal fun pythonLibrary(directory: String, soname: String): Path? {
-    if (directory.isEmpty() || soname.isEmpty() || soname.endsWith(".a")) return null
-    return Path(directory, soname).takeIf { it.isRegularFile() }
+internal fun pythonLibrary(
+    directory: String,
+    soname: String,
+    basePrefix: String = "",
+    linux: Boolean = System.getProperty("os.name").startsWith("Linux")
+): Path? {
+    if (soname.isEmpty() || soname.endsWith(".a")) return null
+    val inDirectory = if (directory.isEmpty()) null else Path(directory, soname)
+    val inBasePrefix = if (linux && basePrefix.isNotEmpty()) Path(basePrefix, "lib", soname) else null
+    return listOfNotNull(inDirectory, inBasePrefix).firstOrNull { it.isRegularFile() }
 }
 
 /**

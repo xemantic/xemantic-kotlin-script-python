@@ -27,6 +27,7 @@ import kotlin.io.path.Path
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
+import kotlin.io.path.listDirectoryEntries
 import kotlin.io.path.writeText
 import kotlin.test.Test
 
@@ -127,6 +128,98 @@ class PythonLibraryTest {
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should load libpython of relocated Python reporting stale library directory without LD_LIBRARY_PATH`() {
+        // given
+        assumeTrue(System.getProperty("os.name").startsWith("Linux"), "the libpython is loaded so only on Linux")
+        val directory = createTempDirectory("python-relocated")
+        try {
+            val basePrefix = relocateBasePython(directory.resolve("python"))
+            val venv = directory.resolve("venv")
+            val created = runProcess(
+                listOf(basePrefix.resolve("bin").resolve("python3").toString(), "-I", "-m", "venv", "--without-pip", venv.toString())
+            )
+            assert(created.exitCode == 0)
+            // jep of the test venv, of the same Python version
+            val sitePackages = runProcess(
+                pythonCommand(venvPython, "import sysconfig\nprint(sysconfig.get_path('purelib'))"),
+                mergeErrorStream = false
+            ).output
+            venv.resolve("lib").listDirectoryEntries().single().resolve("site-packages").resolve("jep-of-tests.pth")
+                .writeText(sitePackages + "\n")
+
+            // when
+            val (exitCode, output) = runInJvm(
+                EmbeddedPythonMain::class.java.name,
+                input = "import sys\nprint(sys.base_prefix, flush=True)",
+                environment = mapOf("LD_LIBRARY_PATH" to null, "PYTHONPATH" to null, "VIRTUAL_ENV" to venv.toString()),
+                jvmArguments = listOf("-Dxemantic.kotlin.script.python.dependencyDirectory=${directory.resolve("dependencies")}")
+            )
+
+            // then
+            assert(output == basePrefix.toString())
+            assert(exitCode == 0)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    /**
+     * Makes the base Python of the test venv relocated into the [prefix], like a python-build-standalone not patched by uv,
+     * whose `sysconfig` reports the `LIBDIR` of `/install/lib`, where it was built,
+     * copying its executable and `libpython`, as CPython finds its prefix from their real paths,
+     * and linking the rest, but the `_sysconfigdata` module, in which its prefix is replaced by `/install`,
+     * skipping the test if the base Python is not a self-contained one with a shared `libpython` in its `lib` directory,
+     * e.g. a Python of the system.
+     *
+     * @return the [prefix].
+     */
+    private fun relocateBasePython(prefix: Path): Path {
+        val result = runProcess(
+            pythonCommand(
+                venvPython,
+                """
+                |import glob, os, shutil, sys, sysconfig
+                |base = sys.base_prefix
+                |libdir = sysconfig.get_config_var('LIBDIR')
+                |soname = sysconfig.get_config_var('INSTSONAME') or ''
+                |library = os.path.join(base, 'lib', soname)
+                |if libdir != os.path.join(base, 'lib') or not soname.endswith('.so.1.0') or not os.path.isfile(library):
+                |    print('not a self-contained Python with a shared libpython:', base, libdir, soname)
+                |    sys.exit(3)
+                |target = sys.argv[1]
+                |stdlib = sysconfig.get_path('stdlib')
+                |os.makedirs(os.path.join(target, 'bin'))
+                |shutil.copy2(os.path.realpath(sys._base_executable), os.path.join(target, 'bin', 'python3'))
+                |target_stdlib = os.path.join(target, 'lib', os.path.basename(stdlib))
+                |os.makedirs(target_stdlib)
+                |shutil.copy2(library, os.path.join(target, 'lib', soname))
+                |for name in os.listdir(stdlib):
+                |    source = os.path.join(stdlib, name)
+                |    if name == '__pycache__':
+                |        continue
+                |    if name.startswith('_sysconfigdata') and name.endswith('.py'):
+                |        with open(source, encoding='utf-8') as file:
+                |            content = file.read()
+                |        with open(os.path.join(target_stdlib, name), 'w', encoding='utf-8') as file:
+                |            file.write(content.replace(base, '/install'))
+                |    else:
+                |        os.symlink(source, os.path.join(target_stdlib, name))
+                |""".trimMargin(),
+                prefix.toString()
+            )
+        )
+        assumeTrue(result.exitCode != 3, result.output)
+        assert(result.exitCode == 0)
+        val libraryDirectory = runProcess(
+            pythonCommand(prefix.resolve("bin").resolve("python3").toString(), "import sysconfig\nprint(sysconfig.get_config_var('LIBDIR'))"),
+            mergeErrorStream = false
+        ).output
+        assert(libraryDirectory == "/install/lib")
+        return prefix
     }
 
     /**
