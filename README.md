@@ -79,11 +79,16 @@ For a Python installed elsewhere, e.g. by `uv python install`, pyenv, or in a cu
 the library loads `libpython` from the `LIBDIR` of the Python's `sysconfig` itself, with its symbols global,
 as C extension modules, e.g. of numpy, need them,
 so that `LD_LIBRARY_PATH` is not needed.
+It does the same when the loader finds `libpython`, but not its development symlink, e.g. `libpython3.12.so`,
+by which `jep` makes the symbols global itself,
+e.g. of a Python of the system without its development package, like `libpython3.12-dev` on Debian.
 On Java 22 or newer, it does so with the foreign linker, a restricted method,
 which, like loading the native library of `jep` on Java 24 or newer, prints a warning without `--enable-native-access=ALL-UNNAMED`.
 On Java 17 to 21, the symbols become global only after the startup of Python,
 so a C extension imported at the startup, by a `.pth` file of the `site-packages`, e.g. of coverage, or by `sitecustomize`,
-fails with an `undefined symbol` and still needs `LD_LIBRARY_PATH`.
+fails with an `undefined symbol`, unless the loader finds both `libpython` and its development symlink,
+which for a Python outside the system library directories means its `LIBDIR` on `LD_LIBRARY_PATH`,
+and for a Python of the system its development package.
 If `libpython` is not found, e.g. on macOS, where it is not loaded so,
 put its directory, the `LIBDIR` of `sysconfig`, on `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS),
 set before the JVM starts, as the loader reads it only then.

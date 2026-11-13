@@ -105,7 +105,8 @@ public object PythonEnvironment {
         val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
         // only when needed, as the foreign linker prints a warning without --enable-native-access
         val loading = if (
-            pythonLibrary != null && System.getProperty("os.name").startsWith("Linux") && !loaderFinds(pythonLibrary)
+            pythonLibrary != null && System.getProperty("os.name").startsWith("Linux") &&
+            !jepLoadsGlobally(pythonLibrary, probe.libraryDevelopmentName)
         ) {
             loadPythonLibrary(pythonLibrary)
         } else PythonLibraryLoading()
@@ -275,13 +276,14 @@ public object PythonEnvironment {
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
         val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
-        if (values == null || values.size != 7) return null
+        if (values == null || values.size != 8) return null
         val paths = values.map { it.hexToPath() ?: return null }
         val (executable, cacheTag, prefix, jepLocation, externallyManaged) = paths
         return PythonProbe(
             executable, cacheTag, prefix, jepLocation, externallyManaged.isNotEmpty(),
             libraryDirectory = paths[5],
-            librarySoname = paths[6]
+            librarySoname = paths[6],
+            libraryDevelopmentName = paths[7]
         )
     }
 
@@ -297,8 +299,9 @@ public object PythonEnvironment {
      * The fifth value tells whether the Python is externally managed (PEP 668), `1` if it is, empty if not:
      * a base Python, not a virtual environment, with an `EXTERNALLY-MANAGED` file in its standard library,
      * into which pip refuses to install.
-     * The values after it are the directory and the soname of the `libpython` of the base Python,
-     * `LIBDIR` and `INSTSONAME` of `sysconfig`, empty if unknown, e.g. on Windows, see [pythonLibrary].
+     * The values after it are the directory, the soname and the name of the development symlink
+     * of the `libpython` of the base Python, `LIBDIR`, `INSTSONAME` and `LDLIBRARY` of `sysconfig`,
+     * empty if unknown, e.g. on Windows, see [pythonLibrary] and [jepLoadsGlobally].
      * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
      * or the [PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE] if the Python is externally managed,
      * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
@@ -329,6 +332,7 @@ public object PythonEnvironment {
         |    '1' if externally_managed else '',
         |    sysconfig.get_config_var('LIBDIR'),
         |    sysconfig.get_config_var('INSTSONAME'),
+        |    sysconfig.get_config_var('LDLIBRARY'),
         |]
         |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
         |sys.stdout.flush()
@@ -655,6 +659,8 @@ internal class EmbeddedPythonStarter(
  * @property externallyManaged whether pip refuses to install into it (PEP 668), see [PythonEnvironment.probeCommand].
  * @property libraryDirectory the directory of the `libpython` of the base Python, `LIBDIR`, empty if unknown.
  * @property librarySoname the soname of the `libpython`, `INSTSONAME`, empty if unknown, see [pythonLibrary].
+ * @property libraryDevelopmentName the name of the development symlink of the `libpython`, `LDLIBRARY`,
+ * empty if unknown, see [jepLoadsGlobally].
  * @property error the standard error of the probe, e.g. a warning of Python, empty if none.
  */
 internal data class PythonProbe(
@@ -665,6 +671,7 @@ internal data class PythonProbe(
     val externallyManaged: Boolean = false,
     val libraryDirectory: String = "",
     val librarySoname: String = "",
+    val libraryDevelopmentName: String = "",
     val error: String = ""
 )
 

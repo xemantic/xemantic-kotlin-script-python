@@ -60,7 +60,7 @@ internal class PythonLibraryLoading(
 
 /**
  * Loads the shared `libpython` [library] of the Python on Linux, before Jep loads its native library, which depends on it,
- * when the dynamic loader would not find it, see [loaderFinds].
+ * unless the dynamic loader finds it, with its symbols made global by Jep, see [jepLoadsGlobally].
  *
  * The dynamic loader finds the `libpython3.X.so.1.0` of the native library of Jep by its soname
  * in the directories of `LD_LIBRARY_PATH`, read when the JVM starts, of `ld.so.cache`, and the system ones,
@@ -70,7 +70,8 @@ internal class PythonLibraryLoading(
  * Its symbols must be global as well, as a C extension module on Linux is not linked to `libpython`,
  * e.g. the ones of numpy, or of the standard library of most Pythons, `_ctypes` among them,
  * and would fail to import with `undefined symbol: PyExc_ValueError`.
- * Jep makes `libpython` global itself, but finds it by its file name, which the loader cannot find, like its soname.
+ * Jep makes `libpython` global itself, but finds it by the name of its development symlink,
+ * which the loader cannot find, like its soname, or which is missing, also of a Python of the system.
  * The JVM loads a native library with local symbols (`RTLD_LOCAL`),
  * so on Java 22 or newer, the library is loaded with `dlopen` and `RTLD_GLOBAL`, called with the foreign linker,
  * before CPython starts, also for a C extension imported at its startup, e.g. by a `.pth` file of the `site-packages`.
@@ -96,10 +97,26 @@ internal fun loadPythonLibrary(
 }
 
 /**
- * Whether the dynamic loader finds the [library] by its soname, its file name, as the same file,
- * so that it needs not be loaded by its path, see [loadPythonLibrary], e.g. of a Python of the system.
+ * Whether Jep loads the shared `libpython` [library] with its symbols global, so that it needs not be loaded by its path,
+ * see [loadPythonLibrary], e.g. of a Python of the system with its development package, e.g. `libpython3.13-dev`.
  *
- * Like the loader, it takes the first file of the soname in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
+ * The dynamic loader must find the [library] by its soname, its file name, for the native library of Jep,
+ * and Jep makes it global with `dlopen` of the [developmentName], `LDLIBRARY` of `sysconfig`, e.g. `libpython3.13.so`,
+ * the development symlink, missing when its development package is not installed, e.g. removed after building Jep,
+ * so that this `dlopen` fails, and the symbols stay local; [finds] tells whether the loader finds the [library] by a name.
+ */
+internal fun jepLoadsGlobally(
+    library: Path,
+    developmentName: String,
+    finds: (library: Path, name: String) -> Boolean = { found, name -> loaderFinds(found, name) }
+): Boolean = finds(library, library.fileName.toString()) &&
+    developmentName.isNotEmpty() && finds(library, developmentName)
+
+/**
+ * Whether the dynamic loader finds the [library] by the [name], its soname by default, as the same file,
+ * see [jepLoadsGlobally].
+ *
+ * Like the loader, it takes the first file of the name in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
  * then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
  * of the directories configured in `/etc/ld.so.conf`, read only if needed, and then in the system directories.
  * It does not know the `RUNPATH` of the native library of Jep, e.g. of conda,
@@ -107,13 +124,13 @@ internal fun loadPythonLibrary(
  */
 internal fun loaderFinds(
     library: Path,
+    name: String = library.fileName.toString(),
     libraryPath: String? = System.getenv("LD_LIBRARY_PATH"),
     cache: () -> ByteArray? = ::readLoaderCache
 ): Boolean {
-    val soname = library.fileName.toString()
-    val candidates = libraryPath.orEmpty().split(':').asSequence().filter { it.isNotEmpty() }.map { Path(it, soname) } +
-        sequence { yieldAll(cachedLibraries(cache(), soname)) } +
-        SYSTEM_LIBRARY_DIRECTORIES.asSequence().map { Path(it, soname) }
+    val candidates = libraryPath.orEmpty().split(':').asSequence().filter { it.isNotEmpty() }.map { Path(it, name) } +
+        sequence { yieldAll(cachedLibraries(cache(), name)) } +
+        SYSTEM_LIBRARY_DIRECTORIES.asSequence().map { Path(it, name) }
     val found = candidates.firstOrNull { it.isRegularFile() } ?: return false
     return try {
         found.isSameFileAs(library)
@@ -132,12 +149,12 @@ private fun readLoaderCache(): ByteArray? = try {
     null
 }
 
-/** The paths of the libraries of the [soname] in the [cache] of the dynamic loader, its null-terminated strings. */
-private fun cachedLibraries(cache: ByteArray?, soname: String): List<Path> {
+/** The paths of the libraries of the [name] in the [cache] of the dynamic loader, its null-terminated strings. */
+private fun cachedLibraries(cache: ByteArray?, name: String): List<Path> {
     if (cache == null) return emptyList()
     // ISO-8859-1 maps each byte to a char, so that the indexes are the ones of the bytes
     val text = String(cache, Charsets.ISO_8859_1)
-    val suffix = "/" + String(soname.toByteArray(filesystemCharset), Charsets.ISO_8859_1) + "\u0000"
+    val suffix = "/" + String(name.toByteArray(filesystemCharset), Charsets.ISO_8859_1) + "\u0000"
     val paths = mutableListOf<Path>()
     var end = text.indexOf(suffix)
     while (end != -1) {

@@ -24,6 +24,8 @@ import java.io.IOException
 import java.nio.file.Path
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectory
+import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
@@ -127,6 +129,78 @@ class PythonLibraryTest {
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should import C extension not linked to libpython found by loader without its development symlink`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        try {
+            compileExtension(directory)
+            val libraryPath = sonameOnlyLibraryPath(directory)
+
+            // when
+            val (exitCode, output) = runInJvm(
+                EmbeddedPythonMain::class.java.name,
+                input = "import xemantic_extension\nprint(xemantic_extension.VALUE, flush=True)",
+                environment = mapOf("LD_LIBRARY_PATH" to libraryPath.toString(), "PYTHONPATH" to directory.toString())
+            )
+
+            // then
+            assert(output == "imported")
+            assert(exitCode == 0)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should import C extension not linked to libpython found by loader without its development symlink and foreign linker`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        try {
+            compileExtension(directory)
+            val libraryPath = sonameOnlyLibraryPath(directory)
+
+            // when
+            val (exitCode, output) = runInJvm(
+                EmbeddedPythonMain::class.java.name,
+                input = "import xemantic_extension\nprint(xemantic_extension.VALUE, flush=True)",
+                environment = mapOf("LD_LIBRARY_PATH" to libraryPath.toString(), "PYTHONPATH" to directory.toString()),
+                // like on Java 17 to 21, without the foreign linker
+                jvmArguments = listOf("-D${NO_FOREIGN_LINKER_PROPERTY}=true")
+            )
+
+            // then
+            assert(output == "imported")
+            assert(exitCode == 0)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    /**
+     * A directory, in the [directory], for `LD_LIBRARY_PATH`, with a symbolic link of the soname of the `libpython`
+     * of the test venv Python to it, but without its development symlink, e.g. `libpython3.13.so`,
+     * like a Python of the system without its development package, e.g. `libpython3.13-dev`,
+     * so that the dynamic loader finds this `libpython` for the native library of Jep, but Jep does not find it by this name.
+     * It tests nothing with a Python whose development symlink the loader finds anyway, e.g. a Python of the system.
+     */
+    private fun sonameOnlyLibraryPath(directory: Path): Path {
+        val (libraryDirectory, soname) = runProcess(
+            pythonCommand(
+                venvPython,
+                "import sysconfig\nprint(sysconfig.get_config_var('LIBDIR'))\nprint(sysconfig.get_config_var('INSTSONAME'))"
+            ),
+            mergeErrorStream = false
+        ).output.lines()
+        val library = pythonLibrary(libraryDirectory, soname)
+        assumeTrue(library != null, "the Python is not built with a shared libpython")
+        val libraryPath = directory.resolve("lib").createDirectory()
+        libraryPath.resolve(soname).createSymbolicLinkPointingTo(library!!)
+        return libraryPath
     }
 
     /**
