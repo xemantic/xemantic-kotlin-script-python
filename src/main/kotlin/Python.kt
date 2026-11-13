@@ -49,6 +49,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * therefore each `Python` runs its code on a thread of its own,
  * and can be called from any thread, one call at a time.
  * Concurrent calls wait for their turn.
+ * A call whose calling thread is interrupted while waiting, throws an [InterruptedException],
+ * clearing the interrupt flag of the thread, like any blocking method throwing it,
+ * and is cancelled, so that it does not run, unless the thread of this `Python` has already started it,
+ * possibly just as the calling thread was interrupted — such a call completes, with its side effects, unreported.
  *
  * Once [close] is called, every call which is not running yet fails with an [IllegalStateException]
  * with the message `Python is closed` —
@@ -88,7 +92,9 @@ import java.util.concurrent.atomic.AtomicInteger
  * Once the embedded CPython fails to start, every `Python` fails, as it can be started only once per JVM.
  */
 public class Python private constructor(
-    decorateExecutor: (ExecutorService) -> ExecutorService
+    decorateExecutor: (ExecutorService) -> ExecutorService,
+    // replaced only by tests, see withInterpreterFactory
+    private val newInterpreter: () -> SharedInterpreter = { SharedInterpreter() }
 ) : AutoCloseable {
 
     public constructor() : this({ it })
@@ -127,7 +133,9 @@ public class Python private constructor(
      *
      * @throws jep.JepException if the code fails, with the type and the message of the Python exception.
      * @throws PythonDependencyException if the declared dependencies cannot be installed.
+     * @throws InterruptedException if the calling thread is interrupted while the call waits for its turn, or runs.
      */
+    @Throws(InterruptedException::class)
     public fun exec(code: String) {
         call {
             PythonDependencies.install(code, this)
@@ -150,7 +158,9 @@ public class Python private constructor(
      * @throws jep.JepException if the code fails, with the type and the message of the Python exception.
      * @throws PythonDependencyException if the declared dependencies cannot be installed.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
+     * @throws InterruptedException if the calling thread is interrupted while the call waits for its turn, or runs.
      */
+    @Throws(InterruptedException::class)
     public operator fun invoke(@Language("python") code: String): Any? = call {
         PythonDependencies.install(code, this)
         @Suppress("UNCHECKED_CAST")
@@ -182,7 +192,9 @@ public class Python private constructor(
      * and dispatching its calls to the thread of this `Python` would fail once it is closed.
      * It is rejected also when called by a Kotlin function, which is called from Python, on the thread of this `Python`.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
+     * @throws InterruptedException if the calling thread is interrupted while the call waits for its turn, or runs.
      */
+    @Throws(InterruptedException::class)
     public inline fun <reified T : Any> eval(@Language("python") expression: String): T =
         eval(expression, T::class.javaObjectType)
 
@@ -206,7 +218,9 @@ public class Python private constructor(
      * and dispatching its calls to the thread of this `Python` would fail once it is closed.
      * It is rejected also when called by a Kotlin function, which is called from Python, on the thread of this `Python`.
      * @throws IllegalStateException if different keys of a returned `dict`, or elements of a [Set], have the same `repr`.
+     * @throws InterruptedException if the calling thread is interrupted while the call waits for its turn, or runs.
      */
+    @Throws(InterruptedException::class)
     public fun <T : Any> eval(@Language("python") expression: String, type: Class<T>): T = call {
         // checked in the call, so that a closed Python fails as closed
         require(!type.holdsPyObject()) { "A PyObject cannot leave the thread of Python" }
@@ -228,12 +242,17 @@ public class Python private constructor(
      *
      * @throws jep.JepException if there is no such variable.
      * @throws IllegalStateException if different keys of a `dict`, or elements of a [Set], have the same `repr`.
+     * @throws InterruptedException if the calling thread is interrupted while the call waits for its turn, or runs.
      */
+    @Throws(InterruptedException::class)
     public operator fun get(name: String): Any? = call { toJava(getValue(name)) }
 
     /**
      * Sets the global variable of the given [name] to the [value], converted to a Python object.
+     *
+     * @throws InterruptedException if the calling thread is interrupted while the call waits for its turn, or runs.
      */
+    @Throws(InterruptedException::class)
     public operator fun set(name: String, value: Any?) {
         call { set(name, value) }
     }
@@ -245,7 +264,21 @@ public class Python private constructor(
      * it closes the interpreter on its thread, and waits for it,
      * so that the interpreter is closed when it returns.
      * Each call which is not running yet, or which is made afterward, fails with an [IllegalStateException].
-     * Calling it again has no effect, and returns immediately.
+     * If closing the interpreter fails, its exception is thrown by this `close()`, which waits for it.
+     * If the waiting is interrupted, it throws an [InterruptedException] at once, clearing the interrupt flag of the thread,
+     * and the interpreter is still closed afterward, in the background, but a failure of closing it is not reported.
+     *
+     * @throws InterruptedException if the waiting is interrupted.
+     *
+     * Only the first `close()` can wait.
+     * Calling it again has no effect, and returns immediately,
+     * also while the interpreter is not closed yet: while the first `close()` waits for it,
+     * or after it is interrupted, or when it has returned without waiting, see below.
+     * So it throws no failure of closing the interpreter again,
+     * e.g. when `use` or try-with-resources closes a `Python` closed explicitly in its block.
+     * Neither can it deadlock when the closing of the interpreter, which can run Python code, waits for it:
+     * when it is called by a Kotlin function, which `__del__` of a global variable calls on the thread of this `Python`,
+     * or by another thread this function waits for.
      *
      * With a call running, or starting or ending, it does not wait for it:
      * it returns immediately, the running call continues and completes normally,
@@ -257,6 +290,7 @@ public class Python private constructor(
      * when it is called by a Kotlin function called from Python, or by another thread, which this function,
      * or the Python code, waits for, and it cannot be told apart from a `close()` which the running call does not wait for.
      */
+    @Throws(InterruptedException::class)
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         // the calls submitted before, and still waiting for their turn, see it closed when it comes,
@@ -264,8 +298,12 @@ public class Python private constructor(
         // explicitly a Runnable, unlike the calls, which tests rely on to intercept only this task
         val closing = try {
             executor.submit(Runnable {
-                interpreter?.close()
-                interpreter = null
+                try {
+                    interpreter?.close()
+                } finally {
+                    // defensive only: nothing can use the interpreter afterward, as the executor is shut down
+                    interpreter = null
+                }
             })
         } finally {
             executor.shutdown()
@@ -279,6 +317,9 @@ public class Python private constructor(
             closing.get()
         } catch (e: ExecutionException) {
             throw e.cause ?: e
+        } catch (e: InterruptedException) {
+            // the interpreter is still closed by its task, which is not cancelled
+            throw e
         }
     }
 
@@ -300,7 +341,7 @@ public class Python private constructor(
                         PythonEnvironment.initialize()
                         // assigned only once checked, so that a later call does not use an interpreter failing the check
                         PythonEnvironment.starter.createInterpreter(
-                            create = { SharedInterpreter() },
+                            create = newInterpreter,
                             check = { PythonEnvironment.checkUtf8Mode(it) }
                         ).also { interpreter = it }
                     }
@@ -317,6 +358,10 @@ public class Python private constructor(
             future.get()
         } catch (e: ExecutionException) {
             throw e.cause ?: e
+        } catch (e: InterruptedException) {
+            // a call still waiting for its turn never runs, while one already taken by the thread of this Python completes
+            future.cancel(false)
+            throw e
         }
     }
 
@@ -519,6 +564,14 @@ public class Python private constructor(
         internal fun withDecoratedExecutor(
             decorateExecutor: (ExecutorService) -> ExecutorService
         ): Python = Python(decorateExecutor)
+
+        /**
+         * Creates a `Python`, whose interpreter is created by [newInterpreter], on the thread of this `Python`,
+         * so that a test can make closing the interpreter fail.
+         */
+        internal fun withInterpreterFactory(
+            newInterpreter: () -> SharedInterpreter
+        ): Python = Python({ it }, newInterpreter)
 
         private val threadCounter = AtomicInteger()
 
