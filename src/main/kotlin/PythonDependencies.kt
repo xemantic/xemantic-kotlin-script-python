@@ -585,7 +585,9 @@ internal object PythonDependencies {
         def top_level_name(path, vendored=False):
             # the top-level module of a path recorded in RECORD,
             # like demo of demo/__init__.py, demo.py or demo.cpython-310-x86_64-linux-gnu.so,
-            # also of demo.libs/ of auditwheel, if vendored, as the demo module loads the shared libraries in it,
+            # also of demo.libs/ of auditwheel, if vendored, holding the shared libraries the modules load:
+            # auditwheel names it after the distribution, not the module, like pillow.libs/ of the PIL module of pillow,
+            # so it is told as a file of an imported module only when the module is named like the distribution,
             # or None of e.g. ../../bin/ of pip install --target, the dist-info, the data, __pycache__ or a .pth file
             first, separator, _ = path.partition("/")
             if separator:
@@ -613,13 +615,22 @@ internal object PythonDependencies {
             except (OSError, ValueError, csv.Error):
                 return set()
 
+        # the top-level modules of each dist-info in the dependency directory, by its path, told once,
+        # as is_imported asks for all the dist-info of a name for each of them
+        dist_info_top_levels = {}
+
+        def dist_info_top_level(path):
+            if path not in dist_info_top_levels:
+                dist_info_top_levels[path] = top_level(metadata.PathDistribution(Path(path)))
+            return dist_info_top_levels[path]
+
         def is_imported(name, distribution):
             # whether the distribution in the dependency directory, or another dist-info of its name there,
             # tells an imported top-level module
-            candidates = [distribution] + [
-                metadata.PathDistribution(Path(path)) for path in dependency_dist_infos.get(normalized_name(name), [])
-            ]
-            return any(not imported.isdisjoint(top_level(candidate)) for candidate in candidates)
+            return not imported.isdisjoint(top_level(distribution)) or any(
+                not imported.isdisjoint(dist_info_top_level(path))
+                for path in dependency_dist_infos.get(normalized_name(name), [])
+            )
 
         def imported_files(distribution):
             # the number of the recorded files of the imported top-level modules of the distribution,
