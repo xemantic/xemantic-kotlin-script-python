@@ -254,7 +254,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with output before and after values`() {
         // given
-        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")}\nmore noise"
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "")}\nmore noise"
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -268,7 +268,7 @@ class PythonEnvironmentTest {
         // given
         val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
             "${PythonEnvironment.PROBE_BEGIN}\n" +
-            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -280,7 +280,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with empty first value`() {
         // given
-        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -292,7 +292,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with values containing spaces and non-ASCII`() {
         // given
-        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "", "")
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -306,7 +306,7 @@ class PythonEnvironmentTest {
         // given
         val output = probePayload(
             "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1", "/opt/python/lib", "libpython3.13.so.1.0",
-            "/opt/python"
+            "/opt/python", "/install"
         )
 
         // when
@@ -319,24 +319,32 @@ class PythonEnvironmentTest {
                 externallyManaged = true,
                 libraryDirectory = "/opt/python/lib",
                 librarySoname = "libpython3.13.so.1.0",
-                basePrefix = "/opt/python"
+                baseExecPrefix = "/opt/python",
+                buildExecPrefix = "/install"
             )
         )
     }
 
     @Test
-    fun `should probe base prefix of Python`() {
+    fun `should probe base exec prefix of Python and exec prefix where it was built`() {
         // given
-        val basePrefix = runProcess(
-            pythonCommand(venvPython, "import sys\nprint(sys.base_prefix)"),
+        val (baseExecPrefix, buildExecPrefix) = runProcess(
+            pythonCommand(
+                venvPython,
+                "import importlib, sys, sysconfig\nprint(sys.base_exec_prefix)\n" +
+                    "print(importlib.import_module(sysconfig._get_sysconfigdata_name()).build_time_vars['exec_prefix'])"
+            ),
             mergeErrorStream = false
-        ).output
+        ).output.lines()
 
         // when
         val probe = PythonEnvironment.probePython(venvPython)
 
         // then
-        assert(probe.basePrefix == basePrefix && probe.basePrefix != probe.prefix)
+        assert(
+            probe.baseExecPrefix == baseExecPrefix && probe.baseExecPrefix != probe.prefix &&
+                probe.buildExecPrefix == buildExecPrefix
+        )
     }
 
     @Test
@@ -352,7 +360,9 @@ class PythonEnvironmentTest {
         val probe = PythonEnvironment.probePython(venvPython)
 
         // then
-        val library = pythonLibrary(probe.libraryDirectory, probe.librarySoname, probe.basePrefix)
+        val library = pythonLibrary(
+            probe.libraryDirectory, probe.librarySoname, probe.baseExecPrefix, probe.buildExecPrefix
+        )
         assert(library != null && library.isRegularFile())
     }
 
@@ -368,7 +378,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "")
             .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
@@ -379,10 +389,10 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should not parse probe output without exactly eight values`() {
+    fun `should not parse probe output without exactly nine values`() {
         // given
-        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
-        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "extra")
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "", "extra")
 
         // when
         val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
@@ -857,22 +867,124 @@ class PythonEnvironmentTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should find libpython of relocated Python in lib directory of its base prefix on Linux`() {
+    fun `should find libpython of relocated Python in its library directory moved with its prefix`() {
         // given
         // e.g. a python-build-standalone not patched by uv reports /install/lib, a moved prefix its old path
-        val basePrefix = createTempDirectory("python-library")
-        val library = basePrefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val library = prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
 
         try {
             // when
             val found = pythonLibrary(
-                "/install/lib", "libpython3.13.so.1.0", basePrefix = basePrefix.toString(), linux = true
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
             )
 
             // then
             assert(found == library)
         } finally {
-            basePrefix.deleteRecursively()
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython of relocated Python in its multiarch library directory before lib directory`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val lib = prefix.resolve("lib").createDirectory()
+        lib.resolve("libpython3.13.so.1.0").createFile()
+        val library = lib.resolve("x86_64-linux-gnu").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                "$buildPrefix/lib/x86_64-linux-gnu", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython of relocated Python in lib directory of its prefix with library directory not under it`() {
+        // given
+        // e.g. built with --libdir outside of its exec_prefix
+        val directory = createTempDirectory("python-library")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val library = prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                directory.resolve("libraries").toString(), "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = directory.resolve("build").toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find libpython of same soname left in stale library directory of relocated Python`() {
+        // given
+        // of another installation of the same Python version at the prefix where this one was built
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build").createDirectory()
+        buildPrefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+        val prefix = directory.resolve("prefix").createDirectory()
+        val lib = prefix.resolve("lib").createDirectory()
+
+        try {
+            // when
+            val missing = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+            val library = lib.resolve("libpython3.13.so.1.0").createFile()
+            val found = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+
+            // then
+            assert(missing == null && found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython in lib directory of base prefix when library directory has none and build prefix is unknown`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val library = prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                "${directory.resolve("build")}/lib", "libpython3.13.so.1.0", baseExecPrefix = prefix.toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
         }
     }
 
@@ -880,16 +992,17 @@ class PythonEnvironmentTest {
     @Test
     fun `should prefer libpython of library directory to one in lib directory of base prefix`() {
         // given
-        // e.g. of Debian, with LIBDIR /usr/lib/x86_64-linux-gnu, and the base prefix /usr
+        // e.g. of Debian, with LIBDIR /usr/lib/x86_64-linux-gnu, and the base prefix /usr, where it was built
         val directory = createTempDirectory("python-library")
         val library = directory.resolve("libpython3.13.so.1.0").createFile()
-        val basePrefix = directory.resolve("prefix").createDirectory()
-        basePrefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+        val prefix = directory.resolve("prefix").createDirectory()
+        prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
 
         try {
             // when
             val found = pythonLibrary(
-                directory.toString(), "libpython3.13.so.1.0", basePrefix = basePrefix.toString(), linux = true
+                directory.toString(), "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = prefix.toString()
             )
 
             // then
@@ -904,8 +1017,10 @@ class PythonEnvironmentTest {
     fun `should not find libpython in lib directory of base prefix other than of its soname`() {
         // given
         // of another Python version, a static libpython, or the linker name of the shared one
-        val basePrefix = createTempDirectory("python-library")
-        val lib = basePrefix.resolve("lib").createDirectory()
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val lib = prefix.resolve("lib").createDirectory()
         lib.resolve("libpython3.12.so.1.0").createFile()
         lib.resolve("libpython3.13.a").createFile()
         lib.resolve("libpython3.13.so").createFile()
@@ -914,37 +1029,18 @@ class PythonEnvironmentTest {
         try {
             // when
             val shared = pythonLibrary(
-                "/install/lib", "libpython3.13.so.1.0", basePrefix = basePrefix.toString(), linux = true
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
             )
             val static = pythonLibrary(
-                "/install/lib", "libpython3.13.a", basePrefix = basePrefix.toString(), linux = true
+                "$buildPrefix/lib", "libpython3.13.a",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
             )
 
             // then
             assert(shared == null && static == null)
         } finally {
-            basePrefix.deleteRecursively()
-        }
-    }
-
-    @OptIn(ExperimentalPathApi::class)
-    @Test
-    fun `should not find libpython in lib directory of base prefix other than on Linux`() {
-        // given
-        // e.g. on macOS, where the loader finds a framework by its install name, and loadPythonLibrary does nothing
-        val basePrefix = createTempDirectory("python-library")
-        basePrefix.resolve("lib").createDirectory().resolve("libpython3.13.dylib").createFile()
-
-        try {
-            // when
-            val found = pythonLibrary(
-                "/install/lib", "libpython3.13.dylib", basePrefix = basePrefix.toString(), linux = false
-            )
-
-            // then
-            assert(found == null)
-        } finally {
-            basePrefix.deleteRecursively()
+            directory.deleteRecursively()
         }
     }
 
