@@ -24,6 +24,9 @@ as `PythonEnvironment` loads its `libpython` before `libjep.so` ([#54](https://g
 `actions/setup-python` sets `LD_LIBRARY_PATH` on CI anyway,
 so `PythonLibraryTest` removes it in the JVM it starts, to test the loading with such a base Python,
 importing a C extension it compiles with `cc`, which tests nothing with a Python of the system library directories.
+It also puts only the soname of such a `libpython` on `LD_LIBRARY_PATH`, without its development symlink,
+like a Python of the system without its development package ([#77](https://github.com/xemantic/xemantic-kotlin-script-python/issues/77)),
+which cannot be simulated with a Python of the system, whose development symlink the loader finds in the system library directories.
 `pyenv` builds Python without a shared `libpython` by default,
 build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
 On Java 17 to 21, also set `LD_LIBRARY_PATH` then, for a C extension imported at the startup of Python, see the README.

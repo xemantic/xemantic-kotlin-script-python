@@ -29,6 +29,7 @@ import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectory
 import kotlin.io.path.createFile
+import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
@@ -254,7 +255,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with output before and after values`() {
         // given
-        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")}\nmore noise"
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")}\nmore noise"
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -268,7 +269,7 @@ class PythonEnvironmentTest {
         // given
         val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
             "${PythonEnvironment.PROBE_BEGIN}\n" +
-            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -280,7 +281,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with empty first value`() {
         // given
-        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "")
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -292,7 +293,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with values containing spaces and non-ASCII`() {
         // given
-        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "")
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -302,10 +303,11 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should parse probe output with library directory and soname of libpython`() {
+    fun `should parse probe output with library directory, soname and development symlink of libpython`() {
         // given
         val output = probePayload(
-            "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1", "/opt/python/lib", "libpython3.13.so.1.0"
+            "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1",
+            "/opt/python/lib", "libpython3.13.so.1.0", "libpython3.13.so"
         )
 
         // when
@@ -317,7 +319,8 @@ class PythonEnvironmentTest {
                 "/venv/bin/python", "cpython-313", "/venv", "/venv/jep",
                 externallyManaged = true,
                 libraryDirectory = "/opt/python/lib",
-                librarySoname = "libpython3.13.so.1.0"
+                librarySoname = "libpython3.13.so.1.0",
+                libraryDevelopmentName = "libpython3.13.so"
             )
         )
     }
@@ -351,7 +354,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
             .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
@@ -362,10 +365,10 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should not parse probe output without exactly seven values`() {
+    fun `should not parse probe output without exactly eight values`() {
         // given
-        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "")
-        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "extra")
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "extra")
 
         // when
         val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
@@ -938,6 +941,68 @@ class PythonEnvironmentTest {
         } finally {
             directory.deleteRecursively()
         }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds development symlink of libpython by its name`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+        directory.resolve("libxemantic-test.so").createSymbolicLinkPointingTo(library.fileName)
+        val sonameOnly = directory.resolve("soname-only").createDirectory()
+        sonameOnly.resolve("libxemantic-test.so.1").createSymbolicLinkPointingTo(library)
+
+        try {
+            // when
+            val found = loaderFinds(library, "libxemantic-test.so", libraryPath = "$directory", cache = { null })
+            val missing = loaderFinds(library, "libxemantic-test.so", libraryPath = "$sonameOnly", cache = { null })
+
+            // then
+            assert(found && !missing)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should tell that Jep loads libpython globally only when loader finds its soname and development symlink`() {
+        // given
+        val library = Path("/usr/lib/libpython3.13.so.1.0")
+        fun loadsGlobally(foundNames: Set<String>, developmentName: String = "libpython3.13.so") =
+            jepLoadsGlobally(library, developmentName, finds = { name -> name in foundNames })
+
+        // when
+        val both = loadsGlobally(setOf("libpython3.13.so.1.0", "libpython3.13.so"))
+        // e.g. of a Python of the system without its development package
+        val sonameOnly = loadsGlobally(setOf("libpython3.13.so.1.0"))
+        val developmentSymlinkOnly = loadsGlobally(setOf("libpython3.13.so"))
+        val unknownDevelopmentName = loadsGlobally(setOf("libpython3.13.so.1.0", ""), developmentName = "")
+
+        // then
+        assert(both && !sonameOnly && !developmentSymlinkOnly && !unknownDevelopmentName)
+    }
+
+    @Test
+    fun `should advise development package providing development symlink of libpython to make its symbols global`() {
+        // given
+        val library = Path("/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0")
+
+        // when
+        val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.so")
+        val adviceWithoutDevelopmentName = pythonLibraryGlobalAdvice(library, "")
+
+        // then
+        assert(
+            advice == "put /usr/lib/x86_64-linux-gnu on LD_LIBRARY_PATH before the JVM starts, " +
+                "unless it is a directory the dynamic loader searches anyway, " +
+                "and if libpython3.12.so is missing there, install the development package of this Python " +
+                "which provides it, e.g. libpython3.X-dev on Debian or Ubuntu"
+        )
+        assert(
+            adviceWithoutDevelopmentName == "put /usr/lib/x86_64-linux-gnu on LD_LIBRARY_PATH before the JVM starts, " +
+                "unless it is a directory the dynamic loader searches anyway"
+        )
     }
 
     @OptIn(ExperimentalPathApi::class)
