@@ -200,6 +200,18 @@ otherwise the code can declare it as a dependency, see below.
   so that pip does not replace it with a distribution from the index required by the other one.
   To update a branch, or a remote archive changing its content under the same URL,
   change the URL — for example, pin the commit — or delete the dependency directory.
+  An installed dependency is also installed again when one of its requirements, also a transitive one,
+  is no longer satisfied by what is installed,
+  e.g. when code declaring `demo==1.0` replaced the `demo 2.0` which an earlier dependency requires,
+  so code with conflicting requirements replaces the versions installed for the other one back and forth.
+  The installation is attempted also when the unsatisfied requirement cannot be installed,
+  as the replacing version is already imported, and so kept,
+  or a distribution of the Python environment, whose version is always kept, no longer satisfies it,
+  e.g. after upgrading the environment —
+  then it fails with the conflict, instead of the code failing later.
+  A direct URL requirement of an installed dependency is satisfied by a distribution installed from the same URL,
+  whatever its revision or content,
+  and the requirements of extras are not checked.
   When pip replaces a distribution with another version of it,
   it leaves the `dist-info` directory of the replaced version beside the new one,
   which is removed after the installation, as it was not written by it.
