@@ -1459,40 +1459,89 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should plan installed dependency with METADATA not in UTF-8 as missing`() {
+    fun `should plan installed dependency with METADATA not in UTF-8 as installed in version of its dist-info name`() {
+        withDistInfos { directory ->
+            // given
+            // uv takes it as installed too, so it would not write it again, and it would be planned again on every use
+            writeDistInfo(directory, "1.0")
+            writeMetadataNotInUtf8(directory, "1.0")
+
+            // when
+            val installs = planInstalls(directory, "replaced-probe==1.0")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency with METADATA not in UTF-8 as missing for other version than of its dist-info name`() {
         withDistInfos { directory ->
             // given
             writeDistInfo(directory, "1.0")
             writeMetadataNotInUtf8(directory, "1.0")
 
             // when
-            val installs = planInstalls(directory, "replaced-probe")
+            val installs = planInstalls(directory, "replaced-probe>=2")
 
             // then
-            assert(installs == listOf("replaced-probe"))
+            assert(installs == listOf("replaced-probe>=2"))
         }
     }
 
     @Test
-    fun `should plan installed dependency without METADATA as missing`() {
+    fun `should plan installed dependency without METADATA as installed in version of its dist-info name`() {
         withDistInfos { directory ->
             // given
+            // uv fails on it with "Failed to read metadata", so it is not to be installed again
             writeDistInfo(directory, "1.0")
             directory.resolve("replaced_probe-1.0.dist-info/METADATA").deleteIfExists()
 
             // when
-            val installs = planInstalls(directory, "replaced-probe")
+            val installs = planInstalls(directory, "replaced-probe==1.0")
 
             // then
-            assert(installs == listOf("replaced-probe"))
+            assert(installs.isEmpty())
         }
     }
 
     @Test
-    fun `should plan installed dependency as missing when METADATA of its requirement is not in UTF-8`() {
+    fun `should plan installed dependency of METADATA without version as installed in version of its dist-info name`() {
         withDistInfos { directory ->
             // given
-            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("replaced-probe"))
+            writeDistInfo(directory, "1.0")
+            directory.resolve("replaced_probe-1.0.dist-info/METADATA")
+                .writeText("Metadata-Version: 2.1\nName: replaced-probe\n")
+
+            // when
+            val installs = planInstalls(directory, "replaced-probe==1.0")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as installed when its requirement of METADATA not in UTF-8 is satisfied by version of its dist-info name`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("replaced-probe>=1"))
+            writeDistInfo(directory, "1.0")
+            writeMetadataNotInUtf8(directory, "1.0")
+
+            // when
+            val installs = planInstalls(directory, "requiring-probe")
+
+            // then
+            assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should plan installed dependency as missing when its requirement of METADATA not in UTF-8 is not satisfied by version of its dist-info name`() {
+        withDistInfos { directory ->
+            // given
+            writeDistInfo(directory, "1.0", name = "requiring-probe", requires = listOf("replaced-probe>=2"))
             writeDistInfo(directory, "1.0")
             writeMetadataNotInUtf8(directory, "1.0")
 
@@ -1505,28 +1554,40 @@ class PythonDependenciesTest {
     }
 
     @Test
-    fun `should plan URL dependency as missing for direct_url_json not in UTF-8`() {
+    fun `should plan installed dependency as installed next to dist-info of environment with unreadable METADATA`() {
         withDistInfos { directory ->
             // given
-            writeDistInfo(directory, "1.0", directUrl = "{}")
-            // satisfying it, but for the ÿ encoded in ISO-8859-1
-            val directUrl = """{"url": "https://example.com/probe-1.0.tar.gz", "archive_info": {}, "note": "ÿ"}"""
-            directory.resolve("replaced_probe-1.0.dist-info/direct_url.json").writeBytes(directUrl.toByteArray(Charsets.ISO_8859_1))
+            // the environment comes before the dependency directory on sys.path, so its dist-info is found first
+            val environment = directory.resolve("environment")
+            listOf("1.0" to null, "2.0" to "Metadata-Version: 2.1\nName: replaced-probe\n").forEach { (version, metadata) ->
+                writeDistInfo(environment, version)
+                val file = environment.resolve("replaced_probe-$version.dist-info/METADATA")
+                if (metadata == null) file.deleteIfExists() else file.writeText(metadata)
+            }
+            writeDistInfo(environment, "3.0")
+            writeMetadataNotInUtf8(environment, "3.0")
+            writeDistInfo(directory, "4.0")
+            val code = "import sys; sys.path.insert(0, r'$environment')\n" + PythonDependencies.PLAN
 
             // when
-            val installs = planInstalls(directory, "replaced-probe @ https://example.com/probe-1.0.tar.gz")
+            val installs = PythonDependencies.plan(
+                "dependencies = ['replaced-probe==4.0']\n",
+                directory.toString(),
+                emptyList(),
+                pythonCommand(PythonEnvironment.executable, code, directory.toString())
+            ).filter { it.first == "install" }
 
             // then
-            assert(installs == listOf("replaced-probe @ https://example.com/probe-1.0.tar.gz"))
+            assert(installs.isEmpty())
         }
     }
 
     @Test
-    fun `should not constrain imported distribution with METADATA not in UTF-8`() {
+    fun `should constrain imported distribution with METADATA not in UTF-8 to version of its dist-info name`() {
         // given
         withDistInfos { directory ->
             val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
-            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
             writeDistInfo(directory, "1.0", modules)
             writeMetadataNotInUtf8(directory, "1.0")
 
@@ -1534,26 +1595,25 @@ class PythonDependenciesTest {
             val constraints = importedConstraints(directory)
 
             // then
-            assert(constraints.isEmpty())
+            assert(constraints == listOf("replaced-probe==1.0"))
         }
     }
 
     @Test
-    fun `should constrain imported distribution to version of METADATA in UTF-8 next to dist-info of METADATA not in UTF-8`() {
+    fun `should constrain imported distribution to version of dist-info name of METADATA not in UTF-8 next to stale dist-info`() {
         // given
-        // 2.0 records more of the installed modules, but its version cannot be read
+        // 2.0 replaced the module of 1.0, whose dist-info is left
         withDistInfos { directory ->
-            val modules = mapOf("replaced_probe/__init__.py" to "", "replaced_probe/added.py" to "")
-            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
-            writeDistInfo(directory, "1.0", modules.filterKeys { it.endsWith("__init__.py") })
-            writeDistInfo(directory, "2.0", modules)
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 2\n")
+            writeDistInfo(directory, "1.0", mapOf("replaced_probe/__init__.py" to "X = 1\n"))
+            writeDistInfo(directory, "2.0", mapOf("replaced_probe/__init__.py" to "X = 2\n"))
             writeMetadataNotInUtf8(directory, "2.0")
 
             // when
             val constraints = importedConstraints(directory)
 
             // then
-            assert(constraints == listOf("replaced-probe==1.0"))
+            assert(constraints == listOf("replaced-probe==2.0"))
         }
     }
 
