@@ -20,6 +20,9 @@ package com.xemantic.kotlin.script.python
 
 import java.io.IOException
 import java.lang.invoke.MethodHandle
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.util.Optional
@@ -42,11 +45,26 @@ internal fun foreignLinkerEnabled(): Boolean = !java.lang.Boolean.getBoolean(NO_
 
 /**
  * The shared `libpython` of the [soname] in the library [directory] of a Python, see [PythonEnvironment.probeCommand],
- * or `null` if there is none, e.g. of a Python linked to `libpython` statically, with `libpython3.X.a` as its soname.
+ * or `null` if there is none.
+ *
+ * A Python linked to `libpython` statically has `libpython3.X.a` as its soname,
+ * but might ship the shared library as well, e.g. conda-forge, without the static one,
+ * so that the native library of Jep links to the shared one:
+ * it is taken if the sonames [jepNeeded] by the native library of Jep, see [readElfDynamic], read only for a static [soname],
+ * have exactly one of the version and ABI of the [soname], e.g. `libpython3.12.so.1.0`, and it is in the [directory].
  */
-internal fun pythonLibrary(directory: String, soname: String): Path? {
-    if (directory.isEmpty() || soname.isEmpty() || soname.endsWith(".a")) return null
-    return Path(directory, soname).takeIf { it.isRegularFile() }
+internal fun pythonLibrary(
+    directory: String,
+    soname: String,
+    jepNeeded: () -> List<String>? = { null }
+): Path? {
+    if (directory.isEmpty() || soname.isEmpty()) return null
+    val name = if (soname.endsWith(".a")) {
+        val stem = soname.removeSuffix(".a")
+        jepNeeded()?.filter { (it == "$stem.so" || it.startsWith("$stem.so.")) && '/' !in it }?.singleOrNull()
+            ?: return null
+    } else soname
+    return Path(directory, name).takeIf { it.isRegularFile() }
 }
 
 /**
@@ -109,12 +127,21 @@ internal fun loadPythonLibrary(
  * the development symlink, missing when its development package is not installed, e.g. removed after building Jep,
  * so that this `dlopen` fails, and the symbols stay local, as they always do with a static `libpython3.X.a`, or none;
  * [finds] tells whether the loader finds the [library] by a name.
+ * The [jepDynamic] section of the native library of Jep must have no search path of its own, see [ElfDynamic.searchPath],
+ * with which the loader might take another file than [finds] tells.
+ * The [jepDynamic] and the [developmentName] are read only if the loader finds the [library] by its soname,
+ * which usually decides, and the [developmentName] only after the [jepDynamic], as it reads the whole native library.
  */
 internal fun jepLoadsGlobally(
     library: Path,
-    developmentName: String,
+    jepDynamic: () -> ElfDynamic?,
+    developmentName: () -> String,
     finds: (name: String) -> Boolean = loaderFinder(library)
-): Boolean = jepOpensShared(developmentName) && finds(library.fileName.toString()) && finds(developmentName)
+): Boolean {
+    if (!finds(library.fileName.toString()) || jepDynamic()?.searchPath != false) return false
+    val name = developmentName()
+    return jepOpensShared(name) && finds(name)
+}
 
 /**
  * Whether the [developmentName] of [jepLibraryName] is the one of a shared library, which `dlopen` can open,
@@ -145,6 +172,121 @@ internal fun jepLibraryName(jepLibrary: Path): String {
 /** A null-terminated string of the name of a `libpython`, preceded by the end of another one, see [jepLibraryName]. */
 private val JEP_LIBRARY_NAME = Regex("(?<=\u0000)libpython[^\u0000/]*\\.(?:so|a)(?=\u0000)")
 
+/**
+ * The dynamic section of an ELF library, see [readElfDynamic].
+ *
+ * @property needed the sonames of the libraries it needs, of its `DT_NEEDED` entries, in their order.
+ * @property searchPath whether it has a search path of its own, a `DT_RPATH`, which the dynamic loader searches
+ * even before `LD_LIBRARY_PATH`, or a `DT_RUNPATH`, searched before `ld.so.cache`, e.g. of a conda build.
+ */
+internal class ElfDynamic(val needed: List<String>, val searchPath: Boolean)
+
+/**
+ * The dynamic section of the ELF [library], or `null` if it cannot be read, e.g. of a file which is not an ELF library.
+ *
+ * It is parsed like the dynamic loader does, from the program headers, not the section headers, which can be stripped:
+ * the `PT_DYNAMIC` segment, and its string table `DT_STRTAB`, a virtual address, mapped to its offset in the file
+ * by the `PT_LOAD` segment which contains it.
+ * Only the few parts needed are read, not the whole library.
+ */
+internal fun readElfDynamic(library: Path): ElfDynamic? = try {
+    FileChannel.open(library).use { readElfDynamic(it) }
+} catch (_: IOException) {
+    null
+} catch (_: RuntimeException) {
+    // e.g. a BufferUnderflowException, or an IllegalArgumentException of a negative size, of a malformed file
+    null
+}
+
+private fun readElfDynamic(channel: FileChannel): ElfDynamic? {
+    val identification = channel.readAt(0, 16, ByteOrder.LITTLE_ENDIAN) ?: return null
+    if (identification.getInt(0) != 0x464c457f) return null
+    val is64 = when (identification.get(4).toInt()) {
+        1 -> false
+        2 -> true
+        else -> return null
+    }
+    val order = when (identification.get(5).toInt()) {
+        1 -> ByteOrder.LITTLE_ENDIAN
+        2 -> ByteOrder.BIG_ENDIAN
+        else -> return null
+    }
+    val header = channel.readAt(0, if (is64) 64 else 52, order) ?: return null
+    fun ByteBuffer.word(at: Int): Long = if (is64) getLong(at) else getInt(at).toUInt().toLong()
+    val programHeaderOffset = header.word(if (is64) 32 else 28)
+    val programHeaderSize = header.getShort(if (is64) 54 else 42).toUShort().toInt()
+    val programHeaderCount = header.getShort(if (is64) 56 else 44).toUShort().toInt()
+    if (programHeaderSize < (if (is64) 56 else 32)) return null
+    val programHeadersSize = (programHeaderSize.toLong() * programHeaderCount).toIntSize() ?: return null
+    val programHeaders = channel.readAt(programHeaderOffset, programHeadersSize, order) ?: return null
+    // offset, virtual address, size in the file
+    val loads = mutableListOf<Triple<Long, Long, Long>>()
+    var dynamic: Pair<Long, Long>? = null
+    for (index in 0 until programHeaderCount) {
+        val at = index * programHeaderSize
+        val offset = programHeaders.word(at + if (is64) 8 else 4)
+        val address = programHeaders.word(at + if (is64) 16 else 8)
+        val size = programHeaders.word(at + if (is64) 32 else 16)
+        when (programHeaders.getInt(at)) {
+            PT_LOAD -> loads += Triple(offset, address, size)
+            PT_DYNAMIC -> dynamic = offset to size
+        }
+    }
+    val (dynamicOffset, dynamicSize) = dynamic ?: return null
+    val entries = channel.readAt(dynamicOffset, dynamicSize.toIntSize() ?: return null, order) ?: return null
+    val entrySize = if (is64) 16 else 8
+    val neededOffsets = mutableListOf<Long>()
+    var searchPath = false
+    var stringTableAddress: Long? = null
+    var stringTableSize: Long? = null
+    for (at in 0..entries.limit() - entrySize step entrySize) {
+        val value = entries.word(at + entrySize / 2)
+        when (entries.word(at)) {
+            DT_NULL -> break
+            DT_NEEDED -> neededOffsets += value
+            DT_STRTAB -> stringTableAddress = value
+            DT_STRSZ -> stringTableSize = value
+            DT_RPATH, DT_RUNPATH -> searchPath = true
+        }
+    }
+    val address = stringTableAddress ?: return null
+    val size = stringTableSize?.toIntSize() ?: return null
+    val load = loads.firstOrNull { (_, start, length) -> address >= start && address - start < length } ?: return null
+    val strings = channel.readAt(load.first + (address - load.second), size, order) ?: return null
+    val needed = neededOffsets.map { offset ->
+        if (offset < 0 || offset >= size) return null
+        val start = offset.toInt()
+        val end = (start until size).firstOrNull { strings.get(it).toInt() == 0 } ?: return null
+        String(ByteArray(end - start) { strings.get(start + it) }, Charsets.ISO_8859_1)
+    }
+    return ElfDynamic(needed, searchPath)
+}
+
+/** The [size] bytes at the [offset] of the [FileChannel], or `null` if the file ends before. */
+private fun FileChannel.readAt(offset: Long, size: Int, order: ByteOrder): ByteBuffer? {
+    if (offset < 0 || size < 0) return null
+    val buffer = ByteBuffer.allocate(size)
+    while (buffer.hasRemaining()) {
+        if (read(buffer, offset + buffer.position()) < 0) return null
+    }
+    return buffer.flip().order(order)
+}
+
+/** The size as an [Int], or `null` if it is beyond the [MAX_ELF_PART_SIZE], of a malformed library. */
+private fun Long.toIntSize(): Int? = takeIf { it in 0..MAX_ELF_PART_SIZE }?.toInt()
+
+/** The largest part of an ELF library read by [readElfDynamic]. */
+private const val MAX_ELF_PART_SIZE = 16L * 1024 * 1024
+
+private const val PT_LOAD = 1
+private const val PT_DYNAMIC = 2
+private const val DT_NULL = 0L
+private const val DT_NEEDED = 1L
+private const val DT_STRTAB = 5L
+private const val DT_STRSZ = 10L
+private const val DT_RPATH = 15L
+private const val DT_RUNPATH = 29L
+
 /** [loaderFinds] of the [library] by a name, reading the cache of the loader at most once for all the names. */
 private fun loaderFinder(library: Path): (name: String) -> Boolean {
     val cache by lazy(::readLoaderCache)
@@ -155,11 +297,24 @@ private fun loaderFinder(library: Path): (name: String) -> Boolean {
  * How to have the symbols of the [library] made global by Jep, before the startup of Python,
  * when [loadPythonLibrary] cannot, or only after the startup, on Java 17 to 21:
  * the dynamic loader has to find the [library] by its soname, and by its [developmentName], see [jepLoadsGlobally].
- * If Jep cannot, without a [developmentName] of a shared library, the [library] has to be preloaded with global symbols.
+ * If Jep cannot, with the [developmentName] of a static library, or might not, with an unknown, empty one,
+ * the [library] has to be loaded with global symbols before Python starts:
+ * on Java 22 or newer by [loadPythonLibrary], unless native access is denied,
+ * or by the loader itself, with `LD_PRELOAD`, which the processes started by the JVM inherit as well,
+ * e.g. another Python, which would then have the symbols of this `libpython` instead of its own.
  */
 internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): String =
     if (!jepOpensShared(developmentName)) {
-        "put $library on LD_PRELOAD before the JVM starts, as Jep does not make its symbols global with this Python"
+        val reason = if (developmentName.isEmpty()) {
+            "if Jep does not make its symbols global with this Python, which its native library does not tell for certain"
+        } else {
+            "as Jep does not make its symbols global with this Python"
+        }
+        "run the JVM on Java 22 or newer with --enable-native-access=ALL-UNNAMED, " +
+            "which loads $library with global symbols before Python starts, " +
+            "or put it on LD_PRELOAD, $reason, " +
+            "set only for the launch of the JVM, e.g. LD_PRELOAD=$library java ..., " +
+            "as every process the JVM starts, e.g. pip, inherits LD_PRELOAD"
     } else {
         "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts, " +
             "unless it is a directory the dynamic loader searches anyway, and if $developmentName is missing there, " +
@@ -189,7 +344,7 @@ internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): 
  *   as they differ between distributions, e.g. `/usr/lib/x86_64-linux-gnu` of Debian, `/usr/lib64` of Fedora.
  *
  * It does not know the other rules of the loaders, with which it might tell that it finds a library it would not:
- * the `RUNPATH` of the native library of Jep, e.g. of conda, with which the library would be loaded when not needed,
+ * the `RPATH` or `RUNPATH` of the library which needs the [name], which [jepLoadsGlobally] checks itself,
  * the legacy hwcaps subdirectories of glibc before 2.37, e.g. `tls` or `haswell`,
  * and the default directories of musl, with `/usr/local/lib`, or the ones of its `/etc/ld-musl-*.path`,
  * as telling musl from glibc is not certain either, e.g. the loader of musl can be installed on a glibc system.

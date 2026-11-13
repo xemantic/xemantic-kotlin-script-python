@@ -73,15 +73,22 @@ The Python code imports the modules from the same paths as this executable,
 e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
 
 The native library of `jep` links to the shared `libpython` of the Python, e.g. `libpython3.13.so.1.0`,
-which on Linux the dynamic loader finds by its soname in the directories of `LD_LIBRARY_PATH`, of `ld.so.cache`, and the system ones,
-unless the native library of `jep` has a `RUNPATH` of it, e.g. in conda.
-For a Python installed elsewhere, e.g. by `uv python install`, pyenv, or in a custom prefix,
-the library loads `libpython` from the `LIBDIR` of the Python's `sysconfig` itself, with its symbols global,
+which on Linux the dynamic loader finds by its soname in the directories of `LD_LIBRARY_PATH`, of `ld.so.cache`, and its default ones,
+unless the native library of `jep` has an `RPATH` or `RUNPATH` of its own, e.g. in conda.
+The library loads `libpython` from the `LIBDIR` of the Python's `sysconfig` itself, with its symbols global,
 as C extension modules, e.g. of numpy, need them,
-so that `LD_LIBRARY_PATH` is not needed.
-It does the same when the loader finds `libpython`, but not its development symlink, e.g. `libpython3.12.so`,
-by which `jep` makes the symbols global itself,
-e.g. of a Python of the system without its development package, like `libpython3.12-dev` on Debian.
+unless it is certain that the loader finds this very file, and that `jep` makes its symbols global,
+so that `LD_LIBRARY_PATH` is not needed,
+e.g. for a Python installed by `uv python install`, pyenv, or in a custom prefix.
+Loading it when not needed is harmless, so whenever it cannot be told for certain, it is loaded:
+for a file found only in a default directory of the loader, which differ between distributions,
+for another file of the same name which the loader might take instead,
+or when the native library of `jep` has a search path of its own.
+`jep` makes the symbols global itself by the development symlink of `libpython`, e.g. `libpython3.12.so`,
+which is missing for a Python of the system without its development package, like `libpython3.12-dev` on Debian.
+A Python linked to `libpython` statically, e.g. of conda-forge, has `libpython3.12.a` in its `sysconfig`,
+though it might ship the shared library as well, which `jep` then links to:
+the library loads it, if it is in the `LIBDIR`, as the one of the soname which the native library of `jep` needs.
 On Java 22 or newer, it does so with the foreign linker, a restricted method,
 which, like loading the native library of `jep` on Java 24 or newer, prints a warning without `--enable-native-access=ALL-UNNAMED`.
 On Java 17 to 21, the symbols become global only after the startup of Python,
@@ -89,6 +96,10 @@ so a C extension imported at the startup, by a `.pth` file of the `site-packages
 fails with an `undefined symbol`, unless the loader finds both `libpython` and its development symlink,
 which for a Python outside the system library directories means its `LIBDIR` on `LD_LIBRARY_PATH`,
 and for a Python of the system its development package.
+With a static `libpython`, `jep` does not make the symbols global at all,
+so on Java 17 to 21 a C extension imported at the startup needs the shared `libpython` on `LD_PRELOAD`,
+set only for the launch of the JVM, e.g. `LD_PRELOAD=/opt/conda/lib/libpython3.12.so.1.0 java ...`,
+as every process started by the JVM inherits it, e.g. `pip`, or another Python, which would then use the symbols of this `libpython`.
 If `libpython` is not found, e.g. on macOS, where it is not loaded so,
 put its directory, the `LIBDIR` of `sysconfig`, on `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS),
 set before the JVM starts, as the loader reads it only then.

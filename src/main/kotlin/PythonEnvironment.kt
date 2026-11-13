@@ -102,16 +102,21 @@ public object PythonEnvironment {
         val library = jepLibrary(Path(jepLocation), python, probe.externallyManaged)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
-        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
+        // read only when needed
+        val jepDynamic by lazy { readElfDynamic(library) }
+        val jepName = lazy { jepLibraryName(library) }
+        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname, jepNeeded = { jepDynamic?.needed })
         val linux = System.getProperty("os.name").startsWith("Linux")
-        val jepLibraryName = if (pythonLibrary != null && linux) jepLibraryName(library) else ""
         // only when needed, as the foreign linker prints a warning without --enable-native-access
-        val loading = if (pythonLibrary != null && linux && !jepLoadsGlobally(pythonLibrary, jepLibraryName)) {
+        val loading = if (
+            pythonLibrary != null && linux &&
+            !jepLoadsGlobally(pythonLibrary, jepDynamic = { jepDynamic }, developmentName = { jepName.value })
+        ) {
             loadPythonLibrary(pythonLibrary)
         } else PythonLibraryLoading()
         this.executable = executable
         starter = EmbeddedPythonStarter(
-            executable, probe.error, pythonLibrary, jepLibraryName, loading.failure, loading.localSymbols
+            executable, probe.error, pythonLibrary, { jepName.value }, loading.failure, loading.localSymbols
         )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -518,7 +523,7 @@ internal class EmbeddedPythonStarter(
     private val executable: String,
     private val probeError: String,
     private val pythonLibrary: Path? = null,
-    private val jepLibraryName: String = "",
+    private val jepLibraryName: () -> String = { "" },
     private val libraryPreloadFailure: Throwable? = null,
     libraryLocalSymbols: Boolean = false
 ) {
@@ -609,7 +614,7 @@ internal class EmbeddedPythonStarter(
                 System.Logger.Level.WARNING,
                 "Cannot make the symbols of $library global, " +
                     "a C extension module might fail to import with an undefined symbol; to have them global, " +
-                    pythonLibraryGlobalAdvice(library, jepLibraryName),
+                    pythonLibraryGlobalAdvice(library, jepLibraryName()),
                 e
             )
         }

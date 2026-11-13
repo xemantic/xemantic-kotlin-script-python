@@ -969,7 +969,12 @@ class PythonEnvironmentTest {
         // given
         val library = Path("/usr/lib/libpython3.13.so.1.0")
         fun loadsGlobally(foundNames: Set<String>, developmentName: String = "libpython3.13.so") =
-            jepLoadsGlobally(library, developmentName, finds = { name -> name in foundNames })
+            jepLoadsGlobally(
+                library,
+                jepDynamic = { ElfDynamic(listOf("libpython3.13.so.1.0"), searchPath = false) },
+                developmentName = { developmentName },
+                finds = { name -> name in foundNames }
+            )
 
         // when
         val both = loadsGlobally(setOf("libpython3.13.so.1.0", "libpython3.13.so"))
