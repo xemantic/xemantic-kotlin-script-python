@@ -24,6 +24,8 @@ import java.io.IOException
 import java.nio.file.Path
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectory
+import kotlin.io.path.createFile
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
@@ -41,6 +43,7 @@ import kotlin.test.Test
  * e.g. installed by uv or by `actions/setup-python`, which sets `LD_LIBRARY_PATH` itself,
  * as the test venv of such a base Python, see `-PbasePython` in DEVELOPMENT.md,
  * while with a Python of the system it passes anyway.
+ * Also the finding of the `libpython` of a Python, see [pythonLibrary].
  */
 class PythonLibraryTest {
 
@@ -132,12 +135,300 @@ class PythonLibraryTest {
 
     @OptIn(ExperimentalPathApi::class)
     @Test
+    fun `should find shared libpython in its library directory on Linux`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(directory.toString(), "libpython3.13.so.1.0")
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find static libpython`() {
+        // given
+        // a Python built without --enable-shared, e.g. by pyenv by default, has its libpython linked statically
+        val directory = createTempDirectory("python-library")
+        directory.resolve("libpython3.13.a").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(directory.toString(), "libpython3.13.a")
+
+            // then
+            assert(found == null)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find libpython missing from its library directory`() {
+        // given
+        val directory = createTempDirectory("python-library")
+
+        try {
+            // when
+            val missing = pythonLibrary(directory.toString(), "libpython3.13.so.1.0")
+            val unknownSoname = pythonLibrary(directory.toString(), "")
+            val unknownDirectory = pythonLibrary("", "libpython3.13.so.1.0")
+
+            // then
+            assert(missing == null && unknownSoname == null && unknownDirectory == null)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython of relocated Python in its library directory moved with its prefix`() {
+        // given
+        // e.g. a python-build-standalone not patched by uv reports /install/lib, a moved prefix its old path
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val library = prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython of relocated Python in its multiarch library directory before lib directory`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val lib = prefix.resolve("lib").createDirectory()
+        lib.resolve("libpython3.13.so.1.0").createFile()
+        val library = lib.resolve("x86_64-linux-gnu").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                "$buildPrefix/lib/x86_64-linux-gnu", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython of relocated Python in its library directory not under its build prefix`() {
+        // given
+        // e.g. built with --libdir outside of its exec_prefix, or reached through a symlink of its prefix,
+        // so that the library directory does not move with the prefix
+        val directory = createTempDirectory("python-library")
+        val libraries = directory.resolve("libraries").createDirectory()
+        val library = libraries.resolve("libpython3.13.so.1.0").createFile()
+        val prefix = directory.resolve("prefix").createDirectory()
+        prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                libraries.toString(), "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = directory.resolve("build").toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython of relocated Python in lib directory of its prefix when library directory not under its build prefix has none`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val library = prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                directory.resolve("libraries").toString(), "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = directory.resolve("build").toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find libpython in lib directory of prefix of Python which was not moved`() {
+        // given
+        // e.g. of a multilib host, with LIBDIR /usr/lib64, and only a 32-bit libpython in /usr/lib,
+        // which would fail to load, instead of the advice to put the directory of the library on LD_LIBRARY_PATH
+        val directory = createTempDirectory("python-library")
+        val prefix = directory.resolve("prefix").createDirectory()
+        prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                prefix.resolve("lib64").toString(), "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = prefix.toString()
+            )
+
+            // then
+            assert(found == null)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find libpython of same soname left in stale library directory of relocated Python`() {
+        // given
+        // of another installation of the same Python version at the prefix where this one was built
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build").createDirectory()
+        buildPrefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+        val prefix = directory.resolve("prefix").createDirectory()
+        val lib = prefix.resolve("lib").createDirectory()
+
+        try {
+            // when
+            val missing = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+            val library = lib.resolve("libpython3.13.so.1.0").createFile()
+            val found = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+
+            // then
+            assert(missing == null && found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find libpython in lib directory of base prefix when library directory has none and build prefix is unknown`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val library = prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                "${directory.resolve("build")}/lib", "libpython3.13.so.1.0", baseExecPrefix = prefix.toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should prefer libpython of library directory to one in lib directory of base prefix`() {
+        // given
+        // e.g. of Debian, with LIBDIR /usr/lib/x86_64-linux-gnu, and the base prefix /usr, where it was built
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libpython3.13.so.1.0").createFile()
+        val prefix = directory.resolve("prefix").createDirectory()
+        prefix.resolve("lib").createDirectory().resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(
+                directory.toString(), "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = prefix.toString()
+            )
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find libpython in lib directory of base prefix other than of its soname`() {
+        // given
+        // of another Python version, a static libpython, or the linker name of the shared one
+        val directory = createTempDirectory("python-library")
+        val buildPrefix = directory.resolve("build")
+        val prefix = directory.resolve("prefix").createDirectory()
+        val lib = prefix.resolve("lib").createDirectory()
+        lib.resolve("libpython3.12.so.1.0").createFile()
+        lib.resolve("libpython3.13.a").createFile()
+        lib.resolve("libpython3.13.so").createFile()
+        lib.resolve("libpython3.so").createFile()
+
+        try {
+            // when
+            val shared = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.so.1.0",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+            val static = pythonLibrary(
+                "$buildPrefix/lib", "libpython3.13.a",
+                baseExecPrefix = prefix.toString(), buildExecPrefix = buildPrefix.toString()
+            )
+
+            // then
+            assert(shared == null && static == null)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
     fun `should load libpython of relocated Python reporting stale library directory without LD_LIBRARY_PATH`() {
         // given
         assumeTrue(System.getProperty("os.name").startsWith("Linux"), "the libpython is loaded so only on Linux")
         val directory = createTempDirectory("python-relocated")
         try {
             val basePrefix = relocateBasePython(directory.resolve("python"))
+            val librarySoname = runProcess(
+                pythonCommand(venvPython, "import sysconfig\nprint(sysconfig.get_config_var('INSTSONAME'))"),
+                mergeErrorStream = false
+            ).output
             val venv = directory.resolve("venv")
             val created = runProcess(
                 listOf(basePrefix.resolve("bin").resolve("python3").toString(), "-I", "-m", "venv", "--without-pip", venv.toString())
@@ -154,13 +445,17 @@ class PythonLibraryTest {
             // when
             val (exitCode, output) = runInJvm(
                 EmbeddedPythonMain::class.java.name,
-                input = "import sys\nprint(sys.base_prefix, flush=True)",
+                // the libpython mapped into the process, which the loader might find elsewhere by its soname
+                input = "import sys\nprint(sys.base_prefix)\n" +
+                    "with open('/proc/self/maps') as maps:\n" +
+                    "    print(*sorted({line.split(None, 5)[-1].strip() for line in maps if 'libpython' in line}), " +
+                    "sep='\\n', flush=True)",
                 environment = mapOf("LD_LIBRARY_PATH" to null, "PYTHONPATH" to null, "VIRTUAL_ENV" to venv.toString()),
                 jvmArguments = listOf("-Dxemantic.kotlin.script.python.dependencyDirectory=${directory.resolve("dependencies")}")
             )
 
             // then
-            assert(output == basePrefix.toString())
+            assert(output == "$basePrefix\n${basePrefix.resolve("lib").resolve(librarySoname)}")
             assert(exitCode == 0)
         } finally {
             directory.deleteRecursively()

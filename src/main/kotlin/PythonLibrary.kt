@@ -43,10 +43,11 @@ internal fun foreignLinkerEnabled(): Boolean = !java.lang.Boolean.getBoolean(NO_
  * The `LIBDIR` of `sysconfig` is the one where the Python was built, at its [buildExecPrefix],
  * so a Python moved since reports a stale one, e.g. `/install/lib` of a python-build-standalone not installed by uv,
  * while its `libpython` moved with it, to its [baseExecPrefix], `sys.base_exec_prefix`, which CPython tells from its executable.
- * When the two differ, the [directory] is taken moved to the [baseExecPrefix] instead, e.g. also `lib64`,
- * and not as it is, where a library of the same soname might be the one of another installation.
- * Otherwise, or when the moved [directory] has none, e.g. not under the [buildExecPrefix],
- * it is the one of the `lib` directory of the [baseExecPrefix].
+ * When the two differ, the [directory] under the [buildExecPrefix] is taken moved to the [baseExecPrefix] instead,
+ * e.g. also `lib64`, and not as it is, where a library of the same soname might be the one of another installation,
+ * while a [directory] not under it, e.g. of `--libdir`, did not move with the prefix, and is taken as it is.
+ * Then, when the Python is moved, or its [buildExecPrefix] unknown, it is the one of the `lib` directory of the [baseExecPrefix],
+ * but not otherwise, e.g. with the `LIBDIR` `/usr/lib64` of a multilib host, whose `/usr/lib` has a 32-bit one.
  * Only a library of the [soname] is taken, not e.g. `libpython3.X.so` or `libpython3.so`,
  * as the native library of Jep is linked to the soname, which the dynamic loader then finds already loaded,
  * and so never the library of another Python version.
@@ -58,17 +59,20 @@ internal fun pythonLibrary(
     buildExecPrefix: String = ""
 ): Path? {
     if (soname.isEmpty() || soname.endsWith(".a")) return null
-    val relocated = baseExecPrefix.isNotEmpty() && buildExecPrefix.isNotEmpty() &&
-        Path(baseExecPrefix).normalize() != Path(buildExecPrefix).normalize()
+    val buildPrefix = if (buildExecPrefix.isEmpty()) null else Path(buildExecPrefix).normalize()
+    val relocated = baseExecPrefix.isNotEmpty() && buildPrefix != null && Path(baseExecPrefix).normalize() != buildPrefix
     val libraryDirectory = when {
         directory.isEmpty() -> null
-        !relocated -> Path(directory)
-        else -> Path(directory).normalize().takeIf { it.startsWith(Path(buildExecPrefix).normalize()) }?.let {
-            Path(baseExecPrefix).resolve(Path(buildExecPrefix).normalize().relativize(it))
-        }
+        relocated && Path(directory).normalize().startsWith(buildPrefix) ->
+            Path(baseExecPrefix).resolve(buildPrefix.relativize(Path(directory).normalize()))
+        else -> Path(directory)
     }
-    val inPrefixLib = if (baseExecPrefix.isEmpty()) null else Path(baseExecPrefix, "lib")
-    return listOfNotNull(libraryDirectory, inPrefixLib).map { it.resolve(soname) }.firstOrNull { it.isRegularFile() }
+    val inPrefixLib = if (baseExecPrefix.isNotEmpty() && (relocated || buildPrefix == null)) {
+        Path(baseExecPrefix, "lib")
+    } else null
+    return listOfNotNull(libraryDirectory, inPrefixLib).distinct()
+        .map { it.resolve(soname) }
+        .firstOrNull { it.isRegularFile() }
 }
 
 /**
