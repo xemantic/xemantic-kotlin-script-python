@@ -50,7 +50,7 @@ internal fun foreignLinkerEnabled(): Boolean = !java.lang.Boolean.getBoolean(NO_
  * A Python linked to `libpython` statically has `libpython3.X.a` as its soname,
  * but might ship the shared library as well, e.g. conda-forge, without the static one,
  * so that the native library of Jep links to the shared one:
- * it is taken if the sonames [jepNeeded] by the native library of Jep, see [readElfDynamic], read only for a static [soname],
+ * it is taken if the sonames [jepNeeded] by the native library of Jep, see [readElfDynamic],
  * have exactly one of the version and ABI of the [soname], e.g. `libpython3.12.so.1.0`, and it is in the [directory].
  * A shared [soname] is not taken if the native library of Jep needs another `libpython`, of a Jep built for another Python,
  * which would not load the one of the [soname] anyway.
@@ -343,7 +343,8 @@ internal fun pythonLibraryGlobalAdvice(
                 "which loads $beforeStartup"
             !foreignLinker -> "run the JVM without -D$NO_FOREIGN_LINKER_PROPERTY=true, " +
                 "with which the foreign linker loads $beforeStartup"
-            else -> "run the JVM with --enable-native-access=ALL-UNNAMED, as the foreign linker failed to load $beforeStartup"
+            else -> "the foreign linker failed to load $beforeStartup: " +
+                "run the JVM with --enable-native-access=ALL-UNNAMED, if not already set"
         }
         "$withoutPreload, or put it on LD_PRELOAD, $reason, " +
             "set only for the launch of the JVM, e.g. LD_PRELOAD=$library java ..., " +
@@ -359,8 +360,7 @@ internal fun pythonLibraryGlobalAdvice(
  * Whether the dynamic loader finds the [library] by the [name], its soname by default, as the same file,
  * see [jepLoadsGlobally].
  *
- * Like the loader of glibc, it takes the first file of the name in the [jvmDirectories], see [jvmSearchDirectories],
- * in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
+ * Like the loader of glibc, it takes the first file of the name in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
  * a relative one in the [workingDirectory], by default the one of the process, not changed by setting `user.dir`,
  * and then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
  * of the directories configured in `/etc/ld.so.conf`, read only if needed.
@@ -372,7 +372,8 @@ internal fun pythonLibraryGlobalAdvice(
  * - a `;` in `LD_LIBRARY_PATH`, at which glibc splits it as well, but musl does not;
  * - a `$` in `LD_LIBRARY_PATH`, of `$ORIGIN`, `$LIB` or `$PLATFORM`, which glibc expands;
  * - a path which is not valid in the JVM, e.g. not in the encoding of the file system;
- * - [jvmDirectories] which cannot be told;
+ * - another file of the [name] in the [jvmDirectories], also in their `glibc-hwcaps`, or [jvmDirectories] which cannot be told,
+ *   see [jvmSearchDirectories], which glibc might search before `LD_LIBRARY_PATH`;
  * - a file of the [name] in a subdirectory of `glibc-hwcaps` of a searched directory, also in the cache,
  *   which glibc takes first, if the CPU supports its level, e.g. `x86-64-v3`;
  * - different files of the [name] in the cache, whose order is not the one of their priority to the loader;
@@ -407,9 +408,11 @@ private fun loaderFindsValidPaths(
     workingDirectory: Path,
     jvmDirectories: () -> List<Path>?
 ): Boolean {
+    // only a veto, as glibc might not search them, e.g. java.home/lib, see jvmSearchDirectories
     for (directory in jvmDirectories() ?: return false) {
+        if (hasHwcapsLibrary(directory, name)) return false
         val candidate = directory.resolve(name)
-        if (candidate.exists()) return isSameFile(candidate, library)
+        if (candidate.exists() && !isSameFile(candidate, library)) return false
     }
     if (libraryPath != null && (';' in libraryPath || '$' in libraryPath)) return false
     // an empty LD_LIBRARY_PATH has no entries, rather than an empty one
@@ -432,7 +435,8 @@ private fun loaderFindsValidPaths(
  * those of the JVM, e.g. `$ORIGIN` of `libjli.so`, and of the JVM [executable], e.g. `$ORIGIN:$ORIGIN/../lib` of `java`.
  * They are taken as the ones of the [executable], with its `RUNPATH` as well, which glibc would ignore,
  * and the `lib` directory of the [javaHome], as the libraries of the JVM in between are not known.
- * A `RUNPATH`, or `RPATH`, which is not absolute, or has a `$` other than of `$ORIGIN`, cannot be told.
+ * A `RUNPATH`, or `RPATH`, which is not absolute, or has a `$` other than of a whole `$ORIGIN` token, cannot be told.
+ * As a superset of the directories glibc searches, they can only tell that it does not find a library, see [loaderFinds].
  * Off Linux, there are none.
  */
 internal fun jvmSearchDirectories(
@@ -449,14 +453,18 @@ internal fun jvmSearchDirectories(
     val origin = file.parent.toString()
     return try {
         dynamic.searchDirectories.map { entry ->
-            val expanded = entry.replace("\${ORIGIN}", origin).replace("\$ORIGIN", origin)
-            if ('$' in expanded || !expanded.startsWith("/")) return null
+            if ('$' in ORIGIN_TOKEN.replace(entry, "")) return null
+            val expanded = ORIGIN_TOKEN.replace(entry) { origin }
+            if (!expanded.startsWith("/")) return null
             Path(expanded)
         } + listOf(Path(javaHome, "lib"))
     } catch (_: InvalidPathException) {
         null
     }
 }
+
+/** `$ORIGIN` or `${ORIGIN}` as a whole token of a search path, see [jvmSearchDirectories]. */
+private val ORIGIN_TOKEN = Regex("\\$(?:\\{ORIGIN}|ORIGIN)(?=/|$)")
 
 /** Whether a file of the [name] is in a subdirectory of `glibc-hwcaps` of the [directory], or it cannot be told. */
 private fun hasHwcapsLibrary(directory: Path, name: String): Boolean {

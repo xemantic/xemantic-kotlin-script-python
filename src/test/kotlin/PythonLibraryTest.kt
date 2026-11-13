@@ -439,8 +439,8 @@ class PythonLibraryTest {
         // then
         assert(
             failed.startsWith(
-                "run the JVM with --enable-native-access=ALL-UNNAMED, as the foreign linker failed to load " +
-                    "/opt/python/lib/libpython3.12.so.1.0 with global symbols before Python starts, " +
+                "the foreign linker failed to load /opt/python/lib/libpython3.12.so.1.0 with global symbols " +
+                    "before Python starts: run the JVM with --enable-native-access=ALL-UNNAMED, if not already set, " +
                     "or put it on LD_PRELOAD, "
             ) &&
                 disabled.startsWith(
@@ -508,12 +508,11 @@ class PythonLibraryTest {
     fun `should read shared libraries needed by ELF library and whether it has search path of its own`() =
         withLibraryDirectory { directory ->
             // given
-            fun library(name: String, bytes: ByteArray) = directory.resolve(name).apply { writeBytes(bytes) }
             val needed = listOf("libjvm.so", "libpython3.12.so.1.0", "libc.so.6")
-            val plain = library("plain.so", elfLibrary(needed))
-            val withRunpath = library("runpath.so", elfLibrary(needed, runpath = "\$ORIGIN/../../.."))
-            val withRpath = library("rpath.so", elfLibrary(needed, rpath = "/opt/conda/lib"))
-            val bigEndian32 = library("be32.so", elfLibrary(needed, is64 = false, order = ByteOrder.BIG_ENDIAN))
+            val plain = directory.writeLibrary("plain.so", elfLibrary(needed))
+            val withRunpath = directory.writeLibrary("runpath.so", elfLibrary(needed, runpath = "\$ORIGIN/../../.."))
+            val withRpath = directory.writeLibrary("rpath.so", elfLibrary(needed, rpath = "/opt/conda/lib"))
+            val bigEndian32 = directory.writeLibrary("be32.so", elfLibrary(needed, is64 = false, order = ByteOrder.BIG_ENDIAN))
 
             // when
             val dynamics = listOf(plain, withRunpath, withRpath, bigEndian32).map { readElfDynamic(it) }
@@ -529,12 +528,11 @@ class PythonLibraryTest {
     fun `should not read dynamic section of file which is not ELF library`() =
         withLibraryDirectory { directory ->
             // given
-            fun library(name: String, bytes: ByteArray) = directory.resolve(name).apply { writeBytes(bytes) }
             val complete = elfLibrary(listOf("libpython3.12.so.1.0"))
             // e.g. a linker script
-            val text = library("text.so", "INPUT(libpython3.12.so.1.0)".toByteArray())
-            val truncated = library("truncated.so", complete.copyOf(complete.size - 20))
-            val headerOnly = library("header.so", complete.copyOf(64))
+            val text = directory.writeLibrary("text.so", "INPUT(libpython3.12.so.1.0)".toByteArray())
+            val truncated = directory.writeLibrary("truncated.so", complete.copyOf(complete.size - 20))
+            val headerOnly = directory.writeLibrary("header.so", complete.copyOf(64))
             val missing = directory.resolve("missing.so")
 
             // when
@@ -630,10 +628,9 @@ class PythonLibraryTest {
     fun `should not read too long name or too many libraries needed by ELF library`() =
         withLibraryDirectory { directory ->
             // given
-            fun library(name: String, bytes: ByteArray) = directory.resolve(name).apply { writeBytes(bytes) }
-            val longName = library("long.so", elfLibrary(listOf("libpython" + "3".repeat(5000) + ".so.1.0")))
-            val manyNeeded = library("many.so", elfLibrary(List(2000) { "libxemantic$it.so" }))
-            val limits = library("limits.so", elfLibrary(List(1000) { "libxemantic$it.so" } + "x".repeat(4000)))
+            val longName = directory.writeLibrary("long.so", elfLibrary(listOf("libpython" + "3".repeat(5000) + ".so.1.0")))
+            val manyNeeded = directory.writeLibrary("many.so", elfLibrary(List(2000) { "libxemantic$it.so" }))
+            val limits = directory.writeLibrary("limits.so", elfLibrary(List(1000) { "libxemantic$it.so" } + "x".repeat(4000)))
 
             // when
             val dynamics = listOf(longName, manyNeeded, limits).map { readElfDynamic(it) }
@@ -656,18 +653,21 @@ class PythonLibraryTest {
             withToken.writeBytes(elfLibrary(emptyList(), runpath = "/opt/\$LIB"))
             val relative = directory.resolve("relative")
             relative.writeBytes(elfLibrary(emptyList(), rpath = "lib"))
+            // $ORIGIN only as a whole token, not a part of another name
+            val longerToken = directory.writeLibrary("longer", elfLibrary(emptyList(), rpath = "\$ORIGINAL/lib"))
+            val braceSuffix = directory.writeLibrary("brace", elfLibrary(emptyList(), rpath = "/opt/\${ORIGIN}x"))
             val javaHome = directory.resolve("jdk").toString()
 
             // when
             val directories = jvmSearchDirectories(link, javaHome)
-            val unknown = listOf(withToken, relative, directory.resolve("missing")).map {
+            val unknown = listOf(withToken, relative, longerToken, braceSuffix, directory.resolve("missing")).map {
                 jvmSearchDirectories(it, javaHome)
             }
 
             // then
             assert(
                 directories == listOf(bin, bin.resolve("../lib"), Path(javaHome, "lib")) &&
-                    unknown == listOf(null, null, null)
+                    unknown == List(5) { null }
             )
         }
 
@@ -701,6 +701,37 @@ class PythonLibraryTest {
 
             // then
             assert(withoutIt && !unknown && !withAnother && withSame)
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython only in directory of JVM`() =
+        withLibraryDirectory { directory ->
+            // given
+            // e.g. java.home/lib, or the RUNPATH of the executable, which glibc does not search for libjep
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(library, libraryPath = null, cache = { null }, jvmDirectories = { listOf(directory) })
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with another one in glibc-hwcaps of directory of JVM`() =
+        withLibraryDirectory { directory ->
+            // given
+            val jvmDirectory = directory.resolve("jvm").createDirectory()
+            jvmDirectory.resolve("glibc-hwcaps/x86-64-v3").createDirectories().resolve("libxemantic-test.so.1").createFile()
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(
+                library, libraryPath = "$directory", cache = { null }, jvmDirectories = { listOf(jvmDirectory) }
+            )
+
+            // then
+            assert(!found)
         }
 
     /**
@@ -772,6 +803,9 @@ class PythonLibraryTest {
         }
         return buffer.array()
     }
+
+    /** Writes the [bytes] of a library of the [name] in this directory. */
+    private fun Path.writeLibrary(name: String, bytes: ByteArray): Path = resolve(name).apply { writeBytes(bytes) }
 
     /** Runs the [block] with a new temporary directory, deleted afterwards. */
     @OptIn(ExperimentalPathApi::class)

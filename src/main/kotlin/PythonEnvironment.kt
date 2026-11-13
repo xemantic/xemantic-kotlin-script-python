@@ -676,6 +676,19 @@ internal data class PythonProbe(
 )
 
 /**
+ * The [preload], a value of `LD_PRELOAD`, separated by spaces or colons like the loader does,
+ * without the libraries named like a `libpython` of a Python version, e.g. `libpython3.12.so.1.0`,
+ * or `null` if no other is left.
+ */
+internal fun withoutPythonLibraryPreload(preload: String): String? = preload.split(' ', ':')
+    .filter { it.isNotEmpty() && !PYTHON_LIBRARY_NAME.matches(it.substringAfterLast('/')) }
+    .takeIf { it.isNotEmpty() }
+    ?.joinToString(" ")
+
+/** The name of a shared `libpython` of a Python version, e.g. `libpython3.13t.so.1.0`. */
+private val PYTHON_LIBRARY_NAME = Regex("libpython\\d+\\.\\d+[a-z]*\\.so(?:\\.[0-9.]*)?")
+
+/**
  * The result of [runProcess].
  *
  * @property exitCode the exit code of the process.
@@ -724,6 +737,12 @@ internal fun runProcess(
     try {
         val builder = ProcessBuilder(command).directory(directory?.toFile())
         builder.environment().apply {
+            // a libpython preloaded for the embedded Python, see pythonLibraryGlobalAdvice,
+            // would replace the symbols of the libpython of another Python; only the inherited one
+            get("LD_PRELOAD")?.let { preload ->
+                val kept = withoutPythonLibraryPreload(preload)
+                if (kept == null) remove("LD_PRELOAD") else put("LD_PRELOAD", kept)
+            }
             putAll(environment)
             // the input is written, and the output read, as UTF-8, while Python would use the locale encoding,
             // e.g. cp1252 on Windows, or ASCII in the C locale;
@@ -732,12 +751,6 @@ internal fun runProcess(
             // must not be inherited with another encoding
             put("PYTHONUTF8", "1")
             put("PYTHONIOENCODING", "utf-8")
-            // a libpython preloaded for the embedded Python, see pythonLibraryGlobalAdvice,
-            // would replace the symbols of the libpython of another Python
-            get("LD_PRELOAD")?.let { preload ->
-                val kept = preload.split(' ', ':').filter { it.isNotEmpty() && !it.substringAfterLast('/').startsWith("libpython") }
-                if (kept.isEmpty()) remove("LD_PRELOAD") else put("LD_PRELOAD", kept.joinToString(" "))
-            }
         }
         if (errorFile == null) builder.redirectErrorStream(true) else builder.redirectError(errorFile.toFile())
         val process = builder.start()
