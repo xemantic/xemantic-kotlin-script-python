@@ -112,7 +112,7 @@ public object PythonEnvironment {
         } else PythonLibraryLoading()
         this.executable = executable
         starter = EmbeddedPythonStarter(
-            executable, probe.error, pythonLibrary, loading.failure, loading.localSymbols
+            executable, probe.error, pythonLibrary, probe.libraryDevelopmentName, loading.failure, loading.localSymbols
         )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -515,12 +515,14 @@ private fun String.hexToPath(): String? {
  * it tells to put its directory on `LD_LIBRARY_PATH`,
  * or the [libraryPreloadFailure] of [loadPythonLibrary], if any, also kept as suppressed.
  * The symbols of the [pythonLibrary] loaded by [loadPythonLibrary], if [libraryLocalSymbols],
- * are made global in the first interpreter, see [makePythonLibraryGlobal].
+ * are made global in the first interpreter, see [makePythonLibraryGlobal],
+ * or, if they cannot be, it tells how, with the [libraryDevelopmentName], see [pythonLibraryGlobalAdvice].
  */
 internal class EmbeddedPythonStarter(
     private val executable: String,
     private val probeError: String,
     private val pythonLibrary: Path? = null,
+    private val libraryDevelopmentName: String = "",
     private val libraryPreloadFailure: Throwable? = null,
     libraryLocalSymbols: Boolean = false
 ) {
@@ -610,8 +612,8 @@ internal class EmbeddedPythonStarter(
             System.getLogger(EmbeddedPythonStarter::class.java.name).log(
                 System.Logger.Level.WARNING,
                 "Cannot make the symbols of $library global, " +
-                    "a C extension module might fail to import with an undefined symbol, " +
-                    "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts",
+                    "a C extension module might fail to import with an undefined symbol; to have them global, " +
+                    pythonLibraryGlobalAdvice(library, libraryDevelopmentName),
                 e
             )
         }

@@ -970,7 +970,7 @@ class PythonEnvironmentTest {
         // given
         val library = Path("/usr/lib/libpython3.13.so.1.0")
         fun loadsGlobally(foundNames: Set<String>, developmentName: String = "libpython3.13.so") =
-            jepLoadsGlobally(library, developmentName, finds = { found, name -> found == library && name in foundNames })
+            jepLoadsGlobally(library, developmentName, finds = { name -> name in foundNames })
 
         // when
         val both = loadsGlobally(setOf("libpython3.13.so.1.0", "libpython3.13.so"))
@@ -981,6 +981,28 @@ class PythonEnvironmentTest {
 
         // then
         assert(both && !sonameOnly && !developmentSymlinkOnly && !unknownDevelopmentName)
+    }
+
+    @Test
+    fun `should advise development package providing development symlink of libpython to make its symbols global`() {
+        // given
+        val library = Path("/usr/lib/x86_64-linux-gnu/libpython3.12.so.1.0")
+
+        // when
+        val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.so")
+        val adviceWithoutDevelopmentName = pythonLibraryGlobalAdvice(library, "")
+
+        // then
+        assert(
+            advice == "put /usr/lib/x86_64-linux-gnu on LD_LIBRARY_PATH before the JVM starts, " +
+                "unless it is a directory the dynamic loader searches anyway, " +
+                "and if libpython3.12.so is missing there, install the development package of this Python " +
+                "which provides it, e.g. libpython3.X-dev on Debian or Ubuntu"
+        )
+        assert(
+            adviceWithoutDevelopmentName == "put /usr/lib/x86_64-linux-gnu on LD_LIBRARY_PATH before the JVM starts, " +
+                "unless it is a directory the dynamic loader searches anyway"
+        )
     }
 
     @OptIn(ExperimentalPathApi::class)

@@ -108,9 +108,27 @@ internal fun loadPythonLibrary(
 internal fun jepLoadsGlobally(
     library: Path,
     developmentName: String,
-    finds: (library: Path, name: String) -> Boolean = { found, name -> loaderFinds(found, name) }
-): Boolean = finds(library, library.fileName.toString()) &&
-    developmentName.isNotEmpty() && finds(library, developmentName)
+    finds: (name: String) -> Boolean = loaderFinder(library)
+): Boolean = finds(library.fileName.toString()) && developmentName.isNotEmpty() && finds(developmentName)
+
+/** [loaderFinds] of the [library] by a name, reading the cache of the loader at most once for all the names. */
+private fun loaderFinder(library: Path): (name: String) -> Boolean {
+    val cache by lazy(::readLoaderCache)
+    return { name -> loaderFinds(library, name, cache = { cache }) }
+}
+
+/**
+ * How to have the symbols of the [library] made global by Jep, before the startup of Python,
+ * when [loadPythonLibrary] cannot, or only after the startup, on Java 17 to 21:
+ * the dynamic loader has to find the [library] by its soname, and by its [developmentName], see [jepLoadsGlobally].
+ */
+internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): String {
+    val directoryAdvice = "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts, " +
+        "unless it is a directory the dynamic loader searches anyway"
+    return if (developmentName.isEmpty()) directoryAdvice
+    else "$directoryAdvice, and if $developmentName is missing there, " +
+        "install the development package of this Python which provides it, e.g. libpython3.X-dev on Debian or Ubuntu"
+}
 
 /**
  * Whether the dynamic loader finds the [library] by the [name], its soname by default, as the same file,
