@@ -334,6 +334,11 @@ internal object PythonDependencies {
         def normalized_name(name):
             return re.sub(r"[-_.]+", "_", name).lower()
 
+        def dist_info_name(entry):
+            # the name and the version of a dist-info directory name, like importlib.metadata parses it
+            name, _, version = entry[:-len(".dist-info")].partition("-")
+            return name, version
+
         def dist_infos(directory):
             # the dist-info directories by the normalized name of their distribution,
             # taken from the directory name, like importlib.metadata finds them
@@ -345,7 +350,7 @@ internal object PythonDependencies {
             for entry in entries:
                 path = os.path.join(directory, entry)
                 if entry.lower().endswith(".dist-info") and os.path.isdir(path):
-                    found.setdefault(normalized_name(entry[:-len(".dist-info")].partition("-")[0]), []).append(path)
+                    found.setdefault(normalized_name(dist_info_name(entry)[0]), []).append(path)
             return found
 
         def identity(path):
@@ -415,8 +420,9 @@ internal object PythonDependencies {
      * and a URL requirement counts as satisfied by a distribution installed from the same URL,
      * whatever its revision or content, which the installer can tell only by installing it again.
      * Without `packaging`, neither of pip nor of the environment, the requirements are not checked.
-     * A distribution whose metadata cannot be read, e.g. not in UTF-8 (#89), or is missing,
-     * is told by the name and version of its dist-info directory, like the installer tells it, with no requirements.
+     * A distribution whose metadata cannot be read, e.g. not in UTF-8 (#89), or is missing, is skipped,
+     * but in the dependency directory, it is told by the name and version of its dist-info directory,
+     * if valid, like the installer tells it, with no requirements.
      */
     @Language("python")
     internal val PLAN = DIST_INFOS + "\n\n" + """
@@ -496,7 +502,7 @@ internal object PythonDependencies {
             # the name, version and requirements of the metadata of the distribution,
             # or None if it cannot be read, e.g. not in UTF-8 (#89), or tells no name or version, e.g. when missing
             try:
-                distribution_metadata = None if distribution is None else distribution.metadata
+                distribution_metadata = distribution.metadata
             except (OSError, ValueError):
                 return None
             if not distribution_metadata:
@@ -506,21 +512,24 @@ internal object PythonDependencies {
                 return None
             return name, version, distribution_metadata.get_all("Requires-Dist") or []
 
-        def distribution_info(distribution):
-            # the name, version and requirements of the distribution, by its metadata, or, if it cannot be read,
-            # by the name of its dist-info directory, with no known requirements, or None without one, e.g. of an egg-info,
-            # like installers tell it: uv takes it as installed, and fails on a missing METADATA if installing it again
+        def dependency_dist_info(path):
+            # the distribution of a dist-info directory of the dependency directory, with its name, version and requirements,
+            # by its metadata, or, if it cannot be read, by the directory name, which the installer wrote,
+            # with no known requirements, as the installer tells it: uv takes it as installed,
+            # and fails on a missing METADATA when installing it again;
+            # None for a directory name which is no valid name and version, or without packaging to tell
+            distribution = metadata.PathDistribution(Path(path))
             info = read_metadata(distribution)
-            if info is not None or distribution is None:
-                return info
-            # PathDistribution keeps its directory only as _path, of pathlib.Path or zipfile.Path
-            entry = getattr(getattr(distribution, "_path", None), "name", "")
-            if not entry.lower().endswith(".dist-info"):
+            if info is not None:
+                return distribution, info
+            name, version = dist_info_name(os.path.basename(path))
+            if Version is None or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._]*[A-Za-z0-9])?", name):
                 return None
-            name, _, version = entry[:-len(".dist-info")].partition("-")
-            if not name or not version:
+            try:
+                version = str(Version(version))
+            except Exception:
                 return None
-            return re.sub(r"[-_.]+", "-", name).lower(), version, []
+            return distribution, (re.sub(r"[-_.]+", "-", name).lower(), version, [])
 
         # the installed distributions by normalized name, as (distribution, version, requirements),
         # the requirements only of the ones in the dependency directory, otherwise None,
@@ -531,7 +540,12 @@ internal object PythonDependencies {
         def installed(name):
             key = normalized_name(name)
             if key not in installed_distributions:
-                found = find_distribution(name)
+                found = lookup_distribution(name)
+                if found is not None and is_in_dependencies(found[0]) and len(dependency_dist_infos.get(key, [])) > 1:
+                    # several dist-info of the name in the dependency directory,
+                    # when it is not known which of them the installed files belong to,
+                    # so that the installation writes a new one, and removes the others
+                    found = None
                 if found is None:
                     installed_distributions[key] = None
                 else:
@@ -594,31 +608,31 @@ internal object PythonDependencies {
                 return True
             return requirement.specifier.contains(version, prereleases=True)
 
-        def find_distribution(name):
-            # the distribution, with its distribution_info, like importlib.metadata finds it,
-            # but the first one with readable metadata, as a dist-info of the environment without it (#89)
-            # would hide the one installed into the dependency directory, after it on sys.path, on every use;
-            # None for several dist-info of the name in the dependency directory,
-            # when it is not known which of them the installed files belong to,
-            # so that the installation writes a new one, and removes the others
-            found = None
-            if not name:
-                # which some versions of importlib.metadata would take as any distribution
+        # the distributions by normalized name, as (distribution, (name, version, requirements)), or None
+        found_distributions = {}
+
+        def lookup_distribution(name):
+            # like importlib.metadata finds it, but the first one with readable metadata, as a dist-info without it (#89),
+            # of the environment, before the dependency directory on sys.path, would hide the one installed there;
+            # otherwise, one of the dependency directory told by its directory name, of the highest version;
+            # one lookup for the requirements and the constraints, so they cannot tell different versions
+            key = normalized_name(name)
+            if not key:
+                # which importlib.metadata would take as any distribution
                 return None
-            for distribution in metadata.distributions(name=name):
-                info = read_metadata(distribution)
-                if info is not None:
-                    found = distribution, info
-                    break
-                if found is None:
-                    info = distribution_info(distribution)
+            if key not in found_distributions:
+                found = None
+                for distribution in metadata.distributions(name=key):
+                    info = read_metadata(distribution)
                     if info is not None:
                         found = distribution, info
-            if found is None or not is_in_dependencies(found[0]):
-                return found
-            if len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
-                return None
-            return found
+                        break
+                else:
+                    candidates = [it for it in map(dependency_dist_info, dependency_dist_infos.get(key, [])) if it]
+                    if candidates:
+                        found = max(candidates, key=lambda it: version_key(it[1][1]))
+                found_distributions[key] = found
+            return found_distributions[key]
 
         # the suffixes of the module files, the longest first, like .cpython-310-x86_64-linux-gnu.so before .so
         module_suffixes = sorted(importlib.machinery.all_suffixes(), key=len, reverse=True)
@@ -701,11 +715,11 @@ internal object PythonDependencies {
             # then the highest version, otherwise the one importlib.metadata finds first
             candidates = []
             for path in dependency_dist_infos.get(normalized_name(name), []):
-                candidate = metadata.PathDistribution(Path(path))
-                count = imported_files(candidate)
-                info = distribution_info(candidate) if count is not None else None
-                if info is not None:
-                    candidates.append((count, version_key(info[1]), info[1]))
+                found = dependency_dist_info(path)
+                count = imported_files(found[0]) if found is not None else None
+                if count is not None:
+                    version = found[1][1]
+                    candidates.append((count, version_key(version), version))
             if not candidates:
                 return version_of_distribution
             return max(candidates, key=lambda it: it[:2])[2]
@@ -828,14 +842,16 @@ internal object PythonDependencies {
             # pip resolves the missing ones without the dependency directory, so it would install a distribution
             # required by them from the index over the one installed from a URL, also in the same version
             missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
-            # by normalized name, as the name of a dist-info directory can differ from the one of its metadata
+            # by normalized name, of the distributions told by readable metadata,
+            # and of the dist-info of the dependency directory, also of the ones told by their directory name
             constraints = {}
-            for distribution in metadata.distributions():
-                info = distribution_info(distribution)
-                if info is None:
-                    continue
-                name, version, _ = info
+            names = [read_metadata(it) for it in metadata.distributions()]
+            for name in [it[0] for it in names if it] + list(dependency_dist_infos):
                 key = normalized_name(name)
+                found = lookup_distribution(name) if key not in constraints else None
+                if found is None:
+                    continue
+                distribution, (name, version, _) = found
                 in_dependencies = is_in_dependencies(distribution)
                 if key not in constraints and (not in_dependencies or is_imported(name, distribution)):
                     if in_dependencies and len(dependency_dist_infos.get(key, [])) > 1:

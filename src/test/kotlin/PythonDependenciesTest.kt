@@ -1567,18 +1567,68 @@ class PythonDependenciesTest {
             writeDistInfo(environment, "3.0")
             writeMetadataNotInUtf8(environment, "3.0")
             writeDistInfo(directory, "4.0")
-            val code = "import sys; sys.path.insert(0, r'$environment')\n" + PythonDependencies.PLAN
 
             // when
-            val installs = PythonDependencies.plan(
-                "dependencies = ['replaced-probe==4.0']\n",
-                directory.toString(),
-                emptyList(),
-                pythonCommand(PythonEnvironment.executable, code, directory.toString())
-            ).filter { it.first == "install" }
+            val installs = planWithEnvironment(directory, environment, "replaced-probe==4.0")
+                .filter { it.first == "install" }
 
             // then
             assert(installs.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should constrain imported distribution to version of dependency directory next to dist-info of environment without METADATA`() {
+        // given
+        // the installed version is to be kept, also as a requirement of another installed distribution
+        withDistInfos { directory ->
+            val environment = directory.resolve("environment")
+            writeDistInfo(environment, "1.0")
+            environment.resolve("replaced_probe-1.0.dist-info/METADATA").deleteIfExists()
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 2\n")
+            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
+            writeDistInfo(directory, "2.0", modules)
+
+            // when
+            val constraints = planWithEnvironment(directory, environment, "nonexistent-dependency", listOf("replaced_probe"))
+                .filter { it.first == "constraint" && it.second.startsWith("replaced-probe==") }.map { it.second }
+
+            // then
+            assert(constraints == listOf("replaced-probe==2.0"))
+        }
+    }
+
+    @Test
+    fun `should not constrain distribution of environment without METADATA`() {
+        // given
+        // like ~ip-21.0.dist-info, which pip leaves incompletely removed, no valid requirement for a constraint
+        withDistInfos { directory ->
+            val environment = directory.resolve("environment")
+            listOf("~ip-21.0.dist-info", "replaced_probe-1.0.dist-info").forEach { environment.resolve(it).createDirectories() }
+
+            // when
+            val constraints = planWithEnvironment(directory, environment, "nonexistent-dependency", listOf("replaced_probe"))
+                .filter { it.first == "constraint" }.map { it.second }
+
+            // then
+            assert(constraints.none { it.startsWith("~ip") || it.startsWith("replaced-probe") })
+        }
+    }
+
+    @Test
+    fun `should not constrain imported distribution without METADATA of dist-info name of invalid version`() {
+        // given
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
+            writeDistInfo(directory, "1.0_1", modules)
+            directory.resolve("replaced_probe-1.0_1.dist-info/METADATA").deleteIfExists()
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints.isEmpty())
         }
     }
 
@@ -2217,6 +2267,25 @@ class PythonDependenciesTest {
     private fun distInfoSnapshot(directory: Path): String =
         PythonDependencies.plan("dependencies = ['nonexistent-dependency']\n", directory.toString(), emptyList())
             .single { it.first == "dist-info" }.second
+
+    /**
+     * The plan of the [dependency] and the [imported] modules,
+     * with the [environment] directory on `sys.path` before the dependency [directory], like the site-packages.
+     */
+    private fun planWithEnvironment(
+        directory: Path,
+        environment: Path,
+        dependency: String,
+        imported: List<String> = emptyList()
+    ): List<Pair<String, String>> {
+        val code = "import sys; sys.path.insert(0, r'$environment')\n" + PythonDependencies.PLAN
+        return PythonDependencies.plan(
+            "dependencies = ['$dependency']\n",
+            directory.toString(),
+            imported,
+            pythonCommand(PythonEnvironment.executable, code, directory.toString())
+        )
+    }
 
     /** The constraints of `replaced-probe` planned with its module imported, for a missing dependency. */
     private fun importedConstraints(directory: Path): List<String> =
