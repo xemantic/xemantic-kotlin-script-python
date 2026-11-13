@@ -20,6 +20,7 @@ package com.xemantic.kotlin.script.python
 
 import java.io.IOException
 import java.lang.invoke.MethodHandle
+import java.nio.file.InvalidPathException
 import java.nio.file.Path
 import java.util.Optional
 import kotlin.io.path.Path
@@ -106,36 +107,43 @@ internal fun loadPythonLibrary(
  * The dynamic loader must find the [library] by its soname, its file name, for the native library of Jep,
  * and Jep makes it global with `dlopen` of the [developmentName], see [jepLibraryName], e.g. `libpython3.13.so`,
  * the development symlink, missing when its development package is not installed, e.g. removed after building Jep,
- * so that this `dlopen` fails, and the symbols stay local, as they always do with a static `libpython3.X.a`;
+ * so that this `dlopen` fails, and the symbols stay local, as they always do with a static `libpython3.X.a`, or none;
  * [finds] tells whether the loader finds the [library] by a name.
  */
 internal fun jepLoadsGlobally(
     library: Path,
     developmentName: String,
     finds: (name: String) -> Boolean = loaderFinder(library)
-): Boolean = finds(library.fileName.toString()) && isSharedLibraryName(developmentName) && finds(developmentName)
-
-/** Whether the [name] can be the one of a shared library: not empty, nor the one of a static library, `libpython3.X.a`. */
-private fun isSharedLibraryName(name: String) = name.isNotEmpty() && !name.endsWith(".a")
+): Boolean = jepOpensShared(developmentName) && finds(library.fileName.toString()) && finds(developmentName)
 
 /**
- * The name of the `libpython` which Jep opens with `dlopen` to make its symbols global, see [jepLoadsGlobally],
- * or empty if it is the one of a static library, which `dlopen` cannot open.
- *
- * It is the base name of `get_libpython()` of the build of Jep: the [developmentName], `LDLIBRARY` of `sysconfig`,
- * also when it is not in the library [directory], `LIBDIR`, nor in its [multiarch] subdirectory, `MULTIARCH`,
- * except for a static `libpython3.X.a` which is not in either of them, e.g. of conda-forge,
- * for which Jep takes the shared `libpython3.X.so` of the same stem in either of them, if any.
- * The files are the ones when Jep was built, assumed to be still there.
+ * Whether the [developmentName] of [jepLibraryName] is the one of a shared library, which `dlopen` can open,
+ * not empty, nor the one of a static library, e.g. `libpython3.12.a`.
  */
-internal fun jepLibraryName(directory: String, developmentName: String, multiarch: String): String {
-    if (!developmentName.endsWith(".a")) return developmentName
-    if (directory.isEmpty()) return ""
-    val directories = listOfNotNull(Path(directory), multiarch.takeIf { it.isNotEmpty() }?.let { Path(directory, it) })
-    fun inDirectories(name: String) = directories.any { it.resolve(name).exists() }
-    if (inDirectories(developmentName)) return ""
-    return developmentName.removeSuffix("a").plus("so").takeIf(::inDirectories) ?: ""
+private fun jepOpensShared(developmentName: String) = developmentName.isNotEmpty() && !developmentName.endsWith(".a")
+
+/**
+ * The name of the `libpython` which the native library of Jep, the [jepLibrary], opens with `dlopen`
+ * to make its symbols global, see [jepLoadsGlobally], or empty if it cannot be told for certain.
+ *
+ * It is `PYTHON_LDLIBRARY`, compiled into the [jepLibrary] as a string, the base name of `get_libpython()`
+ * of the build of Jep, `LDLIBRARY` of `sysconfig`, e.g. `libpython3.13.so`, which the files of the Python decide:
+ * with a static `libpython3.12.a`, e.g. of conda-forge, the shared `libpython3.12.so` of the same stem,
+ * unless the static one existed then, e.g. of the `libpython-static` package, removed since.
+ * The [jepLibrary] has it among its null-terminated strings, as the only one of a `libpython` without a version suffix,
+ * unlike the soname it needs, e.g. `libpython3.13.so.1.0`.
+ */
+internal fun jepLibraryName(jepLibrary: Path): String {
+    val content = try {
+        String(jepLibrary.readBytes(), Charsets.ISO_8859_1)
+    } catch (_: IOException) {
+        return ""
+    }
+    return JEP_LIBRARY_NAME.findAll(content).map { it.value }.toSet().singleOrNull() ?: ""
 }
+
+/** A null-terminated string of the name of a `libpython`, preceded by the end of another one, see [jepLibraryName]. */
+private val JEP_LIBRARY_NAME = Regex("(?<=\u0000)libpython[^\u0000/]*\\.(?:so|a)(?=\u0000)")
 
 /** [loaderFinds] of the [library] by a name, reading the cache of the loader at most once for all the names. */
 private fun loaderFinder(library: Path): (name: String) -> Boolean {
@@ -147,31 +155,38 @@ private fun loaderFinder(library: Path): (name: String) -> Boolean {
  * How to have the symbols of the [library] made global by Jep, before the startup of Python,
  * when [loadPythonLibrary] cannot, or only after the startup, on Java 17 to 21:
  * the dynamic loader has to find the [library] by its soname, and by its [developmentName], see [jepLoadsGlobally].
+ * If Jep cannot, without a [developmentName] of a shared library, the [library] has to be preloaded with global symbols.
  */
-internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): String {
-    val directoryAdvice = "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts, " +
-        "unless it is a directory the dynamic loader searches anyway"
-    return if (!isSharedLibraryName(developmentName)) directoryAdvice
-    else "$directoryAdvice, and if $developmentName is missing there, " +
-        "install the development package of this Python which provides it, e.g. libpython3.X-dev on Debian or Ubuntu"
-}
+internal fun pythonLibraryGlobalAdvice(library: Path, developmentName: String): String =
+    if (!jepOpensShared(developmentName)) {
+        "put $library on LD_PRELOAD before the JVM starts, as Jep does not make its symbols global with this Python"
+    } else {
+        "put ${library.parent} on LD_LIBRARY_PATH before the JVM starts, " +
+            "unless it is a directory the dynamic loader searches anyway, and if $developmentName is missing there, " +
+            "install the development package of this Python which provides it, e.g. libpython3.X-dev on Debian or Ubuntu"
+    }
 
 /**
  * Whether the dynamic loader finds the [library] by the [name], its soname by default, as the same file,
  * see [jepLoadsGlobally].
  *
  * Like the loader of glibc, it takes the first file of the name in the directories of the [libraryPath], `LD_LIBRARY_PATH`,
- * a relative one in the [workingDirectory], the one of the process by default, which the JVM never changes,
- * then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
- * of the directories configured in `/etc/ld.so.conf`, read only if needed, and then in the system directories.
+ * a relative one in the [workingDirectory], by default the one of the process, not changed by setting `user.dir`,
+ * and then in the [cache] of the loader, `/etc/ld.so.cache`, which lists the full paths of the libraries,
+ * of the directories configured in `/etc/ld.so.conf`, read only if needed.
  *
  * Where the loader might take another file, it tells that it does not find the [library],
  * which costs only loading it when not needed, see [loadPythonLibrary]:
  * - an empty entry of `LD_LIBRARY_PATH`, leading, trailing, or of `::`, with a file of the [name] in the [workingDirectory],
  *   as glibc takes the entry for the working directory, but musl skips it;
  * - a `;` in `LD_LIBRARY_PATH`, at which glibc splits it as well, but musl does not;
+ * - a `$` in `LD_LIBRARY_PATH`, of `$ORIGIN`, `$LIB` or `$PLATFORM`, which glibc expands;
+ * - a path which is not valid in the JVM, e.g. not in the encoding of the file system;
  * - a file of the [name] in a subdirectory of `glibc-hwcaps` of a searched directory, also in the cache,
- *   which glibc takes first, if the CPU supports its level, e.g. `x86-64-v3`.
+ *   which glibc takes first, if the CPU supports its level, e.g. `x86-64-v3`;
+ * - different files of the [name] in the cache, whose order is not the one of their priority to the loader;
+ * - a file of the [name] only in a directory which the loader searches last by default,
+ *   as they differ between distributions, e.g. `/usr/lib/x86_64-linux-gnu` of Debian, `/usr/lib64` of Fedora.
  *
  * It does not know the other rules of the loaders, with which it might tell that it finds a library it would not:
  * the `RUNPATH` of the native library of Jep, e.g. of conda, with which the library would be loaded when not needed,
@@ -186,8 +201,20 @@ internal fun loaderFinds(
     libraryPath: String? = System.getenv("LD_LIBRARY_PATH"),
     cache: () -> ByteArray? = ::readLoaderCache,
     workingDirectory: Path = Path("")
+): Boolean = try {
+    loaderFindsValidPaths(library, name, libraryPath, cache, workingDirectory)
+} catch (_: InvalidPathException) {
+    false
+}
+
+private fun loaderFindsValidPaths(
+    library: Path,
+    name: String,
+    libraryPath: String?,
+    cache: () -> ByteArray?,
+    workingDirectory: Path
 ): Boolean {
-    if (libraryPath != null && ';' in libraryPath) return false
+    if (libraryPath != null && (';' in libraryPath || '$' in libraryPath)) return false
     // an empty LD_LIBRARY_PATH has no entries, rather than an empty one
     val entries = if (libraryPath.isNullOrEmpty()) emptyList() else libraryPath.split(':')
     for (entry in entries) {
@@ -197,16 +224,9 @@ internal fun loaderFinds(
         if (candidate.isRegularFile()) return entry.isNotEmpty() && isSameFile(candidate, library)
     }
     val cached = cachedLibraries(cache(), name).filter { it.isRegularFile() }
-    if (cached.isNotEmpty()) {
-        return cached.none { path -> path.any { it.toString() == "glibc-hwcaps" } } &&
-            isSameFile(cached.first(), library)
-    }
-    for (directory in SYSTEM_LIBRARY_DIRECTORIES) {
-        if (hasHwcapsLibrary(Path(directory), name)) return false
-        val candidate = Path(directory, name)
-        if (candidate.isRegularFile()) return isSameFile(candidate, library)
-    }
-    return false
+    return cached.isNotEmpty() &&
+        cached.none { path -> path.any { it.toString() == "glibc-hwcaps" } } &&
+        cached.all { isSameFile(it, library) }
 }
 
 /** Whether a file of the [name] is in a subdirectory of `glibc-hwcaps` of the [directory], or it cannot be told. */
@@ -225,9 +245,6 @@ private fun isSameFile(file: Path, other: Path): Boolean = try {
 } catch (_: IOException) {
     false
 }
-
-/** The directories which the dynamic loader of glibc searches last, also without `ld.so.cache`. */
-private val SYSTEM_LIBRARY_DIRECTORIES = listOf("/lib64", "/usr/lib64", "/lib", "/usr/lib")
 
 /** The `/etc/ld.so.cache` of the dynamic loader, or `null` if it cannot be read, e.g. of musl, which has none. */
 private fun readLoaderCache(): ByteArray? = try {

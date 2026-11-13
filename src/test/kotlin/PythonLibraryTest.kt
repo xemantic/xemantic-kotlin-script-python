@@ -31,6 +31,8 @@ import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
+import kotlin.io.path.isRegularFile
+import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
 
@@ -240,67 +242,154 @@ class PythonLibraryTest {
         }
 
     @Test
-    fun `should take development symlink of shared libpython as the name Jep opens`() =
+    fun `should tell that dynamic loader does not find libpython listed in its cache with another one of same name`() =
         withLibraryDirectory { directory ->
+            // given
+            // the order of the string table of the cache is not the one in which the loader takes its entries
+            val other = directory.resolve("other").createDirectory().resolve("libxemantic-test.so.1").createFile()
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            val cache = ("ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$library\u0000" +
+                "libxemantic-test.so.1\u0000$other\u0000").toByteArray(filesystemCharset)
+
             // when
-            val name = jepLibraryName("$directory", "libpython3.13.so", "x86_64-linux-gnu")
+            val found = loaderFinds(library, libraryPath = null, cache = { cache })
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader finds libpython listed in its cache twice as the same file`() =
+        withLibraryDirectory { directory ->
+            // given
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            val link = directory.resolve("link").createDirectory().resolve("libxemantic-test.so.1")
+                .createSymbolicLinkPointingTo(library)
+            val cache = ("ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$link\u0000" +
+                "libxemantic-test.so.1\u0000$library\u0000").toByteArray(filesystemCharset)
+
+            // when
+            val found = loaderFinds(library, libraryPath = null, cache = { cache })
+
+            // then
+            assert(found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with dynamic string token in LD_LIBRARY_PATH`() =
+        withLibraryDirectory { directory ->
+            // given
+            // glibc expands $ORIGIN, $LIB and $PLATFORM, e.g. ${PLATFORM} to x86_64
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            val cache = "ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$library\u0000".toByteArray(filesystemCharset)
+
+            // when
+            val found = listOf("$directory/\${PLATFORM}", "\$ORIGIN", "/nonexistent:$directory/\$LIB").map {
+                loaderFinds(library, libraryPath = it, cache = { cache })
+            }
+
+            // then
+            assert(found == listOf(false, false, false))
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython only in directory it might not search by default`() {
+        // given
+        // e.g. /usr/lib, which glibc searches by default on Debian, but not on Fedora, where it searches /usr/lib64
+        val library = Path("/usr/lib/os-release")
+        assumeTrue(library.isRegularFile(), "no $library")
+
+        // when
+        val found = loaderFinds(library, libraryPath = null, cache = { null })
+
+        // then
+        assert(!found)
+    }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with invalid path in LD_LIBRARY_PATH`() =
+        withLibraryDirectory { directory ->
+            // given
+            // like a path which is not valid in the encoding of the file system, e.g. of an ISO-8859-1 locale
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(library, libraryPath = "/invalid\u0000path:$directory", cache = { null })
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should take name of libpython which Jep opens from its native library`() =
+        withLibraryDirectory { directory ->
+            // given
+            // the soname needed by the native library of Jep, and the name of its PYTHON_LDLIBRARY, among other strings
+            val jepLibrary = directory.resolve("libjep.so")
+            jepLibrary.writeBytes(
+                ("\u007fELF\u0000libjvm.so\u0000libpython3.13.so.1.0\u0000libc.so.6\u0000\u0000\u0000" +
+                    "jep/__init__.py\u0000libpython3.13.so\u0000Jep %s\u0000").toByteArray(Charsets.ISO_8859_1)
+            )
+
+            // when
+            val name = jepLibraryName(jepLibrary)
 
             // then
             assert(name == "libpython3.13.so")
         }
 
     @Test
-    fun `should take shared libpython of static development name as the name Jep opens`() =
+    fun `should take static libpython which Jep opens from its native library`() =
         withLibraryDirectory { directory ->
             // given
-            // e.g. of conda-forge, without the static libpython3.12.a
-            val libraryDirectory = directory.resolve("lib").createDirectory()
-            libraryDirectory.resolve("libpython3.12.so").createFile()
-            directory.resolve("multiarch").createDirectory().resolve("libpython3.12.so").createFile()
+            // e.g. of conda-forge, when the static libpython3.12.a existed when Jep was built
+            val jepLibrary = directory.resolve("libjep.so")
+            jepLibrary.writeBytes(
+                "\u007fELF\u0000libpython3.12.so.1.0\u0000\u0000libpython3.12.a\u0000".toByteArray(Charsets.ISO_8859_1)
+            )
 
             // when
-            val name = jepLibraryName("$libraryDirectory", "libpython3.12.a", "x86_64-linux-gnu")
-            val multiarchName = jepLibraryName("$directory", "libpython3.12.a", "multiarch")
+            val name = jepLibraryName(jepLibrary)
 
             // then
-            assert(name == "libpython3.12.so" && multiarchName == "libpython3.12.so")
+            assert(name == "libpython3.12.a")
         }
 
     @Test
-    fun `should not take static libpython which Jep opens as development name`() =
+    fun `should not take name of libpython which Jep opens when its native library does not tell it for certain`() =
         withLibraryDirectory { directory ->
             // given
-            // Jep opens the static libpython3.12.a, which it cannot, when it exists, also in the multiarch subdirectory
-            val static = directory.resolve("static").createDirectory()
-            static.resolve("libpython3.12.a").createFile()
-            static.resolve("libpython3.12.so").createFile()
-            val multiarchStatic = directory.resolve("multiarch-static").createDirectory()
-            multiarchStatic.resolve("libpython3.12.so").createFile()
-            multiarchStatic.resolve("x86_64-linux-gnu").createDirectory().resolve("libpython3.12.a").createFile()
-            val neither = directory.resolve("neither").createDirectory()
-
-            // when
-            val names = listOf(static, multiarchStatic, neither).map {
-                jepLibraryName("$it", "libpython3.12.a", "x86_64-linux-gnu")
+            fun jepLibrary(name: String, content: String) = directory.resolve(name).apply {
+                writeBytes(content.toByteArray(Charsets.ISO_8859_1))
             }
-            val unknownDirectory = jepLibraryName("", "libpython3.12.a", "x86_64-linux-gnu")
+            // e.g. built without PYTHON_LDLIBRARY, with only the soname it needs
+            val withoutName = jepLibrary("without.so", "\u007fELF\u0000libpython3.13.so.1.0\u0000")
+            val twoNames = jepLibrary("two.so", "\u007fELF\u0000libpython3.13.so\u0000libpython3.12.so\u0000")
+            // e.g. a part of a longer string
+            val notStandalone = jepLibrary("part.so", "\u007fELF\u0000/opt/libpython3.13.so\u0000")
+            val missing = directory.resolve("missing.so")
+
+            // when
+            val names = listOf(withoutName, twoNames, notStandalone, missing).map { jepLibraryName(it) }
 
             // then
-            assert(names == listOf("", "", "") && unknownDirectory == "")
+            assert(names == listOf("", "", "", ""))
         }
 
     @Test
-    fun `should not advise static libpython to make its symbols global`() {
+    fun `should advise preloading libpython to make its symbols global when Jep cannot`() {
         // given
         val library = Path("/opt/conda/lib/libpython3.12.so.1.0")
 
         // when
-        val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.a")
+        val advice = listOf("libpython3.12.a", "").map { pythonLibraryGlobalAdvice(library, it) }
 
         // then
         assert(
-            advice == "put /opt/conda/lib on LD_LIBRARY_PATH before the JVM starts, " +
-                "unless it is a directory the dynamic loader searches anyway"
+            advice == List(2) {
+                "put /opt/conda/lib/libpython3.12.so.1.0 on LD_PRELOAD before the JVM starts, " +
+                    "as Jep does not make its symbols global with this Python"
+            }
         )
     }
 
