@@ -490,6 +490,18 @@ internal object PythonDependencies {
         def is_in_dependencies(distribution):
             return os.path.realpath(distribution.locate_file("")) == dependency_location
 
+        def read_metadata(distribution):
+            # the metadata of the distribution, or None if it cannot be read, e.g. not in UTF-8 (#89),
+            # or tells no name or version, e.g. when missing,
+            # so that the distribution satisfies no requirement, and is not constrained
+            try:
+                distribution_metadata = distribution.metadata
+            except (OSError, ValueError):
+                return None
+            if not distribution_metadata or not distribution_metadata["Name"] or not distribution_metadata["Version"]:
+                return None
+            return distribution_metadata
+
         # the installed distributions by normalized name, as (distribution, version, requirements),
         # the requirements only of the ones in the dependency directory, otherwise None,
         # read from the metadata parsed once, as importlib.metadata parses it on every access,
@@ -500,10 +512,10 @@ internal object PythonDependencies {
             key = normalized_name(name)
             if key not in installed_distributions:
                 distribution = find_distribution(name)
-                if distribution is None:
+                distribution_metadata = read_metadata(distribution) if distribution is not None else None
+                if distribution_metadata is None:
                     installed_distributions[key] = None
                 else:
-                    distribution_metadata = distribution.metadata
                     installed_distributions[key] = (
                         distribution,
                         distribution_metadata["Version"],
@@ -653,19 +665,22 @@ internal object PythonDependencies {
                     pass
             return 0, version
 
-        def imported_distribution(name, distribution):
-            # of several dist-info of an imported distribution in the dependency directory,
+        def imported_version(name, version_of_distribution):
+            # the version of the dist-info, of several of an imported distribution in the dependency directory,
             # the one whose files of the imported modules are installed, as the constraint keeps them:
             # of several such ones, e.g. when a version only added files, the one recording the most of them,
-            # then the highest version, otherwise the one importlib.metadata finds first
+            # then the highest version, otherwise the one importlib.metadata finds first;
+            # as the version, of the readable metadata
             candidates = []
             for path in dependency_dist_infos.get(normalized_name(name), []):
                 candidate = metadata.PathDistribution(Path(path))
                 count = imported_files(candidate)
-                if count is not None:
-                    candidates.append((count, version_key(candidate.version), candidate))
+                candidate_metadata = read_metadata(candidate) if count is not None else None
+                if candidate_metadata is not None:
+                    version = candidate_metadata["Version"]
+                    candidates.append((count, version_key(version), version))
             if not candidates:
-                return distribution
+                return version_of_distribution
             return max(candidates, key=lambda it: it[:2])[2]
 
         def without_credentials(url):
@@ -702,7 +717,7 @@ internal object PythonDependencies {
             # compared without hitting the network
             try:
                 direct_url = json.loads(distribution.read_text("direct_url.json") or "null")
-            except ValueError:
+            except (OSError, ValueError):
                 return None
             if not isinstance(direct_url, dict) or not isinstance(direct_url.get("url"), str):
                 return None
@@ -788,13 +803,16 @@ internal object PythonDependencies {
             missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
             constraints = {}
             for distribution in metadata.distributions():
-                name = distribution.metadata["Name"]
+                distribution_metadata = read_metadata(distribution)
+                if distribution_metadata is None:
+                    continue
+                name, version = distribution_metadata["Name"], distribution_metadata["Version"]
                 in_dependencies = is_in_dependencies(distribution)
-                if name and name not in constraints and (not in_dependencies or is_imported(name, distribution)):
+                if name not in constraints and (not in_dependencies or is_imported(name, distribution)):
                     if in_dependencies and len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
                         # not the version of a dist-info left by a replaced version
-                        distribution = imported_distribution(name, distribution)
-                    constraints[name] = distribution.version
+                        version = imported_version(name, version)
+                    constraints[name] = version
             for dependency in missing:
                 print("install", dependency)
             for name, version in constraints.items():
