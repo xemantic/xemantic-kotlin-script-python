@@ -488,13 +488,14 @@ internal object PythonDependencies {
         # the suffixes of the module files, the longest first, like .cpython-310-x86_64-linux-gnu.so before .so
         module_suffixes = sorted(importlib.machinery.all_suffixes(), key=len, reverse=True)
 
-        def top_level_name(path):
+        def top_level_name(path, vendored=False):
             # the top-level module of a path recorded in RECORD,
-            # like demo of demo/__init__.py, demo.libs/ of auditwheel, demo.py or demo.cpython-310-x86_64-linux-gnu.so,
+            # like demo of demo/__init__.py, demo.py or demo.cpython-310-x86_64-linux-gnu.so,
+            # also of demo.libs/ of auditwheel, if vendored, as the demo module loads the shared libraries in it,
             # or None of e.g. ../../bin/ of pip install --target, the dist-info, the data, __pycache__ or a .pth file
             first, separator, _ = path.partition("/")
             if separator:
-                name = first.partition(".")[0]
+                name = first.partition(".")[0] if vendored else first
             else:
                 name = next((first[:-len(suffix)] for suffix in module_suffixes if first.endswith(suffix)), "")
             return name if name.isidentifier() and name != "__pycache__" else None
@@ -503,14 +504,28 @@ internal object PythonDependencies {
             # the top-level modules of the distribution, told by top_level.txt, otherwise by the recorded files,
             # as e.g. hatchling and flit do not write it:
             # packages_distributions of importlib.metadata tells them only by top_level.txt on Python 3.10,
-            # only of the .py files on 3.11, and fails on a malformed RECORD
-            names = set((distribution.read_text("top_level.txt") or "").split())
+            # only of the .py files on 3.11, and Distribution.files fails on a malformed RECORD,
+            # e.g. of a row with a blank line, an extra column or a size which is not a number,
+            # so RECORD is read as it is, like in imported_files
+            try:
+                names = set((distribution.read_text("top_level.txt") or "").split())
+            except (OSError, ValueError):
+                names = set()
             if names:
                 return names
             try:
-                return {top_level_name(str(file)) for file in distribution.files or []} - {None}
+                rows = csv.reader((distribution.read_text("RECORD") or "").splitlines())
+                return {top_level_name(row[0]) for row in rows if row} - {None}
             except (OSError, ValueError, csv.Error):
                 return set()
+
+        def is_imported(name, distribution):
+            # whether the distribution in the dependency directory, or another dist-info of its name there,
+            # tells an imported top-level module
+            candidates = [distribution] + [
+                metadata.PathDistribution(Path(path)) for path in dependency_dist_infos.get(normalized_name(name), [])
+            ]
+            return any(not imported.isdisjoint(top_level(candidate)) for candidate in candidates)
 
         def imported_files(distribution):
             # the number of the recorded files of the imported top-level modules of the distribution,
@@ -522,7 +537,7 @@ internal object PythonDependencies {
                     (row[0].split("/"), row[1].partition("="))
                     for row in csv.reader((distribution.read_text("RECORD") or "").splitlines())
                     if len(row) > 1 and row[1] and not row[0].endswith(".pyc")
-                    and top_level_name(row[0]) in imported
+                    and top_level_name(row[0], vendored=True) in imported
                 ]
                 for parts, (algorithm, _, value) in files:
                     if algorithm not in hashlib.algorithms_guaranteed or algorithm.startswith("shake_"):
@@ -663,15 +678,11 @@ internal object PythonDependencies {
             # pip resolves the missing ones without the dependency directory, so it would install a distribution
             # required by them from the index over the one installed from a URL, also in the same version
             missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
-            in_use = {
-                distribution.metadata["Name"] for distribution in metadata.distributions()
-                if not imported.isdisjoint(top_level(distribution))
-            }
             constraints = {}
             for distribution in metadata.distributions():
                 name = distribution.metadata["Name"]
                 in_dependencies = os.path.realpath(distribution.locate_file("")) == dependency_location
-                if name and name not in constraints and (not in_dependencies or name in in_use):
+                if name and name not in constraints and (not in_dependencies or is_imported(name, distribution)):
                     if in_dependencies and len(dependency_dist_infos.get(normalized_name(name), [])) > 1:
                         # not the version of a dist-info left by a replaced version
                         distribution = imported_distribution(name, distribution)
