@@ -24,7 +24,9 @@ import java.io.IOException
 import java.nio.file.Path
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectories
 import kotlin.io.path.createDirectory
+import kotlin.io.path.createFile
 import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
@@ -126,6 +128,204 @@ class PythonLibraryTest {
             assert(output == "imported")
             assert(exitCode == 0)
         }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython behind empty entry of LD_LIBRARY_PATH with another libpython in working directory`() =
+        withLibraryDirectory { directory ->
+            // given
+            // glibc takes an empty entry for the working directory, which has another libpython of the same soname
+            val workingDirectory = directory.resolve("working").createDirectory()
+            workingDirectory.resolve("libxemantic-test.so.1").createFile()
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            val cache = "ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$library\u0000".toByteArray(filesystemCharset)
+
+            // when
+            // a trailing empty entry before the library listed in the cache
+            val found = listOf(":$directory", "/nonexistent:", "/nonexistent::$directory").map { libraryPath ->
+                loaderFinds(library, libraryPath = libraryPath, cache = { cache }, workingDirectory = workingDirectory)
+            }
+
+            // then
+            assert(found == listOf(false, false, false))
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython in working directory of empty entry of LD_LIBRARY_PATH`() =
+        withLibraryDirectory { directory ->
+            // given
+            // glibc would find it there, but musl skips an empty entry, so that it is not certain
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(library, libraryPath = ":/nonexistent", cache = { null }, workingDirectory = directory)
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader finds libpython behind empty entry of LD_LIBRARY_PATH without it in working directory`() =
+        withLibraryDirectory { directory ->
+            // given
+            val workingDirectory = directory.resolve("working").createDirectory()
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(
+                library, libraryPath = ":$directory:", cache = { null }, workingDirectory = workingDirectory
+            )
+
+            // then
+            assert(found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader finds libpython in relative entry of LD_LIBRARY_PATH of working directory`() =
+        withLibraryDirectory { directory ->
+            // given
+            val library = directory.resolve("lib").createDirectory().resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(library, libraryPath = "lib", cache = { null }, workingDirectory = directory)
+            val notFound = loaderFinds(library, libraryPath = "other", cache = { null }, workingDirectory = directory)
+
+            // then
+            assert(found && !notFound)
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with LD_LIBRARY_PATH split at semicolon`() =
+        withLibraryDirectory { directory ->
+            // given
+            // glibc splits LD_LIBRARY_PATH also at a semicolon, unlike musl
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(library, libraryPath = "/nonexistent;$directory:$directory", cache = { null })
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with another one in glibc-hwcaps subdirectory`() =
+        withLibraryDirectory { directory ->
+            // given
+            // glibc searches first the subdirectory of the most capable CPU level it supports
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            directory.resolve("glibc-hwcaps/x86-64-v3").createDirectories().resolve("libxemantic-test.so.1").createFile()
+
+            // when
+            val found = loaderFinds(library, libraryPath = "$directory", cache = { null })
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should tell that dynamic loader does not find libpython with glibc-hwcaps one in its cache`() =
+        withLibraryDirectory { directory ->
+            // given
+            val library = directory.resolve("libxemantic-test.so.1").createFile()
+            val hwcapsLibrary = directory.resolve("glibc-hwcaps/x86-64-v3").createDirectories()
+                .resolve("libxemantic-test.so.1").createFile()
+            val cache = ("ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$library\u0000" +
+                "libxemantic-test.so.1\u0000$hwcapsLibrary\u0000").toByteArray(filesystemCharset)
+
+            // when
+            val found = loaderFinds(library, libraryPath = null, cache = { cache })
+
+            // then
+            assert(!found)
+        }
+
+    @Test
+    fun `should take development symlink of shared libpython as the name Jep opens`() =
+        withLibraryDirectory { directory ->
+            // when
+            val name = jepLibraryName("$directory", "libpython3.13.so", "x86_64-linux-gnu")
+
+            // then
+            assert(name == "libpython3.13.so")
+        }
+
+    @Test
+    fun `should take shared libpython of static development name as the name Jep opens`() =
+        withLibraryDirectory { directory ->
+            // given
+            // e.g. of conda-forge, without the static libpython3.12.a
+            val libraryDirectory = directory.resolve("lib").createDirectory()
+            libraryDirectory.resolve("libpython3.12.so").createFile()
+            directory.resolve("multiarch").createDirectory().resolve("libpython3.12.so").createFile()
+
+            // when
+            val name = jepLibraryName("$libraryDirectory", "libpython3.12.a", "x86_64-linux-gnu")
+            val multiarchName = jepLibraryName("$directory", "libpython3.12.a", "multiarch")
+
+            // then
+            assert(name == "libpython3.12.so" && multiarchName == "libpython3.12.so")
+        }
+
+    @Test
+    fun `should not take static libpython which Jep opens as development name`() =
+        withLibraryDirectory { directory ->
+            // given
+            // Jep opens the static libpython3.12.a, which it cannot, when it exists, also in the multiarch subdirectory
+            val static = directory.resolve("static").createDirectory()
+            static.resolve("libpython3.12.a").createFile()
+            static.resolve("libpython3.12.so").createFile()
+            val multiarchStatic = directory.resolve("multiarch-static").createDirectory()
+            multiarchStatic.resolve("libpython3.12.so").createFile()
+            multiarchStatic.resolve("x86_64-linux-gnu").createDirectory().resolve("libpython3.12.a").createFile()
+            val neither = directory.resolve("neither").createDirectory()
+
+            // when
+            val names = listOf(static, multiarchStatic, neither).map {
+                jepLibraryName("$it", "libpython3.12.a", "x86_64-linux-gnu")
+            }
+            val unknownDirectory = jepLibraryName("", "libpython3.12.a", "x86_64-linux-gnu")
+
+            // then
+            assert(names == listOf("", "", "") && unknownDirectory == "")
+        }
+
+    @Test
+    fun `should not advise static libpython to make its symbols global`() {
+        // given
+        val library = Path("/opt/conda/lib/libpython3.12.so.1.0")
+
+        // when
+        val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.a")
+
+        // then
+        assert(
+            advice == "put /opt/conda/lib on LD_LIBRARY_PATH before the JVM starts, " +
+                "unless it is a directory the dynamic loader searches anyway"
+        )
+    }
+
+    @Test
+    fun `should tell that Jep does not load libpython globally by static development name`() {
+        // given
+        val library = Path("/opt/conda/lib/libpython3.12.so.1.0")
+
+        // when
+        val loadsGlobally = jepLoadsGlobally(library, "libpython3.12.a", finds = { true })
+
+        // then
+        assert(!loadsGlobally)
+    }
+
+    /** Runs the [block] with a new temporary directory, deleted afterwards. */
+    @OptIn(ExperimentalPathApi::class)
+    private fun withLibraryDirectory(block: (directory: Path) -> Unit) {
+        val directory = createTempDirectory("python-library")
+        try {
+            block(directory)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
 
     /**
      * Runs the [block] with a new temporary directory, deleted afterwards,

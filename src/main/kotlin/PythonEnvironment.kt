@@ -103,16 +103,17 @@ public object PythonEnvironment {
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
         val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
+        val jepLibraryName = jepLibraryName(probe.libraryDirectory, probe.libraryDevelopmentName, probe.libraryMultiarch)
         // only when needed, as the foreign linker prints a warning without --enable-native-access
         val loading = if (
             pythonLibrary != null && System.getProperty("os.name").startsWith("Linux") &&
-            !jepLoadsGlobally(pythonLibrary, probe.libraryDevelopmentName)
+            !jepLoadsGlobally(pythonLibrary, jepLibraryName)
         ) {
             loadPythonLibrary(pythonLibrary)
         } else PythonLibraryLoading()
         this.executable = executable
         starter = EmbeddedPythonStarter(
-            executable, probe.error, pythonLibrary, probe.libraryDevelopmentName, loading.failure, loading.localSymbols
+            executable, probe.error, pythonLibrary, jepLibraryName, loading.failure, loading.localSymbols
         )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -276,14 +277,15 @@ public object PythonEnvironment {
         val begin = lines.lastIndexOf("\n$PROBE_BEGIN\n").takeIf { it != -1 }?.let { it + PROBE_BEGIN.length + 2 }
         val end = begin?.let { lines.indexOf("\n$PROBE_END", it) }?.takeIf { it != -1 }
         val values = if (begin == null || end == null) null else lines.substring(begin, end).split(' ')
-        if (values == null || values.size != 8) return null
+        if (values == null || values.size != 9) return null
         val paths = values.map { it.hexToPath() ?: return null }
         val (executable, cacheTag, prefix, jepLocation, externallyManaged) = paths
         return PythonProbe(
             executable, cacheTag, prefix, jepLocation, externallyManaged.isNotEmpty(),
             libraryDirectory = paths[5],
             librarySoname = paths[6],
-            libraryDevelopmentName = paths[7]
+            libraryDevelopmentName = paths[7],
+            libraryMultiarch = paths[8]
         )
     }
 
@@ -300,8 +302,9 @@ public object PythonEnvironment {
      * a base Python, not a virtual environment, with an `EXTERNALLY-MANAGED` file in its standard library,
      * into which pip refuses to install.
      * The values after it are the directory, the soname and the name of the development symlink
-     * of the `libpython` of the base Python, `LIBDIR`, `INSTSONAME` and `LDLIBRARY` of `sysconfig`,
-     * empty if unknown, e.g. on Windows, see [pythonLibrary] and [jepLoadsGlobally].
+     * of the `libpython` of the base Python, and the multiarch subdirectory of the directory,
+     * `LIBDIR`, `INSTSONAME`, `LDLIBRARY` and `MULTIARCH` of `sysconfig`,
+     * empty if unknown, e.g. on Windows, see [pythonLibrary] and [jepLibraryName].
      * Without the `jep` package, it exits with the [PROBE_JEP_MISSING_EXIT_CODE],
      * or the [PROBE_JEP_MISSING_EXTERNALLY_MANAGED_EXIT_CODE] if the Python is externally managed,
      * writing to the standard error the file of a `jep` module, if any, e.g. a `jep.py` shadowing the package.
@@ -333,6 +336,7 @@ public object PythonEnvironment {
         |    sysconfig.get_config_var('LIBDIR'),
         |    sysconfig.get_config_var('INSTSONAME'),
         |    sysconfig.get_config_var('LDLIBRARY'),
+        |    sysconfig.get_config_var('MULTIARCH'),
         |]
         |payload = ' '.join('' if value is None else os.fsencode(str(value)).hex() for value in values)
         |sys.stdout.flush()
@@ -516,7 +520,8 @@ private fun String.hexToPath(): String? {
  * or the [libraryPreloadFailure] of [loadPythonLibrary], if any, also kept as suppressed.
  * The symbols of the [pythonLibrary] loaded by [loadPythonLibrary], if [libraryLocalSymbols],
  * are made global in the first interpreter, see [makePythonLibraryGlobal],
- * or, if they cannot be, it tells how, with the [libraryDevelopmentName], see [pythonLibraryGlobalAdvice].
+ * or, if they cannot be, it tells how, with the [libraryDevelopmentName] which Jep opens, see [jepLibraryName]
+ * and [pythonLibraryGlobalAdvice].
  */
 internal class EmbeddedPythonStarter(
     private val executable: String,
@@ -662,7 +667,9 @@ internal class EmbeddedPythonStarter(
  * @property libraryDirectory the directory of the `libpython` of the base Python, `LIBDIR`, empty if unknown.
  * @property librarySoname the soname of the `libpython`, `INSTSONAME`, empty if unknown, see [pythonLibrary].
  * @property libraryDevelopmentName the name of the development symlink of the `libpython`, `LDLIBRARY`,
- * empty if unknown, see [jepLoadsGlobally].
+ * empty if unknown, see [jepLibraryName].
+ * @property libraryMultiarch the multiarch subdirectory of the [libraryDirectory], `MULTIARCH`, e.g. `x86_64-linux-gnu`,
+ * empty if unknown, see [jepLibraryName].
  * @property error the standard error of the probe, e.g. a warning of Python, empty if none.
  */
 internal data class PythonProbe(
@@ -674,6 +681,7 @@ internal data class PythonProbe(
     val libraryDirectory: String = "",
     val librarySoname: String = "",
     val libraryDevelopmentName: String = "",
+    val libraryMultiarch: String = "",
     val error: String = ""
 )
 
