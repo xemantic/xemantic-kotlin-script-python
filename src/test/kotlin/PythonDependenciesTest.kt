@@ -1254,7 +1254,7 @@ class PythonDependenciesTest {
                 "../../bin/replaced-probe" to ""
             )
             directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
-            writeDistInfo(directory, "1.0", modules, topLevel = false)
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
 
             // when
             val constraints = importedConstraints(directory)
@@ -1270,7 +1270,7 @@ class PythonDependenciesTest {
         withDistInfos { directory ->
             val modules = mapOf("replaced_probe.py" to "X = 1\n")
             modules.forEach { (path, content) -> directory.resolve(path).writeText(content) }
-            writeDistInfo(directory, "1.0", modules, topLevel = false)
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
 
             // when
             val constraints = importedConstraints(directory)
@@ -1292,7 +1292,60 @@ class PythonDependenciesTest {
                 "../../bin/replaced_probe" to ""
             )
             directory.resolve("other_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
-            writeDistInfo(directory, "1.0", files, topLevel = false)
+            writeDistInfo(directory, "1.0", files, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should constrain imported extension module of distribution without top_level_txt`() {
+        // given
+        // like replaced_probe.cpython-310-x86_64-linux-gnu.so, which ends also with the shorter suffix .so
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe${extensionSuffix()}" to "")
+            modules.forEach { (path, content) -> directory.resolve(path).writeText(content) }
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported package of distribution with empty top_level_txt`() {
+        // given
+        // like Python 3.11+, which tells the modules of such a distribution by its recorded files
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", modules, topLevel = "")
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should not constrain distribution without top_level_txt of malformed RECORD`() {
+        // given
+        // its file size is not a number
+        withDistInfos { directory ->
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(
+                directory, "1.0", topLevel = null,
+                record = "replaced_probe/__init__.py,sha256=x,notanint\nreplaced_probe-1.0.dist-info/RECORD,,\n"
+            )
 
             // when
             val constraints = importedConstraints(directory)
@@ -1536,24 +1589,34 @@ class PythonDependenciesTest {
 
     /**
      * Writes the dist-info directory of the [name] [version] into the [directory],
-     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds.
+     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds,
+     * unless the [record] is given, and with the [topLevel] content of `top_level.txt`, unless it is `null`.
      */
     private fun writeDistInfo(
         directory: Path,
         version: String,
         files: Map<String, String> = emptyMap(),
         name: String = "replaced-probe",
-        topLevel: Boolean = true
+        // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
+        topLevel: String? = "${name.replace('-', '_')}\n",
+        record: String? = null
     ) {
         val distInfo = "${name.replace('-', '_')}-$version.dist-info"
         val metadata = mapOf(
             "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n"
-        ) + if (topLevel) mapOf(
-            // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
-            "$distInfo/top_level.txt" to "${name.replace('-', '_')}\n"
-        ) else emptyMap()
+        ) + if (topLevel != null) mapOf("$distInfo/top_level.txt" to topLevel) else emptyMap()
         metadata.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
-        directory.resolve("$distInfo/RECORD").writeText(record(files + metadata, distInfo))
+        directory.resolve("$distInfo/RECORD").writeText(record ?: record(files + metadata, distInfo))
+    }
+
+    /** The suffix of the extension modules of the Python of the tests, like `.cpython-310-x86_64-linux-gnu.so`. */
+    private fun extensionSuffix(): String {
+        val process = ProcessBuilder(
+            PythonEnvironment.executable, "-c", "import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])"
+        ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
+        val suffix = process.inputStream.bufferedReader().readText().trim()
+        check(process.waitFor() == 0 && suffix.isNotEmpty()) { "No extension suffix: $suffix" }
+        return suffix
     }
 
     private fun Path.distInfoNames(): List<String> =
