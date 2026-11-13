@@ -255,7 +255,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with output before and after values`() {
         // given
-        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")}\nmore noise"
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")}\nmore noise"
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -269,7 +269,7 @@ class PythonEnvironmentTest {
         // given
         val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
             "${PythonEnvironment.PROBE_BEGIN}\n" +
-            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -281,7 +281,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with empty first value`() {
         // given
-        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -293,7 +293,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with values containing spaces and non-ASCII`() {
         // given
-        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "", "")
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -303,11 +303,11 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should parse probe output with library directory, soname and development symlink of libpython`() {
+    fun `should parse probe output with library directory and soname of libpython`() {
         // given
         val output = probePayload(
             "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1",
-            "/opt/python/lib", "libpython3.13.so.1.0", "libpython3.13.so"
+            "/opt/python/lib", "libpython3.13.so.1.0"
         )
 
         // when
@@ -319,8 +319,7 @@ class PythonEnvironmentTest {
                 "/venv/bin/python", "cpython-313", "/venv", "/venv/jep",
                 externallyManaged = true,
                 libraryDirectory = "/opt/python/lib",
-                librarySoname = "libpython3.13.so.1.0",
-                libraryDevelopmentName = "libpython3.13.so"
+                librarySoname = "libpython3.13.so.1.0"
             )
         )
     }
@@ -354,7 +353,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "")
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
             .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
@@ -365,10 +364,10 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should not parse probe output without exactly eight values`() {
+    fun `should not parse probe output without exactly seven values`() {
         // given
-        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
-        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "", "extra")
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "extra")
 
         // when
         val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
@@ -990,7 +989,6 @@ class PythonEnvironmentTest {
 
         // when
         val advice = pythonLibraryGlobalAdvice(library, "libpython3.12.so")
-        val adviceWithoutDevelopmentName = pythonLibraryGlobalAdvice(library, "")
 
         // then
         assert(
@@ -998,10 +996,6 @@ class PythonEnvironmentTest {
                 "unless it is a directory the dynamic loader searches anyway, " +
                 "and if libpython3.12.so is missing there, install the development package of this Python " +
                 "which provides it, e.g. libpython3.X-dev on Debian or Ubuntu"
-        )
-        assert(
-            adviceWithoutDevelopmentName == "put /usr/lib/x86_64-linux-gnu on LD_LIBRARY_PATH before the JVM starts, " +
-                "unless it is a directory the dynamic loader searches anyway"
         )
     }
 
