@@ -969,7 +969,12 @@ class PythonEnvironmentTest {
         // given
         val library = Path("/usr/lib/libpython3.13.so.1.0")
         fun loadsGlobally(foundNames: Set<String>, developmentName: String = "libpython3.13.so") =
-            jepLoadsGlobally(library, developmentName, finds = { name -> name in foundNames })
+            jepLoadsGlobally(
+                library,
+                jepDynamic = { ElfDynamic(listOf("libpython3.13.so.1.0"), searchPath = false) },
+                developmentName = { developmentName },
+                finds = { name -> name in foundNames }
+            )
 
         // when
         val both = loadsGlobally(setOf("libpython3.13.so.1.0", "libpython3.13.so"))
@@ -1364,6 +1369,39 @@ class PythonEnvironmentTest {
 
         // then
         assert(result == ProcessResult(exitCode = 0, output = "out", error = "err"))
+    }
+
+    @Test
+    fun `should remove libpython from LD_PRELOAD inherited by process`() {
+        // when
+        // a libpython of another Python would replace the symbols of the one of the process
+        val other = withoutPythonLibraryPreload(
+            "/opt/lib/libpython3.12.so.1.0 /opt/lib/libxemantic.so:libpython3.13t.so /opt/libpython-helper.so"
+        )
+        val onlyLibpython = withoutPythonLibraryPreload("/opt/lib/libpython3.12.so.1.0")
+        // e.g. the one of the stable ABI, or of another name, not libpython itself
+        val notLibpython = withoutPythonLibraryPreload("/opt/lib/libpython3.so::/opt/lib/libpythonista.so.1")
+
+        // then
+        assert(
+            other == "/opt/lib/libxemantic.so /opt/libpython-helper.so" &&
+                onlyLibpython == null &&
+                notLibpython == "/opt/lib/libpython3.so /opt/lib/libpythonista.so.1"
+        )
+    }
+
+    @Test
+    fun `should run process with LD_PRELOAD passed in its environment as it is`() {
+        // when
+        val preload = runProcess(
+            listOf(venvPython, "-c", "import os; print(os.environ.get('LD_PRELOAD'))"),
+            environment = mapOf("LD_PRELOAD" to "/nonexistent/libpython3.12.so.1.0"),
+            // the loader complains about a missing library on the standard error
+            mergeErrorStream = false
+        ).output
+
+        // then
+        assert(preload == "/nonexistent/libpython3.12.so.1.0")
     }
 
     @Test
