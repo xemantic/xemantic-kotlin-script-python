@@ -57,6 +57,7 @@ import kotlin.io.path.outputStream
 import kotlin.io.path.readBytes
 import kotlin.io.path.readText
 import kotlin.io.path.setLastModifiedTime
+import kotlin.io.path.writeBytes
 import kotlin.io.path.writeText
 import kotlin.test.Test
 import kotlin.test.assertFailsWith
@@ -1245,6 +1246,190 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should constrain imported package of distribution without top_level_txt`() {
+        // given
+        // like a wheel built by hatchling or flit, which Python 3.10 tells the modules of only by top_level.txt
+        withDistInfos { directory ->
+            val modules = mapOf(
+                "replaced_probe/__init__.py" to "X = 1\n",
+                "../../bin/replaced-probe" to ""
+            )
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported single-file module of distribution without top_level_txt`() {
+        // given
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe.py" to "X = 1\n")
+            modules.forEach { (path, content) -> directory.resolve(path).writeText(content) }
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should not constrain distribution without top_level_txt of modules not imported`() {
+        // given
+        // its .pth file, scripts and data, and files outside the directory are no modules
+        withDistInfos { directory ->
+            val files = mapOf(
+                "other_probe/__init__.py" to "X = 1\n",
+                "replaced_probe.pth" to "",
+                "replaced_probe-1.0.data/scripts/replaced_probe" to "",
+                "../../bin/replaced_probe" to ""
+            )
+            directory.resolve("other_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", files, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints.isEmpty())
+        }
+    }
+
+    @Test
+    fun `should constrain imported extension module of distribution without top_level_txt`() {
+        // given
+        // like replaced_probe.cpython-310-x86_64-linux-gnu.so, which ends also with the shorter suffix .so
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe${extensionSuffix()}" to "")
+            modules.forEach { (path, content) -> directory.resolve(path).writeText(content) }
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported package of distribution with empty top_level_txt`() {
+        // given
+        // like Python 3.11+, which tells the modules of such a distribution by its recorded files
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", modules, topLevel = "")
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported package of distribution without top_level_txt of RECORD with non-integer size`() {
+        // given
+        // Distribution.files fails on it with ValueError
+        withDistInfos { directory ->
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(
+                directory, "1.0", topLevel = null,
+                record = "replaced_probe/__init__.py,sha256=x,notanint\nreplaced_probe-1.0.dist-info/RECORD,,\n"
+            )
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported package of distribution without top_level_txt of RECORD with extra column`() {
+        // given
+        // Distribution.files fails on it with TypeError
+        withDistInfos { directory ->
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(
+                directory, "1.0", topLevel = null,
+                record = "replaced_probe/__init__.py,sha256=x,2,extra\nreplaced_probe-1.0.dist-info/RECORD,,\n"
+            )
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported package of distribution without top_level_txt of RECORD with blank line`() {
+        // given
+        // Distribution.files fails on it with TypeError
+        withDistInfos { directory ->
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(
+                directory, "1.0", topLevel = null,
+                record = "replaced_probe/__init__.py,,\n\nreplaced_probe-1.0.dist-info/RECORD,,\n"
+            )
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported package of distribution with top_level_txt not in UTF-8`() {
+        // given
+        // told by its recorded files then
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            directory.resolve("replaced_probe/__init__.py").createParentDirectories().writeText("X = 1\n")
+            writeDistInfo(directory, "1.0", modules, topLevel = null)
+            directory.resolve("replaced_probe-1.0.dist-info/top_level.txt").writeBytes(byteArrayOf(0xff.toByte(), 0xfe.toByte()))
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
+    fun `should not constrain distribution without top_level_txt of dotted directory named like imported module`() {
+        // given
+        // like replaced_probe.libs/ of auditwheel, which is no module
+        withDistInfos { directory ->
+            val files = mapOf("replaced_probe.libs/libprobe.so" to "", "replaced_probe.b/__init__.py" to "")
+            files.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
+            writeDistInfo(directory, "1.0", files, topLevel = null)
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints.isEmpty())
+        }
+    }
+
+    @Test
     fun `should remove dist-info of other version by name when identities are unknown`() {
         withDistInfos { directory ->
             // given
@@ -1478,22 +1663,35 @@ class PythonDependenciesTest {
 
     /**
      * Writes the dist-info directory of the [name] [version] into the [directory],
-     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds.
+     * with a `RECORD` of the [files] with the hashes of the given content, whatever the [directory] holds,
+     * unless the [record] is given, and with the [topLevel] content of `top_level.txt`, unless it is `null`.
      */
     private fun writeDistInfo(
         directory: Path,
         version: String,
         files: Map<String, String> = emptyMap(),
-        name: String = "replaced-probe"
+        name: String = "replaced-probe",
+        // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
+        topLevel: String? = "${name.replace('-', '_')}\n",
+        record: String? = null
     ) {
         val distInfo = "${name.replace('-', '_')}-$version.dist-info"
         val metadata = mapOf(
-            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n",
-            // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
-            "$distInfo/top_level.txt" to "${name.replace('-', '_')}\n"
-        )
+            "$distInfo/METADATA" to "Metadata-Version: 2.1\nName: $name\nVersion: $version\n"
+        ) + if (topLevel != null) mapOf("$distInfo/top_level.txt" to topLevel) else emptyMap()
         metadata.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
-        directory.resolve("$distInfo/RECORD").writeText(record(files + metadata, distInfo))
+        directory.resolve("$distInfo/RECORD").writeText(record ?: record(files + metadata, distInfo))
+    }
+
+    /** The suffix of the extension modules of the Python of the tests, like `.cpython-310-x86_64-linux-gnu.so`. */
+    private fun extensionSuffix(): String {
+        val process = ProcessBuilder(
+            PythonEnvironment.executable, "-c", "import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])"
+        ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
+        process.outputStream.close()
+        val suffix = process.inputStream.bufferedReader().readLine()?.trim()?.ifEmpty { null }
+        check(process.waitFor(5, TimeUnit.MINUTES) && process.exitValue() == 0) { "The Python did not tell the extension suffix" }
+        return checkNotNull(suffix) { "No extension suffix of the Python" }
     }
 
     private fun Path.distInfoNames(): List<String> =
