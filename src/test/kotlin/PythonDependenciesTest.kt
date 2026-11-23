@@ -1514,6 +1514,50 @@ class PythonDependenciesTest {
     }
 
     @Test
+    fun `should constrain imported distribution regardless of top-level non-module files named like its module`() {
+        // given
+        // the .pth and .pyi files of 2.0 are not files of the replaced_probe module,
+        // so that they do not tell which version the installed module is of, here e.g. after 1.0 removed them
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            modules.forEach { (path, content) -> directory.resolve(path).createParentDirectories().writeText(content) }
+            writeDistInfo(directory, "1.0", modules)
+            writeDistInfo(
+                directory, "2.0",
+                modules + mapOf("replaced_probe.pth" to "import os\n", "replaced_probe.pyi" to "X: int\n")
+            )
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==2.0"))
+        }
+    }
+
+    @Test
+    fun `should constrain imported distribution to version of its installed vendored libraries`() {
+        // given
+        // replaced_probe.libs/ of auditwheel holds the shared libraries the replaced_probe module loads,
+        // named by their hash, so that those of 2.0 are not installed
+        withDistInfos { directory ->
+            val modules = mapOf("replaced_probe/__init__.py" to "X = 1\n")
+            val libraries = mapOf("replaced_probe.libs/libprobe-1a2b3c.so" to "1.0\n")
+            (modules + libraries).forEach { (path, content) ->
+                directory.resolve(path).createParentDirectories().writeText(content)
+            }
+            writeDistInfo(directory, "1.0", modules + libraries)
+            writeDistInfo(directory, "2.0", modules + mapOf("replaced_probe.libs/libprobe-4d5e6f.so" to "2.0\n"))
+
+            // when
+            val constraints = importedConstraints(directory)
+
+            // then
+            assert(constraints == listOf("replaced-probe==1.0"))
+        }
+    }
+
+    @Test
     fun `should constrain imported package of distribution without top_level_txt`() {
         // given
         // like a wheel built by hatchling or flit, which Python 3.10 tells the modules of only by top_level.txt
@@ -1972,7 +2016,7 @@ class PythonDependenciesTest {
         version: String,
         files: Map<String, String> = emptyMap(),
         name: String = "replaced-probe",
-        // as importlib.metadata.packages_distributions of Python 3.10 tells the modules only by it
+        // as a distribution built by setuptools tells its top-level modules by it, unlike e.g. one built by hatchling
         topLevel: String? = "${name.replace('-', '_')}\n",
         requires: List<String> = emptyList(),
         directUrl: String? = null,
@@ -1990,13 +2034,15 @@ class PythonDependenciesTest {
 
     /** The suffix of the extension modules of the Python of the tests, like `.cpython-310-x86_64-linux-gnu.so`. */
     private fun extensionSuffix(): String {
-        val process = ProcessBuilder(
-            PythonEnvironment.executable, "-c", "import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])"
-        ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
-        process.outputStream.close()
-        val suffix = process.inputStream.bufferedReader().readLine()?.trim()?.ifEmpty { null }
-        check(process.waitFor(5, TimeUnit.MINUTES) && process.exitValue() == 0) { "The Python did not tell the extension suffix" }
-        return checkNotNull(suffix) { "No extension suffix of the Python" }
+        val (exitCode, output, error) = runProcess(
+            pythonCommand(
+                PythonEnvironment.executable,
+                "import importlib.machinery; print(importlib.machinery.EXTENSION_SUFFIXES[0])"
+            ),
+            mergeErrorStream = false
+        )
+        check(exitCode == 0 && output.isNotEmpty()) { "The Python did not tell the extension suffix: $error" }
+        return output
     }
 
     private fun Path.distInfoNames(): List<String> =
