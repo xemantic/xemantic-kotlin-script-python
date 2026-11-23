@@ -102,16 +102,21 @@ public object PythonEnvironment {
         val library = jepLibrary(Path(jepLocation), python, probe.externallyManaged)
         MainInterpreter.setJepLibraryPath(library.toString())
         MainInterpreter.setInitParams(embeddedPythonConfig(executable))
-        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
         val linux = System.getProperty("os.name").startsWith("Linux")
-        val jepLibraryName = if (pythonLibrary != null && linux) jepLibraryName(library) else ""
+        // read only when needed, and only the ELF library of Linux
+        val jepDynamic by lazy { if (linux) readElfDynamic(library) else null }
+        val jepName by lazy { jepLibraryName(library) }
+        val pythonLibrary = pythonLibrary(probe.libraryDirectory, probe.librarySoname, jepNeeded = { jepDynamic?.needed })
         // only when needed, as the foreign linker prints a warning without --enable-native-access
-        val loading = if (pythonLibrary != null && linux && !jepLoadsGlobally(pythonLibrary, jepLibraryName)) {
+        val loading = if (
+            pythonLibrary != null && linux &&
+            !jepLoadsGlobally(pythonLibrary, jepDynamic = { jepDynamic }, developmentName = { jepName })
+        ) {
             loadPythonLibrary(pythonLibrary)
         } else PythonLibraryLoading()
         this.executable = executable
         starter = EmbeddedPythonStarter(
-            executable, probe.error, pythonLibrary, jepLibraryName, loading.failure, loading.localSymbols
+            executable, probe.error, pythonLibrary, { jepName }, loading.failure, loading.localSymbols
         )
         if (dependencyDirectory == null) {
             dependencyDirectory = System.getProperty(DEPENDENCY_DIRECTORY_PROPERTY)?.let { Path(it) }
@@ -518,7 +523,7 @@ internal class EmbeddedPythonStarter(
     private val executable: String,
     private val probeError: String,
     private val pythonLibrary: Path? = null,
-    private val jepLibraryName: String = "",
+    private val jepLibraryName: () -> String = { "" },
     private val libraryPreloadFailure: Throwable? = null,
     libraryLocalSymbols: Boolean = false
 ) {
@@ -609,7 +614,7 @@ internal class EmbeddedPythonStarter(
                 System.Logger.Level.WARNING,
                 "Cannot make the symbols of $library global, " +
                     "a C extension module might fail to import with an undefined symbol; to have them global, " +
-                    pythonLibraryGlobalAdvice(library, jepLibraryName),
+                    pythonLibraryGlobalAdvice(library, jepLibraryName()),
                 e
             )
         }
@@ -671,6 +676,19 @@ internal data class PythonProbe(
 )
 
 /**
+ * The [preload], a value of `LD_PRELOAD`, separated by spaces or colons like the loader does,
+ * without the libraries named like a `libpython` of a Python version, e.g. `libpython3.12.so.1.0`,
+ * or `null` if no other is left.
+ */
+internal fun withoutPythonLibraryPreload(preload: String): String? = preload.split(' ', ':')
+    .filter { it.isNotEmpty() && !PYTHON_LIBRARY_NAME.matches(it.substringAfterLast('/')) }
+    .takeIf { it.isNotEmpty() }
+    ?.joinToString(" ")
+
+/** The name of a shared `libpython` of a Python version, e.g. `libpython3.13t.so.1.0`. */
+private val PYTHON_LIBRARY_NAME = Regex("libpython\\d+\\.\\d+[a-z]*\\.so(?:\\.[0-9.]*)?")
+
+/**
  * The result of [runProcess].
  *
  * @property exitCode the exit code of the process.
@@ -719,6 +737,12 @@ internal fun runProcess(
     try {
         val builder = ProcessBuilder(command).directory(directory?.toFile())
         builder.environment().apply {
+            // a libpython preloaded for the embedded Python, see pythonLibraryGlobalAdvice,
+            // would replace the symbols of the libpython of another Python; only the inherited one
+            get("LD_PRELOAD")?.let { preload ->
+                val kept = withoutPythonLibraryPreload(preload)
+                if (kept == null) remove("LD_PRELOAD") else put("LD_PRELOAD", kept)
+            }
             putAll(environment)
             // the input is written, and the output read, as UTF-8, while Python would use the locale encoding,
             // e.g. cp1252 on Windows, or ASCII in the C locale;
