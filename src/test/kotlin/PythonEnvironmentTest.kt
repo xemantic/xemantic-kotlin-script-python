@@ -28,11 +28,13 @@ import kotlin.concurrent.thread
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
 import kotlin.io.path.createDirectory
+import kotlin.io.path.createFile
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.createTempFile
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
+import kotlin.io.path.isRegularFile
 import kotlin.io.path.readText
 import kotlin.io.path.setPosixFilePermissions
 import kotlin.io.path.writeText
@@ -252,7 +254,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with output before and after values`() {
         // given
-        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "")}\nmore noise"
+        val output = "noise\n${probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")}\nmore noise"
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -266,7 +268,7 @@ class PythonEnvironmentTest {
         // given
         val output = "${PythonEnvironment.PROBE_BEGIN}\nfake\n${PythonEnvironment.PROBE_END}\n" +
             "${PythonEnvironment.PROBE_BEGIN}\n" +
-            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "")
+            probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -278,7 +280,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with empty first value`() {
         // given
-        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "")
+        val output = probePayload("", "cpython-313", "/venv", "/venv/jep", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
@@ -290,13 +292,51 @@ class PythonEnvironmentTest {
     @Test
     fun `should parse probe output with values containing spaces and non-ASCII`() {
         // given
-        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "")
+        val output = probePayload("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep", "", "", "")
 
         // when
         val probe = PythonEnvironment.parseProbeOutput(output)
 
         // then
         assert(probe == PythonProbe("/My Zażółć/bin/python", "cpython-313", "/My Zażółć", "/My Zażółć/jep"))
+    }
+
+    @Test
+    fun `should parse probe output with library directory and soname of libpython`() {
+        // given
+        val output = probePayload(
+            "/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "1", "/opt/python/lib", "libpython3.13.so.1.0"
+        )
+
+        // when
+        val probe = PythonEnvironment.parseProbeOutput(output)
+
+        // then
+        assert(
+            probe == PythonProbe(
+                "/venv/bin/python", "cpython-313", "/venv", "/venv/jep",
+                externallyManaged = true,
+                libraryDirectory = "/opt/python/lib",
+                librarySoname = "libpython3.13.so.1.0"
+            )
+        )
+    }
+
+    @Test
+    fun `should probe shared libpython of Python built with it`() {
+        // given
+        val shared = runProcess(
+            pythonCommand(venvPython, "import sysconfig\nprint(sysconfig.get_config_var('Py_ENABLE_SHARED'))"),
+            mergeErrorStream = false
+        ).output
+        assumeTrue(shared == "1", "the Python is not built with a shared libpython")
+
+        // when
+        val probe = PythonEnvironment.probePython(venvPython)
+
+        // then
+        val library = pythonLibrary(probe.libraryDirectory, probe.librarySoname)
+        assert(library != null && library.isRegularFile())
     }
 
     @Test
@@ -311,7 +351,7 @@ class PythonEnvironmentTest {
     @Test
     fun `should not parse probe output with begin marker but without end marker`() {
         // given
-        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "")
+        val output = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "")
             .removeSuffix("\n${PythonEnvironment.PROBE_END}")
 
         // when
@@ -322,10 +362,10 @@ class PythonEnvironmentTest {
     }
 
     @Test
-    fun `should not parse probe output without exactly five values`() {
+    fun `should not parse probe output without exactly seven values`() {
         // given
-        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep")
-        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "extra")
+        val tooFew = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "")
+        val tooMany = probePayload("/venv/bin/python", "cpython-313", "/venv", "/venv/jep", "", "", "", "extra")
 
         // when
         val probes = listOf(tooFew, tooMany).map { PythonEnvironment.parseProbeOutput(it) }
@@ -742,6 +782,316 @@ class PythonEnvironmentTest {
         }
     }
 
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should find shared libpython in its library directory on Linux`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libpython3.13.so.1.0").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(directory.toString(), "libpython3.13.so.1.0")
+
+            // then
+            assert(found == library)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find static libpython`() {
+        // given
+        // a Python built without --enable-shared, e.g. by pyenv by default, has its libpython linked statically
+        val directory = createTempDirectory("python-library")
+        directory.resolve("libpython3.13.a").createFile()
+
+        try {
+            // when
+            val found = pythonLibrary(directory.toString(), "libpython3.13.a")
+
+            // then
+            assert(found == null)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not find libpython missing from its library directory`() {
+        // given
+        val directory = createTempDirectory("python-library")
+
+        try {
+            // when
+            val missing = pythonLibrary(directory.toString(), "libpython3.13.so.1.0")
+            val unknownSoname = pythonLibrary(directory.toString(), "")
+            val unknownDirectory = pythonLibrary("", "libpython3.13.so.1.0")
+
+            // then
+            assert(missing == null && unknownSoname == null && unknownDirectory == null)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds libpython in directory of LD_LIBRARY_PATH`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val other = directory.resolve("other").createDirectory()
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = { null })
+
+            // then
+            assert(found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds libpython listed in its cache`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+        val cache = "ld.so-1.7.0\u0000libxemantic-test.so.1\u0000$library\u0000/usr/lib/libc.so.6\u0000"
+            .toByteArray(filesystemCharset)
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = null, cache = { cache })
+
+            // then
+            assert(found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should not read cache of dynamic loader when libpython is found in directory of LD_LIBRARY_PATH`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "$directory", cache = { error("cache read") })
+
+            // then
+            assert(found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should keep failure of loading libpython denied by JVM`() {
+        // given
+        // like System.load with --illegal-native-access=deny
+        val denied = IllegalCallerException("Illegal native access from: unnamed module")
+
+        // when
+        val loading = withSystemProperty(NO_FOREIGN_LINKER_PROPERTY, "true") {
+            loadPythonLibrary(Path("/opt/python/lib/libpython3.13.so.1.0"), load = { throw denied })
+        }
+
+        // then
+        assert(loading.failure === denied && !loading.localSymbols)
+    }
+
+    @Test
+    fun `should use foreign linker unless disabled by system property set to true`() {
+        // when
+        val usage = listOf(null, "false", "true", "TRUE").map { value ->
+            withSystemProperty(NO_FOREIGN_LINKER_PROPERTY, value) { foreignLinkerEnabled() }
+        }
+
+        // then
+        assert(usage == listOf(true, true, false, false))
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader does not find libpython`() {
+        // given
+        val directory = createTempDirectory("python-library")
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+        val cache = "ld.so-1.7.0\u0000libc.so.6\u0000/usr/lib/libc.so.6\u0000".toByteArray(filesystemCharset)
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "", cache = { cache })
+
+            // then
+            assert(!found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @OptIn(ExperimentalPathApi::class)
+    @Test
+    fun `should tell that dynamic loader finds another libpython of same soname first`() {
+        // given
+        // e.g. of another installation of the same Python version
+        val directory = createTempDirectory("python-library")
+        val other = directory.resolve("other").createDirectory()
+        other.resolve("libxemantic-test.so.1").createFile()
+        val library = directory.resolve("libxemantic-test.so.1").createFile()
+
+        try {
+            // when
+            val found = loaderFinds(library, libraryPath = "$other:$directory", cache = { null })
+
+            // then
+            assert(!found)
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `should advise library directory of libpython when native library of Jep cannot load it`() {
+        // given
+        val starter = EmbeddedPythonStarter(
+            "/venv/bin/python", "", pythonLibrary = Path("/opt/python/lib/libpython3.13.so.1.0")
+        )
+        val cause = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
+                "libpython3.13.so.1.0: cannot open shared object file: No such file or directory"
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            exception.cause === cause &&
+                message.startsWith("Cannot initialize the embedded Python /venv/bin/python: ${cause.message}\n") &&
+                "/opt/python/lib" in message &&
+                "LD_LIBRARY_PATH" in message
+        )
+    }
+
+    @Test
+    fun `should tell failure to load libpython instead of advising its directory`() {
+        // given
+        // LD_LIBRARY_PATH would not help, as the loader would fail to load the library the same way
+        val preloadFailure = UnsatisfiedLinkError("/opt/python/lib/libpython3.13.so.1.0: wrong ELF class: ELFCLASS32")
+        val starter = EmbeddedPythonStarter(
+            "/venv/bin/python", "",
+            pythonLibrary = Path("/opt/python/lib/libpython3.13.so.1.0"),
+            libraryPreloadFailure = preloadFailure
+        )
+        val cause = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
+                "libpython3.13.so.1.0: cannot open shared object file: No such file or directory"
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        assert(
+            exception.cause === cause &&
+                exception.suppressed.toList() == listOf(preloadFailure) &&
+                message == "Cannot initialize the embedded Python /venv/bin/python: ${cause.message}\n" +
+                "Cannot load the libpython of this Python: ${preloadFailure.message}"
+        )
+    }
+
+    @Test
+    fun `should advise library directory of libpython when initialization of embedded Python is retried`() {
+        // given
+        val starter = EmbeddedPythonStarter(
+            "/venv/bin/python", "", pythonLibrary = Path("/opt/python/lib/libpython3.13.so.1.0")
+        )
+        val first = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
+                "libpython3.13.so.1.0: cannot open shared object file: No such file or directory"
+        )
+        // like jep's MainInterpreter, rethrowing the failure of the first attempt
+        val cause = Error("The main Python interpreter previously failed to initialize.", first)
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        val message = exception.message!!
+        assert(exception.cause === cause && "/opt/python/lib" in message && "LD_LIBRARY_PATH" in message)
+    }
+
+    @Test
+    fun `should not advise library directory of libpython on other failure of embedded Python startup`() {
+        // given
+        val starter = EmbeddedPythonStarter(
+            "/venv/bin/python", "", pythonLibrary = Path("/opt/python/lib/libpython3.13.so.1.0")
+        )
+        val wrongClass = UnsatisfiedLinkError("/venv/lib/python3.13/site-packages/jep/libjep.so: wrong ELF class: ELFCLASS32")
+        // of libpython found, but of another Python
+        val undefinedSymbol = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: undefined symbol: PyFoo, version libpython3.13.so.1.0"
+        )
+        // of jep built for another Python
+        val anotherVersion = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
+                "libpython3.12.so.1.0: cannot open shared object file: No such file or directory"
+        )
+
+        // when
+        val messages = listOf(wrongClass, undefinedSymbol, anotherVersion).map { cause ->
+            assertFailsWith<IllegalStateException> {
+                starter.createInterpreter(create = { throw cause }, check = {})
+            }.message
+        }
+
+        // then
+        assert(
+            messages == listOf(
+                "Cannot initialize the embedded Python /venv/bin/python: ${wrongClass.message}",
+                "Cannot initialize the embedded Python /venv/bin/python: ${undefinedSymbol.message}",
+                "Cannot initialize the embedded Python /venv/bin/python: ${anotherVersion.message}"
+            )
+        )
+    }
+
+    @Test
+    fun `should not advise library directory of Python without shared libpython`() {
+        // given
+        val starter = EmbeddedPythonStarter("/venv/bin/python", "")
+        val cause = UnsatisfiedLinkError(
+            "/venv/lib/python3.13/site-packages/jep/libjep.so: " +
+                "libpython3.13.so.1.0: cannot open shared object file: No such file or directory"
+        )
+
+        // when
+        val exception = assertFailsWith<IllegalStateException> {
+            starter.createInterpreter(create = { throw cause }, check = {})
+        }
+
+        // then
+        assert(exception.message == "Cannot initialize the embedded Python /venv/bin/python: ${cause.message}")
+    }
+
     @Test
     fun `should report stderr of probe on Error of embedded Python startup`() {
         // given
@@ -842,6 +1192,16 @@ class PythonEnvironmentTest {
     }
 
     /** The output of [PythonEnvironment.probeCommand] writing the [values], trimmed as by [runProcess]. */
+    private fun <T> withSystemProperty(name: String, value: String?, block: () -> T): T {
+        val previous = System.getProperty(name)
+        if (value == null) System.clearProperty(name) else System.setProperty(name, value)
+        try {
+            return block()
+        } finally {
+            if (previous == null) System.clearProperty(name) else System.setProperty(name, previous)
+        }
+    }
+
     private fun probePayload(vararg values: String): String {
         val hexValues = values.joinToString(" ") { it.toByteArray(filesystemCharset).toHexString() }
         return "${PythonEnvironment.PROBE_BEGIN}\n$hexValues\n${PythonEnvironment.PROBE_END}"

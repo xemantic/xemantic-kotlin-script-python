@@ -72,6 +72,23 @@ The Python executable is, in this order:
 The Python code imports the modules from the same paths as this executable,
 e.g. the `site-packages` of a virtual environment, but not the ones of its base Python.
 
+The native library of `jep` links to the shared `libpython` of the Python, e.g. `libpython3.13.so.1.0`,
+which on Linux the dynamic loader finds by its soname in the directories of `LD_LIBRARY_PATH`, of `ld.so.cache`, and the system ones,
+unless the native library of `jep` has a `RUNPATH` of it, e.g. in conda.
+For a Python installed elsewhere, e.g. by `uv python install`, pyenv, or in a custom prefix,
+the library loads `libpython` from the `LIBDIR` of the Python's `sysconfig` itself, with its symbols global,
+as C extension modules, e.g. of numpy, need them,
+so that `LD_LIBRARY_PATH` is not needed.
+On Java 22 or newer, it does so with the foreign linker, a restricted method,
+which, like loading the native library of `jep` on Java 24 or newer, prints a warning without `--enable-native-access=ALL-UNNAMED`.
+On Java 17 to 21, the symbols become global only after the startup of Python,
+so a C extension imported at the startup, by a `.pth` file of the `site-packages`, e.g. of coverage, or by `sitecustomize`,
+fails with an `undefined symbol` and still needs `LD_LIBRARY_PATH`.
+If `libpython` is not found, e.g. on macOS, where it is not loaded so,
+put its directory, the `LIBDIR` of `sysconfig`, on `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS),
+set before the JVM starts, as the loader reads it only then.
+pyenv builds Python without a shared `libpython` by default, build it with `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
+
 The embedded Python, like every Python process started by this library, e.g. `pip`,
 runs in the [UTF-8 mode](https://peps.python.org/pep-0540/),
 whatever the locale, e.g. cp1252 on Windows, or `C` on Linux:
