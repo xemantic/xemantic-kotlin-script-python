@@ -311,7 +311,8 @@ internal object PythonDependencies {
         # before any import which can fail, so that the input is always read
         request = json.loads(sys.stdin.read())
 
-        import importlib, importlib.metadata as metadata, os, re
+        import hashlib, importlib, importlib.metadata as metadata, os, re
+        from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
         directory, imported = sys.argv[1], set(request["modules"])
         sys.path.append(directory)
@@ -350,17 +351,130 @@ internal object PythonDependencies {
                     sys.exit(f"Invalid dependency '{dependency}': {e}")
                 if requirement.marker is not None and not requirement.marker.evaluate():
                     return False
+                if requirement.url is not None:
+                    url_dependencies.add(dependency)
                 name = requirement.name
             try:
-                version = metadata.version(name)
+                distribution = metadata.distribution(name)
             except metadata.PackageNotFoundError:
                 return True
             if Requirement is None:
                 return specified
-            return requirement.url is not None or not requirement.specifier.contains(version, prereleases=True)
+            if requirement.url is not None:
+                # the dependencies of the extras are not checked (#47), so they are installed again with them,
+                # and pip --target --upgrade leaves the dist-info of the previous version, maybe with its
+                # direct_url.json, so it cannot be known which of them the installed files belong to
+                return (
+                    bool(requirement.extras)
+                    or len(list(metadata.distributions(name=name, path=[directory]))) > 1
+                    or not is_installed_from(requirement.url, distribution)
+                )
+            return not requirement.specifier.contains(distribution.version, prereleases=True)
 
+        def without_credentials(url):
+            # direct_url.json holds the URL without credentials, and without the fragment
+            parts = urlsplit(url)
+            return urlunsplit((parts.scheme.lower(), parts.netloc.rpartition("@")[2].lower(), parts.path, parts.query, ""))
+
+        def file_digests(path, algorithms):
+            # in one pass over the file for all the algorithms
+            try:
+                digests = {algorithm: hashlib.new(algorithm) for algorithm in algorithms}
+                with open(path, "rb") as file:
+                    for chunk in iter(lambda: file.read(1 << 20), b""):
+                        for digest in digests.values():
+                            digest.update(chunk)
+                return {algorithm: digest.hexdigest() for algorithm, digest in digests.items()}
+            except (OSError, ValueError):
+                return None
+
+        def is_unmodified_since_uv_install(path, distribution):
+            # uv records the change time of a local archive in uv_cache.json, the last write time on Windows,
+            # not its hash
+            try:
+                timestamp = json.loads(distribution.read_text("uv_cache.json") or "null")["timestamp"]
+                installed_time = timestamp["secs_since_epoch"] * 1_000_000_000 + timestamp["nanos_since_epoch"]
+                status = os.stat(path)
+                return (status.st_mtime_ns if os.name == "nt" else status.st_ctime_ns) == installed_time
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
+
+        def is_installed_from(url, distribution):
+            # compared with the direct_url.json of the distribution, PEP 610, without hitting the network
+            try:
+                installed = json.loads(distribution.read_text("direct_url.json") or "null")
+            except ValueError:
+                return False
+            if not isinstance(installed, dict) or not isinstance(installed.get("url"), str):
+                return False
+            url, _, fragment = url.partition("#")
+            options = dict(parse_qsl(fragment))
+            if options.pop("subdirectory", None) != installed.get("subdirectory"):
+                return False
+            vcs, plus, _ = urlsplit(url).scheme.partition("+")
+            vcs_info = installed.get("vcs_info")
+            if plus and vcs in ("git", "hg", "svn", "bzr"):
+                # a branch or a tag is satisfied by the commit installed for it before, as the snippet requests
+                # the same thing, and the latest commit cannot be known without the network
+                parts = urlsplit(url[len(vcs) + 1:])
+                path, at, revision = parts.path.rpartition("@")
+                if not at:
+                    path, revision = parts.path, None
+                if not isinstance(vcs_info, dict) or vcs_info.get("vcs") != vcs:
+                    return False
+                installed_url = installed["url"]
+                if installed_url.startswith(vcs + "+"):
+                    installed_url = installed_url[len(vcs) + 1:]
+                if without_credentials(parts._replace(path=path).geturl()) != without_credentials(installed_url):
+                    return False
+                if revision is not None and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", revision):
+                    return vcs_info.get("commit_id") == revision
+                return vcs_info.get("requested_revision") == revision
+            archive_info = installed.get("archive_info")
+            if vcs_info is not None or not isinstance(archive_info, dict):
+                # a local directory can change without changing its URL, so it is always installed again
+                return False
+            if without_credentials(url) != without_credentials(installed["url"]):
+                return False
+            # pip records the hashes, also when not requested, while uv records none,
+            # but keeps the hash fragment in the URL of a local archive
+            hashes = archive_info.get("hashes")
+            hashes = dict(hashes) if isinstance(hashes, dict) else {}
+            legacy_hash = archive_info.get("hash")
+            if isinstance(legacy_hash, str) and "=" in legacy_hash:
+                hashes.setdefault(*legacy_hash.split("=", 1))
+            for algorithm, value in parse_qsl(installed["url"].partition("#")[2]):
+                # the recorded hashes are the ones verified on installation
+                hashes.setdefault(algorithm, value)
+            # a shake digest has no fixed length to compute and compare
+            if any(name.startswith("shake_") for name in options):
+                return False
+            algorithms = {name for name in hashlib.algorithms_guaranteed if not name.startswith("shake_")}
+            hashes = {name: str(value).lower() for name, value in hashes.items() if name in algorithms}
+            requested = {name: value.lower() for name, value in options.items() if name in algorithms}
+            if any(name in hashes and hashes[name] != value for name, value in requested.items()):
+                return False
+            if urlsplit(url).scheme.lower() != "file":
+                # a remote archive is trusted to keep its content under the same URL,
+                # as uv records no hash of it, not even the requested one,
+                # but a requested hash of another algorithm than the ones pip recorded cannot be verified
+                return not hashes or all(name in hashes for name in requested)
+            # imported only here, as it imports http.client, email and ssl
+            from urllib.request import url2pathname
+            # a local archive can be rebuilt without changing its URL, so its content is compared
+            path = url2pathname(urlsplit(url).path)
+            if hashes:
+                expected = {**hashes, **requested}
+                return file_digests(path, expected) == expected
+            return not requested and is_unmodified_since_uv_install(path, distribution)
+
+        # the URL requirements whose marker applies, collected by is_missing
+        url_dependencies = set()
         missing = [dependency for dependency in dependencies if is_missing(dependency)]
         if missing:
+            # pip resolves the missing ones without the dependency directory, so it would install a distribution
+            # required by them from the index over the one installed from a URL, also in the same version
+            missing = [dependency for dependency in dependencies if dependency in missing or dependency in url_dependencies]
             distributions_of = metadata.packages_distributions()
             in_use = {name for module in imported for name in distributions_of.get(module, [])}
             dependency_location = os.path.realpath(directory)
