@@ -24,6 +24,8 @@ import java.io.IOException
 import java.nio.file.Path
 import kotlin.io.path.ExperimentalPathApi
 import kotlin.io.path.Path
+import kotlin.io.path.createDirectory
+import kotlin.io.path.createSymbolicLinkPointingTo
 import kotlin.io.path.createTempDirectory
 import kotlin.io.path.deleteRecursively
 import kotlin.io.path.exists
@@ -45,38 +47,22 @@ class PythonLibraryTest {
 
     private val venvPython = Path(System.getenv("VIRTUAL_ENV"), "bin", "python").toString()
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
-    fun `should import C extension not linked to libpython without LD_LIBRARY_PATH`() {
-        // given
-        val directory = createTempDirectory("python-library")
-        try {
-            compileExtension(directory)
+    fun `should import C extension not linked to libpython without LD_LIBRARY_PATH`() = withExtension { directory ->
+        // when
+        val (exitCode, output) = importExtension(directory, libraryPath = null)
 
-            // when
-            val (exitCode, output) = runInJvm(
-                EmbeddedPythonMain::class.java.name,
-                input = "import xemantic_extension\nprint(xemantic_extension.VALUE, flush=True)",
-                environment = mapOf("LD_LIBRARY_PATH" to null, "PYTHONPATH" to directory.toString())
-            )
-
-            // then
-            assert(output == "imported")
-            assert(exitCode == 0)
-        } finally {
-            directory.deleteRecursively()
-        }
+        // then
+        assert(output == "imported")
+        assert(exitCode == 0)
     }
 
-    @OptIn(ExperimentalPathApi::class)
     @Test
     fun `should import C extension not linked to libpython at startup of Python without LD_LIBRARY_PATH`() {
         // given
         // on Java 17 to 21, the symbols of libpython become global only after the startup, see loadPythonLibrary
         assumeTrue(Runtime.version().feature() >= 22, "the foreign linker is of Java 22")
-        val directory = createTempDirectory("python-library")
-        try {
-            compileExtension(directory)
+        withExtension { directory ->
             // imported by the site module at the startup, like a .pth file of the site-packages does, e.g. of coverage
             directory.resolve("sitecustomize.py").writeText(
                 """
@@ -90,43 +76,111 @@ class PythonLibraryTest {
             )
 
             // when
-            val (exitCode, output) = runInJvm(
-                EmbeddedPythonMain::class.java.name,
-                input = "import sys\nprint(sys.xemantic_startup_import, flush=True)",
-                environment = mapOf("LD_LIBRARY_PATH" to null, "PYTHONPATH" to directory.toString())
+            val (exitCode, output) = importExtension(
+                directory,
+                libraryPath = null,
+                input = "import sys\nprint(sys.xemantic_startup_import, flush=True)"
             )
 
             // then
             assert(output == "imported")
             assert(exitCode == 0)
+        }
+    }
+
+    @Test
+    fun `should import C extension not linked to libpython without LD_LIBRARY_PATH and foreign linker`() =
+        withExtension { directory ->
+            // when
+            val (exitCode, output) = importExtension(directory, libraryPath = null, foreignLinker = false)
+
+            // then
+            assert(output == "imported")
+            assert(exitCode == 0)
+        }
+
+    @Test
+    fun `should import C extension not linked to libpython found by loader without its development symlink`() =
+        withExtension { directory ->
+            // given
+            val libraryPath = sonameOnlyLibraryPath(directory)
+
+            // when
+            val (exitCode, output) = importExtension(directory, libraryPath.toString())
+
+            // then
+            assert(output == "imported")
+            assert(exitCode == 0)
+        }
+
+    @Test
+    fun `should import C extension not linked to libpython found by loader without its development symlink and foreign linker`() =
+        withExtension { directory ->
+            // given
+            val libraryPath = sonameOnlyLibraryPath(directory)
+
+            // when
+            val (exitCode, output) = importExtension(directory, libraryPath.toString(), foreignLinker = false)
+
+            // then
+            assert(output == "imported")
+            assert(exitCode == 0)
+        }
+
+    /**
+     * Runs the [block] with a new temporary directory, deleted afterwards,
+     * into which the `xemantic_extension` is compiled, see [compileExtension].
+     */
+    @OptIn(ExperimentalPathApi::class)
+    private fun withExtension(block: (directory: Path) -> Unit) {
+        val directory = createTempDirectory("python-library")
+        try {
+            compileExtension(directory)
+            block(directory)
         } finally {
             directory.deleteRecursively()
         }
     }
 
-    @OptIn(ExperimentalPathApi::class)
-    @Test
-    fun `should import C extension not linked to libpython without LD_LIBRARY_PATH and foreign linker`() {
-        // given
-        val directory = createTempDirectory("python-library")
-        try {
-            compileExtension(directory)
+    /**
+     * Runs the [input], importing the `xemantic_extension` compiled into the [directory] by default,
+     * in the embedded Python of a JVM of its own, with the [libraryPath] as its `LD_LIBRARY_PATH`, none if `null`,
+     * and without the foreign linker unless [foreignLinker], like on Java 17 to 21.
+     *
+     * @return the exit code and the output of the JVM.
+     */
+    private fun importExtension(
+        directory: Path,
+        libraryPath: String?,
+        input: String = "import xemantic_extension\nprint(xemantic_extension.VALUE, flush=True)",
+        foreignLinker: Boolean = true
+    ): Pair<Int, String> = runInJvm(
+        EmbeddedPythonMain::class.java.name,
+        input = input,
+        environment = mapOf("LD_LIBRARY_PATH" to libraryPath, "PYTHONPATH" to directory.toString()),
+        jvmArguments = if (foreignLinker) emptyList() else listOf("-D${NO_FOREIGN_LINKER_PROPERTY}=true")
+    )
 
-            // when
-            val (exitCode, output) = runInJvm(
-                EmbeddedPythonMain::class.java.name,
-                input = "import xemantic_extension\nprint(xemantic_extension.VALUE, flush=True)",
-                environment = mapOf("LD_LIBRARY_PATH" to null, "PYTHONPATH" to directory.toString()),
-                // like on Java 17 to 21, without the foreign linker
-                jvmArguments = listOf("-D${NO_FOREIGN_LINKER_PROPERTY}=true")
-            )
-
-            // then
-            assert(output == "imported")
-            assert(exitCode == 0)
-        } finally {
-            directory.deleteRecursively()
-        }
+    /**
+     * A directory, in the [directory], for `LD_LIBRARY_PATH`, with a symbolic link of the soname of the `libpython`
+     * of the test venv Python to it, but without its development symlink, e.g. `libpython3.13.so`,
+     * like a Python of the system without its development package, e.g. `libpython3.13-dev`,
+     * so that the dynamic loader finds this `libpython` for the native library of Jep, but Jep does not find it by this name.
+     * It tests nothing with a Python whose development symlink the loader finds anyway, e.g. a Python of the system.
+     */
+    private fun sonameOnlyLibraryPath(directory: Path): Path {
+        val (libraryDirectory, soname) = runProcess(
+            pythonCommand(
+                venvPython,
+                "import sysconfig\nprint(sysconfig.get_config_var('LIBDIR'))\nprint(sysconfig.get_config_var('INSTSONAME'))"
+            ),
+            mergeErrorStream = false
+        ).output.lines()
+        val library = pythonLibrary(libraryDirectory, soname)
+        assumeTrue(library != null, "the Python is not built with a shared libpython")
+        val libraryPath = directory.resolve("lib").createDirectory()
+        libraryPath.resolve(soname).createSymbolicLinkPointingTo(library!!)
+        return libraryPath
     }
 
     /**
